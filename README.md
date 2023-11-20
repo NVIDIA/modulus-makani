@@ -23,7 +23,7 @@ Makani is a research code built for massively parallel training of weather and c
 Training is launched by calling `train.py` and passing it the necessary CLI arguments to specify the configuration file `--yaml_config` and he configuration target `--config`:
 
 ```bash
-mpirun -np 8 --allow-run-as-root python -u train.py --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq"
+mpirun -np 8 --allow-run-as-root python -u train.py --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2"
 ```
 
 :warning: **architectures with complex-valued weights**: Training some architectures with complex-valued weights requires yet to be released patches to PyTorch. These will currently fail - a patch will follow soon.
