@@ -44,7 +44,7 @@ Makani supports various optimization to fit large models ino GPU memory and enab
 Especially larger models are enabled by using a mix of these techniques. Spatial model parallelism splits both the model and the data onto multiple GPUs, thus reducing both the memory footprint of the model and the load on the IO as each rank only needs to read a fraction of the data. A typical "large" training run of SFNO can be launched by running
 
 ```bash
-mpirun -np 256 --allow-run-as-root python -u train.py --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim960" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
+mpirun -np 256 --allow-run-as-root python -u train.py --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
 ```
 Here we train the model on 256 GPUs, split horizontally across 4 ranks with a batch size of 64, which amounts to a local batch size of 1/4. Memory requirements are further reduced by the use of `bf16` automatic mixed precision.
 
@@ -53,7 +53,7 @@ Here we train the model on 256 GPUs, split horizontally across 4 ranks with a ba
 In a similar fashion to training, inference can be called from the CLI by calling `inference.py` and handled by `inferencer.py`. To launch inference on the out-of-sample dataset, we can call:
 
 ```bash
-mpirun -np 256 --allow-run-as-root python -u inference.py --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim960" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
+mpirun -np 256 --allow-run-as-root python -u inference.py --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
 ```
 
 By default, the inference script will perform inference on the out-of-sample dataset specified 
@@ -139,6 +139,8 @@ Makani requires a metadata file named `data.json`, which describes important pro
 }
 ```
 
+The ERA5 dataset can be downloaded [here](https://cds.climate.copernicus.eu/cdsapp#!/dataset/reanalysis-era5-single-levels?tab=overview).
+
 ### Model packages
 
 By default, Makani will save out a model package when training starts. Model packages allow easily contain all the necessary data to run the model. This includes statistics used to normalize inputs and outputs, unpredicted static channels and even the code which appends celestial features such as the cosine of the solar zenith angle. Read more about model packages [here](networks/Readme.md).
@@ -156,6 +158,8 @@ While this is a research project, we aim to have functional unit tests with dece
 
 - [NVIDIA blog article](https://developer.nvidia.com/blog/modeling-earths-atmosphere-with-spherical-fourier-neural-operators/) on Spherical Fourier Neural Operators for ML-based weather prediction
 - [torch-harmonics](https://github.com/NVIDIA/torch-harmonics), a library for differentiable Spherical Harmonics in PyTorch
+- [ECMWF ERA5 dataset](https://cds.climate.copernicus.eu/cdsapp#!/dataset/reanalysis-era5-single-levels)
+- [SFNO-based forecasts deployed by ECMWF](https://charts.ecmwf.int/products/fourcast_medium-mslp-wind850)
 - [Apex](https://github.com/NVIDIA/apex), tools for easier mixed precision
 - [Dali](https://developer.nvidia.com/dali), NVIDIA data loading library
 - [Modulus](https://developer.nvidia.com/modulus), NVIDIA's library for physics-ML
