@@ -99,7 +99,7 @@ Model training in Makani is specified through the use of `.yaml` files located i
 
 | Configuration Key         | Description                                             | Options                                                 |
 |---------------------------|---------------------------------------------------------|---------------------------------------------------------|
-| `nettype`                 | Network architecture.                                   | `sfno`, `fno`, `afno`, `unet`                           |
+| `nettype`                 | Network architecture.                                   | `sfno`, `fno`, `afno`, `vit`                            |
 | `loss`                    | Loss function.                                          | `l2`, `geometric l2`, ...                               |
 | `optimizer`               | Optimizer to be used.                                   | `sfno`, `fno`, `afno`, `unet`                           |
 | `lr`                      | Initial learning rate.                                  | float > 0.0                                             |
