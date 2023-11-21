@@ -101,7 +101,7 @@ Model training in Makani is specified through the use of `.yaml` files located i
 |---------------------------|---------------------------------------------------------|---------------------------------------------------------|
 | `nettype`                 | Network architecture.                                   | `sfno`, `fno`, `afno`, `vit`                            |
 | `loss`                    | Loss function.                                          | `l2`, `geometric l2`, ...                               |
-| `optimizer`               | Optimizer to be used.                                   | `sfno`, `fno`, `afno`, `unet`                           |
+| `optimizer`               | Optimizer to be used.                                   | `Adam`, `AdamW`                                         |
 | `lr`                      | Initial learning rate.                                  | float > 0.0                                             |
 | `batch_size`              | Batch size.                                             | integer > 0                                             |
 | `max_epochs`              | Number of epochs to train for                           | integer                                                 |
