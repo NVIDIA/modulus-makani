@@ -16,7 +16,7 @@ Makani was started by engineers and researchers at NVIDIA and NERSC to train [Fo
 
 Makani is a research code built for massively parallel training of weather and climate prediction models on 100+ GPUs and to enable the development of the next generation of weather and climate models. Among others, Makani was used to train [Spherical Fourier Neural Operators (SFNO)](https://developer.nvidia.com/blog/modeling-earths-atmosphere-with-spherical-fourier-neural-operators/) [1] and Adaptive Fourier Neural Operators (AFNO) [2] on the ERA5 dataset. Makani is written in [PyTorch](https://pytorch.org) and supports various forms of model- and data-parallelism, asynchronous loading of data, unpredicted channels, autoregressive training and much more.
 
-Makani is used for ongoing research. Stable features are regularly ported to the NVIDIA [Modulus](https://developer.nvidia.com/modulus) framework, a framework used for training Physics ML models in Science and Engineering.
+Makani is used for ongoing research. Stable features are regularly ported to the [NVIDIA Modulus](https://developer.nvidia.com/modulus) framework, a framework used for training Physics-ML models in Science and Engineering.
 
 ## Getting started
 
