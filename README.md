@@ -4,7 +4,7 @@
 
 [![tests](https://github.com/NVIDIA/makani/actions/workflows/tests.yml/badge.svg)](https://github.com/NVIDIA/makani/actions/workflows/tests.yml)
 
-Makani (the Hawaiian word for wind 🍃🌺) is a library designed to enable the research and development of machine-learning based weather and climate models in PyTorch.
+Makani (the Hawaiian word for wind 🍃🌺) is an experimental library designed to enable the research and development of machine-learning based weather and climate models in PyTorch.
 
 <div align="center">
 <img src="https://github.com/NVIDIA/makani/blob/main/images/sfno_rollout.gif"  height="388px">
