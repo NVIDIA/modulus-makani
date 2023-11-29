@@ -1,10 +1,10 @@
-# Makani: Massively parallel training of machine-learning based weather and climate models
+# Modulus-Makani: Massively parallel training of machine-learning based weather and climate models
 
 [**Overview**](#overview) | [**Getting started**](#getting-started) | [**More information**](#more-about-makani) | [**Contributing**](#contributing) | [**Further reading**](#further-reading) | [**References**](#references)
 
 [![tests](https://github.com/NVIDIA/makani/actions/workflows/tests.yml/badge.svg)](https://github.com/NVIDIA/makani/actions/workflows/tests.yml)
 
-Makani (the Hawaiian word for wind 🍃🌺) is an experimental library designed to enable the research and development of machine-learning based weather and climate models in PyTorch.
+Makani (the Hawaiian word for wind 🍃🌺) is an experimental library designed to enable the research and development of machine-learning based weather and climate models in PyTorch. Makani is used for ongoing research. Stable features are regularly ported to the [NVIDIA Modulus](https://developer.nvidia.com/modulus) framework, a framework used for training Physics-ML models in Science and Engineering.
 
 <div align="center">
 <img src="https://github.com/NVIDIA/makani/blob/main/images/sfno_rollout.gif"  height="388px">
@@ -15,8 +15,6 @@ Makani (the Hawaiian word for wind 🍃🌺) is an experimental library designed
 Makani was started by engineers and researchers at NVIDIA and NERSC to train [FourCastNet](https://github.com/NVlabs/FourCastNet), a deep-learning based weather prediction model.
 
 Makani is a research code built for massively parallel training of weather and climate prediction models on 100+ GPUs and to enable the development of the next generation of weather and climate models. Among others, Makani was used to train [Spherical Fourier Neural Operators (SFNO)](https://developer.nvidia.com/blog/modeling-earths-atmosphere-with-spherical-fourier-neural-operators/) [1] and [Adaptive Fourier Neural Operators (AFNO)](https://arxiv.org/abs/2111.13587) [2] on the ERA5 dataset. Makani is written in [PyTorch](https://pytorch.org) and supports various forms of model- and data-parallelism, asynchronous loading of data, unpredicted channels, autoregressive training and much more.
-
-Makani is used for ongoing research. Stable features are regularly ported to the [NVIDIA Modulus](https://developer.nvidia.com/modulus) framework, a framework used for training Physics-ML models in Science and Engineering.
 
 ## Getting started
 
@@ -158,13 +156,13 @@ While this is a research project, we aim to have functional unit tests with dece
 
 ## Further reading
 
+- [Modulus](https://developer.nvidia.com/modulus), NVIDIA's library for physics-ML
 - [NVIDIA blog article](https://developer.nvidia.com/blog/modeling-earths-atmosphere-with-spherical-fourier-neural-operators/) on Spherical Fourier Neural Operators for ML-based weather prediction
 - [torch-harmonics](https://github.com/NVIDIA/torch-harmonics), a library for differentiable Spherical Harmonics in PyTorch
 - [ECMWF ERA5 dataset](https://cds.climate.copernicus.eu/cdsapp#!/dataset/reanalysis-era5-single-levels)
 - [SFNO-based forecasts deployed by ECMWF](https://charts.ecmwf.int/products/fourcast_medium-mslp-wind850)
 - [Apex](https://github.com/NVIDIA/apex), tools for easier mixed precision
 - [Dali](https://developer.nvidia.com/dali), NVIDIA data loading library
-- [Modulus](https://developer.nvidia.com/modulus), NVIDIA's library for physics-ML
 - [earth2mip](https://github.com/NVIDIA/earth2mip), a library for intercomparing DL based weather models
 
 ## Authors
