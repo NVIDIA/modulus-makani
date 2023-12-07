@@ -24,7 +24,7 @@ import numpy as np
 import h5py as h5
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.dataloader import get_dataloader
+from makani.utils.dataloader import get_dataloader
 
 from testutils import get_default_parameters, init_dataset
 from testutils import H5_PATH, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W
@@ -53,7 +53,7 @@ def init_params(train_path: str,
                 num_data_workers: int,
 ):
 
-    # instantiate params base  
+    # instantiate params base
     params = get_default_parameters()
 
     # init paths
@@ -79,7 +79,7 @@ def init_params(train_path: str,
     params.num_data_workers = num_data_workers
 
     return params
-    
+
 
 class TestMultifiles(unittest.TestCase):
 
@@ -114,12 +114,12 @@ class TestMultifiles(unittest.TestCase):
 
         self.num_steps = 5
 
-    
+
     def test_shapes_and_sample_counts(self):
-    
+
         # create dataloaders
         valid_loader, valid_dataset = get_dataloader(self.params, self.params.valid_data_path, train=False, device=self.device)
-                
+
         # do tests
         num_valid_steps = self.params.num_valid // self.params.batch_size
         for idt, token in enumerate(valid_loader):
@@ -128,12 +128,12 @@ class TestMultifiles(unittest.TestCase):
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
             self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
-            
+
         self.assertEqual((idt+1), num_valid_steps)
 
 
     def test_content(self):
-        
+
         # create dataloaders
         valid_loader, valid_dataset = get_dataloader(self.params, self.params.valid_data_path, train=False, device=self.device)
 
@@ -164,7 +164,7 @@ class TestMultifiles(unittest.TestCase):
     def test_history(self):
         # set history:
         self.params.n_history = 3
-        
+
         # create dataloaders
         valid_loader, valid_dataset = get_dataloader(self.params, self.params.valid_data_path, train=False, device=self.device)
 
@@ -224,7 +224,7 @@ class TestMultifiles(unittest.TestCase):
         off_y = valid_dataset.img_local_offset_y
         range_x = valid_dataset.img_local_shape_x
         range_y = valid_dataset.img_local_shape_y
-        
+
         # do tests
         num_steps = 3
         for idt, token in enumerate(valid_loader):
@@ -233,7 +233,7 @@ class TestMultifiles(unittest.TestCase):
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, range_x, range_y))
             self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, range_x, range_y))
-            
+
             # get test samples
             off = self.params.batch_size * idt
             inp_res = []
@@ -247,7 +247,7 @@ class TestMultifiles(unittest.TestCase):
             # stack
             test_inp = np.squeeze(np.stack(inp_res, axis=0))
             test_tar = np.squeeze(np.stack(tar_res, axis=0))
-            
+
             inp = np.squeeze(inp.cpu().numpy())
             tar = np.squeeze(tar.cpu().numpy())
 
@@ -259,4 +259,3 @@ class TestMultifiles(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-    

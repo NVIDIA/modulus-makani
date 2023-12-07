@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modulus-makani"
+authors = [
+  { name="NVIDIA"},
+  { name="NERSC"},
+]
+description = "A machine learning library for weather and climate modeling"
+readme = "README.md"
+requires-python = ">=3.10"
+
+classifiers = [
+    "Development Status :: Alpha",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+
+dynamic = ["version"]
+
+dependencies = [
+    "torch>=2.0.0",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "makani.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["makani*"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0.0",
+    "black>=22.10.0",
+    "coverage>=6.5.0",
+]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = ""
+testpaths = [
+    "tests"
+]

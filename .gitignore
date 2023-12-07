@@ -19,3 +19,4 @@ coverage.xml
 *.svg
 *.coverage
 *.hypothesis
+*.egg-info/
