@@ -18,6 +18,20 @@ Makani is a research code built for massively parallel training of weather and c
 
 ## Getting started
 
+### Installation
+
+Makani can be installed by running the following command:
+```bash
+make install
+```
+
+Alternatively, Makani can be installed using `pip install`:
+```bash
+pip install -e .
+```
+
+In both cases, Makani package, `modulus-makani`, will be installed in [editable](https://setuptools.pypa.io/en/latest/userguide/development_mode.html) mode.
+
 ### Training:
 
 Training is launched by calling `train.py` and passing it the necessary CLI arguments to specify the configuration file `--yaml_config` and he configuration target `--config`:
@@ -153,6 +167,11 @@ Thanks for your interest in contributing. There are many ways to contribute to t
 - If you feel like adding a feature, we encourage you to discuss it with us first, so we can guide you on how to best achieve it.
 
 While this is a research project, we aim to have functional unit tests with decent coverage. We kindly ask you to implement unit tests if you add a new feature and it can be tested.
+
+To install dependencies required when contributing to the project, run the following command:
+```bash
+pip install -e .[dev]
+```
 
 ## Further reading
 

@@ -42,5 +42,6 @@ dev = [
 minversion = "6.0"
 addopts = ""
 testpaths = [
-    "tests"
+    "tests",
+    "makani",
 ]

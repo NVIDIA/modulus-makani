@@ -20,3 +20,4 @@ coverage.xml
 *.coverage
 *.hypothesis
 *.egg-info/
+build/

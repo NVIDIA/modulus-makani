@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+install:
+	pip install --upgrade pip && \
+		pip install -e .
+
+wheel:
+	pip install --upgrade pip && \
+		pip wheel . --no-deps
+
 test:
 	coverage run --source utils,utils/dataloaders,utils/metrics,networks -m pytest tests
 	coverage report
