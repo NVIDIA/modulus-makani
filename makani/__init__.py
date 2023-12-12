@@ -13,25 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-install:
-	pip install --upgrade pip && \
-		pip install -e .
-
-wheel:
-	pip install --upgrade pip && \
-		pip wheel . --no-deps
-
-test:
-	coverage run --source utils,utils/dataloaders,utils/metrics,networks -m pytest tests
-	coverage report
-	coverage xml
-
-# reset_regregression_data:
-# 	pytest --regtest-reset tests
-
-mount:
-	s3fs -o use_path_request_style -o url=https://pbss.s8k.io SCRATCH mount/scratch
-	s3fs -o use_path_request_style -o url=https://pbss.s8k.io era5_wind_data mount/era5_wind_data
-
-
-.PHONY: mount test lock
+__version__ = "0.1.0a0"

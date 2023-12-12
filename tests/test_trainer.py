@@ -23,10 +23,10 @@ import unittest
 
 import torch
 
-from utils.trainer import Trainer
-from utils.YParams import YParams, ParamsBase
-from inference.inferencer import Inferencer
-from networks.model_package import load_model_package
+from makani.utils.trainer import Trainer
+from makani.utils.YParams import YParams, ParamsBase
+from makani.inference.inferencer import Inferencer
+from makani.networks.model_package import load_model_package
 
 from testutils import get_default_parameters, init_dataset
 from testutils import H5_PATH
@@ -42,7 +42,7 @@ def init_params(exp_path: str,
                 num_data_workers: int,
 ):
 
-    # instantiate params base  
+    # instantiate params base
     params = get_default_parameters()
 
     # init paths

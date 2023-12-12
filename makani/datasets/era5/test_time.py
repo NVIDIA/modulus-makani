@@ -13,25 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-install:
-	pip install --upgrade pip && \
-		pip install -e .
-
-wheel:
-	pip install --upgrade pip && \
-		pip wheel . --no-deps
-
-test:
-	coverage run --source utils,utils/dataloaders,utils/metrics,networks -m pytest tests
-	coverage report
-	coverage xml
-
-# reset_regregression_data:
-# 	pytest --regtest-reset tests
-
-mount:
-	s3fs -o use_path_request_style -o url=https://pbss.s8k.io SCRATCH mount/scratch
-	s3fs -o use_path_request_style -o url=https://pbss.s8k.io era5_wind_data mount/era5_wind_data
+import datetime
+from makani.datasets.era5 import time
 
 
-.PHONY: mount test lock
+def test_datetime_range():
+    times = time.datetime_range(2018, datetime.timedelta(hours=6), 2)
+    assert times == [datetime.datetime(2018, 1, 1, 0), datetime.datetime(2018, 1, 1, 6)]
+
+
+def test_filename_to_year():
+    assert 2018 == time.filename_to_year("some/long/path/2018.h5")

@@ -13,25 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-install:
-	pip install --upgrade pip && \
-		pip install -e .
+import pathlib
+import h5py
 
-wheel:
-	pip install --upgrade pip && \
-		pip wheel . --no-deps
-
-test:
-	coverage run --source utils,utils/dataloaders,utils/metrics,networks -m pytest tests
-	coverage report
-	coverage xml
-
-# reset_regregression_data:
-# 	pytest --regtest-reset tests
-
-mount:
-	s3fs -o use_path_request_style -o url=https://pbss.s8k.io SCRATCH mount/scratch
-	s3fs -o use_path_request_style -o url=https://pbss.s8k.io era5_wind_data mount/era5_wind_data
+from makani.datasets import era5
 
 
-.PHONY: mount test lock
+def test_open_34_vars(tmp_path: pathlib.Path):
+    path = tmp_path / "1979.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("fields", shape=[1, 34, 721, 1440])
+
+    ds = era5.open_34_vars(path)
+    # ensure that data can be grabbed
+    ds.mean().compute()
+
+    assert set(ds.coords) == {"time", "channel", "lat", "lon"}
