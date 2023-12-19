@@ -13,18 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-install:
-	pip install --upgrade pip && pip install -e .
+__version__ = "0.1.0a0"
 
-wheel:
-	pip install --upgrade pip && pip wheel . --no-deps
-
-test:
-	coverage run --source ./makani -m pytest tests
-	coverage report
-	coverage xml
-
-format:
-	python3 -m black --line-length=180 ./makani
-
-.PHONY: install wheel test
+from .utils.trainer import Trainer
+from .utils.inferencer import Inferencer

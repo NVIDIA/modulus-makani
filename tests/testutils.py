@@ -19,7 +19,7 @@ from typing import List, Optional
 import numpy as np
 import h5py as h5
 
-from utils.YParams import ParamsBase
+from makani.utils.YParams import ParamsBase
 
 H5_PATH = "fields"
 NUM_CHANNELS = 4

@@ -23,10 +23,9 @@ import unittest
 
 import torch
 
-from utils.trainer import Trainer
-from utils.YParams import YParams, ParamsBase
-from inference.inferencer import Inferencer
-from networks.model_package import load_model_package
+from makani.utils.YParams import YParams, ParamsBase
+from makani import Inferencer, Trainer
+from makani.networks.model_package import load_model_package
 
 from testutils import get_default_parameters, init_dataset
 from testutils import H5_PATH
@@ -146,6 +145,9 @@ class TestTrainer(unittest.TestCase):
 
         # self.num_steps = 5
         self.params.print_timings_frequency = 0
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
 
     def test_training(self):
         self.trainer = Trainer(self.params, 0)

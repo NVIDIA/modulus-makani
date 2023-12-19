@@ -30,7 +30,7 @@ base_config: &BASE_CONFIG
     num_layers: 8
     complex_activation: "real"
     normalization_layer: "instance_norm"
-    hard_thresholding_fraction: 0.5
+    hard_thresholding_fraction: 1.0
     use_mlp: !!bool True
     mlp_mode: "serial"
     mlp_ratio: 2
@@ -144,6 +144,19 @@ base_73chq_finetune: &BASELINE_73CHQ_FINETUNE
     scheduler: "CosineAnnealingLR"
     max_epochs: 20
     scheduler_T_max: 20
+
+# current best single GPU model
+sfno_linear_73chq_sc3_layers8_edim384_wstgl2:
+    <<: *BASELINE_73CHQ
+    wandb_group: "sfno_linear_73chq_sc3_layers8_edim384_wstgl2"
+
+    embed_dim: 384
+    num_layers: 8
+    scale_factor: 3
+    hard_thresholding_fraction: 1.0
+
+    loss: "weighted squared temp-std geometric l2"
+    channel_weights: "auto"
 
 sfno_linear_73chq_sc3_layers8_edim384_asgl2:
     <<: *BASELINE_73CHQ

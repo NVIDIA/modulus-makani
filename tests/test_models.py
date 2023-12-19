@@ -13,14 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os, sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import unittest
 from parameterized import parameterized
 import torch
 
-from networks.models import list_models, get_model
+from makani.networks.models import list_models, get_model
 
 from testutils import get_default_parameters
 

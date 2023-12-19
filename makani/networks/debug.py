@@ -13,18 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-install:
-	pip install --upgrade pip && pip install -e .
+import torch
+from torch import nn
 
-wheel:
-	pip install --upgrade pip && pip wheel . --no-deps
 
-test:
-	coverage run --source ./makani -m pytest tests
-	coverage report
-	coverage xml
+class DebugNet(nn.Module):
+    def __init__(self):
+        super(DebugNet, self).__init__()
 
-format:
-	python3 -m black --line-length=180 ./makani
+        # create dummy param so that it won't crash in optimizer instantiation
+        self.factor = nn.Parameter(torch.ones((1), dtype=torch.float32))
 
-.PHONY: install wheel test
+    def forward(self, x):
+        return self.factor * x

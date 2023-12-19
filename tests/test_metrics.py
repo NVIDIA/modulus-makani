@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os, sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import unittest
 
 import numpy as np
@@ -23,8 +20,8 @@ import torch
 import xarray as xr
 import xskillscore as xs
 
-from utils.grids import GridQuadrature
-from utils.metrics.functions import GeometricL1, GeometricRMSE, GeometricACC
+from makani.utils.grids import GridQuadrature
+from makani.utils.metrics.functions import GeometricL1, GeometricRMSE, GeometricACC
 
 quadrature_list = ['naive', 'clenshaw-curtiss', 'legendre-gauss']
 param_list = [(1, 10, 20, 101), (4, 21, 721, 1440)]

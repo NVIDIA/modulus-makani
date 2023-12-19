@@ -45,7 +45,6 @@ full_field: &BASE_CONFIG
     perturb: !!bool False
     add_noise: !!bool False
     noise_std: 0.
-    add_zenith: !!bool False
 
 
     max_epochs: 150

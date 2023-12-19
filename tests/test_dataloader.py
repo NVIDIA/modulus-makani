@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os, sys
+import os
 import glob
 import tempfile
 from typing import List, Optional
@@ -23,8 +23,7 @@ import torch
 import numpy as np
 import h5py as h5
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.dataloader import get_dataloader
+from makani.utils.dataloader import get_dataloader
 
 from testutils import get_default_parameters, init_dataset
 from testutils import H5_PATH, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W
@@ -113,6 +112,9 @@ class TestMultifiles(unittest.TestCase):
         self.params.io_rank = [0, 0, 0]
 
         self.num_steps = 5
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
 
     
     def test_shapes_and_sample_counts(self):
