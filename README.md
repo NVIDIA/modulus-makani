@@ -1,6 +1,6 @@
 # Makani: Massively parallel training of machine-learning based weather and climate models
 
-[**Overview**](#overview) | [**Getting started**](#getting-started) | [**More information**](#more-about-makani) | [**Contributing**](#contributing) | [**Further reading**](#further-reading) | [**References**](#references)
+[**Overview**](#overview) | [**Getting started**](#getting-started) | [**More information**](#more-about-makani) | [**Known issues**](#known-issues) | [**Contributing**](#contributing) | [**Further reading**](#further-reading) | [**References**](#references)
 
 [![tests](https://github.com/NVIDIA/makani/actions/workflows/tests.yml/badge.svg)](https://github.com/NVIDIA/makani/actions/workflows/tests.yml)
 
@@ -18,15 +18,23 @@ Makani is a research code built for massively parallel training of weather and c
 
 ## Getting started
 
+Makani can be installed by running
+
+```bash
+git clone git@github.com:NVIDIA/makani.git
+cd makani
+pip install -e .
+```
+
 ### Training:
 
 Training is launched by calling `train.py` and passing it the necessary CLI arguments to specify the configuration file `--yaml_config` and he configuration target `--config`:
 
 ```bash
-mpirun -np 8 --allow-run-as-root python -u train.py --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2"
+mpirun -np 8 --allow-run-as-root python -u makani.train --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2"
 ```
 
-:warning: **architectures with complex-valued weights**: Training some architectures with complex-valued weights requires yet to be released patches to PyTorch. These will currently fail - a patch will follow soon.
+:warning: **architectures with complex-valued weights** will currently fail. See  [Known issues](#known-issues) for more information.
 
 Makani supports various optimization to fit large models ino GPU memory and enable computationally efficient training. An overview of these features and corresponding CLI arguments is provided in the following table:
 
@@ -44,7 +52,7 @@ Makani supports various optimization to fit large models ino GPU memory and enab
 Especially larger models are enabled by using a mix of these techniques. Spatial model parallelism splits both the model and the data onto multiple GPUs, thus reducing both the memory footprint of the model and the load on the IO as each rank only needs to read a fraction of the data. A typical "large" training run of SFNO can be launched by running
 
 ```bash
-mpirun -np 256 --allow-run-as-root python -u train.py --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
+mpirun -np 256 --allow-run-as-root python -u makani.train --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
 ```
 Here we train the model on 256 GPUs, split horizontally across 4 ranks with a batch size of 64, which amounts to a local batch size of 1/4. Memory requirements are further reduced by the use of `bf16` automatic mixed precision.
 
@@ -53,7 +61,7 @@ Here we train the model on 256 GPUs, split horizontally across 4 ranks with a ba
 In a similar fashion to training, inference can be called from the CLI by calling `inference.py` and handled by `inferencer.py`. To launch inference on the out-of-sample dataset, we can call:
 
 ```bash
-mpirun -np 256 --allow-run-as-root python -u inference.py --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
+mpirun -np 256 --allow-run-as-root python -u makani.inference --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
 ```
 
 By default, the inference script will perform inference on the out-of-sample dataset specified 
@@ -67,29 +75,30 @@ The project is structured as follows:
 ```
 makani
 ├── ...
-├── config                  # configuration files, also known as recipes
-├── data_process            # data pre-processing such as computation of statistics
-├── datasets                # dataset utility scripts
-├── docker                  # scripts for building a docker image for training
-├── inference               # contains the inferencer
-├── mpu                     # utilities for model parallelism
-├── networks                # networks, contains definitions of various ML models
-├── tests                   # test files
-├── third_party/climt       # third party modules
-│   └── zenith_angle.py     # computation of zenith angle
-├── utils                   # utilities
-│   ├── dataloaders         # contains various dataloaders
-│   ├── metrics             # metrics folder contains routines for scoring and benchmarking.
+├── config                      # configuration files, also known as recipes
+├── data_process                # data pre-processing such as computation of statistics
+├── datasets                    # dataset utility scripts
+├── docker                      # scripts for building a docker image for training
+├── makani                      # Main directory containing the package
+│   ├── inference               # contains the inferencer
+│   ├── mpu                     # utilities for model parallelism
+│   ├── networks                # networks, contains definitions of various ML models
+│   ├── third_party/climt       # third party modules
+│   │   └── zenith_angle.py     # computation of zenith angle
+│   ├── utils                   # utilities
+│   │   ├── dataloaders         # contains various dataloaders
+│   │   ├── metrics             # metrics folder contains routines for scoring and benchmarking.
+│   │   ├── ...
+│   │   ├── comm.py             # comms module for orthogonal communicator infrastructure
+│   │   ├── dataloader.py       # dataloader interface
+│   │   ├── metric.py           # centralized metrics handler
+│   │   ├── trainer_profile.py  # copy of trainer.py used for profiling
+│   │   └── trainer.py          # main file for handling training
 │   ├── ...
-│   ├── comm.py             # comms module for orthogonal communicator infrastructure
-│   ├── dataloader.py       # dataloader interface
-│   ├── metric.py           # centralized metrics handler
-│   ├── trainer_profile.py  # copy of trainer.py used for profiling
-│   └── trainer.py          # main file for handling training
-├── ...
-├── inference.py            # CLI script for launching inference
-├── train.py                # CLI script for launching training
-└── README.md               # this file
+│   ├── inference.py            # CLI script for launching inference
+│   ├── train.py                # CLI script for launching training
+├── tests                       # test files
+└── README.md                   # this file
 ```
 
 ### Model and Training configuration
@@ -144,6 +153,10 @@ The ERA5 dataset can be downloaded [here](https://cds.climate.copernicus.eu/cdsa
 ### Model packages
 
 By default, Makani will save out a model package when training starts. Model packages allow easily contain all the necessary data to run the model. This includes statistics used to normalize inputs and outputs, unpredicted static channels and even the code which appends celestial features such as the cosine of the solar zenith angle. Read more about model packages [here](networks/Readme.md).
+
+## Known Issues
+
+:warning: **architectures with complex-valued weights**: Training some architectures with complex-valued weights requires yet to be released patches to PyTorch. A hotfix that addresses these issues is available in the `makani/third_party/torch` folder. Overwriting the corresponding files in the PyTorch installation will resolve these issues.
 
 ## Contributing
 

@@ -19,6 +19,9 @@ jobs:
         python -m pip install tqdm numpy parameterized xarray xskillscore timm jsbeautifier pynvml h5py wandb ruamel.yaml moviepy tensorly tensorly-torch
         python -m pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cpu
         python -m pip install torch_harmonics
+    - name: Install package
+      run: |
+        python -m pip install -e .
     - name: Test with pytest
       run: |
         python -m pip install pytest pytest-cov parameterized
