@@ -208,6 +208,7 @@ def load_time_loop(package, device=None, time_step_hours=None):
     # https://gitlab-master.nvidia.com/modulus/earth-2/earth2-mip
     from earth2mip.networks import Inference
     from earth2mip.schema import Grid
+    import earth2mip
     config = package.get("config.json")
     params = ParamsBase.from_json(config)
 
@@ -266,7 +267,7 @@ def load_time_loop(package, device=None, time_step_hours=None):
         channel_names=names,
         center=center,
         scale=scale,
-        grid=grid,
+        grid=earth2mip.grid.from_enum(grid),
         n_history=params.n_history,
         time_step=time_step,
     )
