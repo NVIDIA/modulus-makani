@@ -22,7 +22,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from apex.normalization import FusedLayerNorm
 import torch.fft
 from torch.nn.modules.container import Sequential
 from torch.utils.checkpoint import checkpoint_sequential
@@ -282,7 +281,7 @@ class AdaptiveFourierNeuralOperatorNet(nn.Module):
             # nn.init.normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm) or isinstance(m, FusedLayerNorm) or isinstance(m, nn.InstanceNorm3d):
+        elif isinstance(m, nn.LayerNorm) or isinstance(m, nn.InstanceNorm3d):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
