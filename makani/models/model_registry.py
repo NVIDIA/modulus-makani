@@ -15,8 +15,10 @@
 
 import os
 import importlib.util
+
+# we need this here for the code to work
+import importlib_metadata
 from importlib.metadata import EntryPoint, entry_points
-import importlib.metadata
 
 import logging
 
@@ -148,8 +150,9 @@ def get_model(params: ParamsBase, **kwargs) -> "torch.nn.Module":
         
     model_handle = _model_registry.get(params.nettype)
     if model_handle is not None:
-        if isinstance(model_handle, (EntryPoint, importlib.metadata.EntryPoint)):
+        if isinstance(model_handle, (EntryPoint, importlib_metadata.EntryPoint)):
             model_handle = model_handle.load()
+
         model_handle = partial(model_handle, inp_shape=inp_shape, out_shape=out_shape, inp_chans=inp_chans, out_chans=out_chans, **params.to_dict())
     else:
         raise KeyError(f"No model is registered under the name {name}")
