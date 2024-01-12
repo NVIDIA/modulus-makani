@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,10 +29,8 @@ from torch.cuda import amp
 from typing import Optional
 import math
 
-from torch_harmonics import *
-from makani.networks.contractions import compl_muladd2d_fwd, compl_mul2d_fwd
-from makani.networks.contractions import _contract_diagonal
-from makani.networks.activations import *
+from makani.models.common.contractions import compl_muladd2d_fwd, compl_mul2d_fwd
+from makani.models.common.contractions import _contract_diagonal
 
 
 @torch.jit.script

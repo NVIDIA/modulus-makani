@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-from torch import nn
-
-
-class DebugNet(nn.Module):
-    def __init__(self):
-        super(DebugNet, self).__init__()
-
-        # create dummy param so that it won't crash in optimizer instantiation
-        self.factor = nn.Parameter(torch.ones((1), dtype=torch.float32))
-
-    def forward(self, x):
-        return self.factor * x
+from .activations import ComplexReLU, ComplexActivation
+from .layers import DropPath, PatchEmbed, EncoderDecoder, MLP, RealFFT2, InverseRealFFT2
+from .spectral_convolution import SpectralConv, FactorizedSpectralConv, SpectralAttention

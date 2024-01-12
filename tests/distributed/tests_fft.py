@@ -39,7 +39,7 @@ import torch.distributed as dist
 
 import torch_harmonics.distributed as thd
 
-from makani.networks.layers import RealFFT2, InverseRealFFT2
+from makani.models.common import RealFFT2, InverseRealFFT2
 
 from makani.utils import comm
 from modulus.distributed.utils import split_tensor_along_dim

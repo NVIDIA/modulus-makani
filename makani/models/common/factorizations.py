@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,8 +21,8 @@ import tensorly as tl
 
 tl.set_backend("pytorch")
 
-from makani.networks.contractions import _contract_diagonal, _contract_dhconv, _contract_sep_diagonal, _contract_sep_dhconv
-from makani.networks.contractions import _contract_diagonal_real, _contract_dhconv_real, _contract_sep_diagonal_real, _contract_sep_dhconv_real
+from makani.models.common.contractions import _contract_diagonal, _contract_dhconv, _contract_sep_diagonal, _contract_sep_dhconv
+from makani.models.common.contractions import _contract_diagonal_real, _contract_dhconv_real, _contract_sep_diagonal_real, _contract_sep_dhconv_real
 
 
 from tltorch.factorized_tensors.core import FactorizedTensor

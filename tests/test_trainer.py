@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +25,7 @@ import torch
 
 from makani.utils.YParams import YParams, ParamsBase
 from makani import Inferencer, Trainer
-from makani.networks.model_package import load_model_package
+from makani.models.model_package import load_model_package
 
 from testutils import get_default_parameters, init_dataset
 from testutils import H5_PATH
@@ -59,8 +59,8 @@ def init_params(exp_path: str,
     params.experiment_dir = exp_path
 
     # checkpoint locations
-    params.checkpoint_path = os.path.join(exp_path, 'training_checkpoints/ckpt_mp{mp_rank}.tar')
-    params.best_checkpoint_path = os.path.join(exp_path, 'training_checkpoints/best_ckpt_mp{mp_rank}.tar')
+    params.checkpoint_path = os.path.join(exp_path, "training_checkpoints/ckpt_mp{mp_rank}.tar")
+    params.best_checkpoint_path = os.path.join(exp_path, "training_checkpoints/best_ckpt_mp{mp_rank}.tar")
 
     # general parameters
     params.dhours = 24
@@ -79,15 +79,15 @@ def init_params(exp_path: str,
     params.log_video = 0
 
     # test architecture
-    params.nettype = 'sfno'
+    params.nettype = "SFNO"
 
     # losss
-    params.loss = 'geometric l2'
+    params.loss = "geometric l2"
     params.lr = 5E-4
     params.weight_decay = 0.0
 
     # optimizer
-    params.optimizer_type = 'AdamW'
+    params.optimizer_type = "AdamW"
     params.optimizer_beta1 = 0.9
     params.optimizer_beta2 = 0.95
     params.optimizer_max_grad_norm = 32
@@ -98,7 +98,7 @@ def init_params(exp_path: str,
     params.n_eval_samples = 2
 
     # scheduler
-    params.scheduler = 'CosineAnnealingLR'
+    params.scheduler = "CosineAnnealingLR"
     params.scheduler_T_max = 10
     params.lr_warmup_steps = 0
 

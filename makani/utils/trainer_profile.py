@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,12 +30,14 @@ import torch.cuda.amp as amp
 import logging
 import wandb
 
-from makani.networks.models import get_model
 from makani.utils.dataloader import get_dataloader
 from makani.mpu.mappings import init_gradient_reduction_hooks
 from makani.mpu.helpers import sync_params, gather_uneven
 from makani.utils.losses import LossHandler
 from makani.utils.metric import MetricsHandler
+
+# get the model registry
+from makani.models import model_registry
 
 # distributed computing stuff
 from makani.utils import comm
@@ -46,7 +48,7 @@ import torch.distributed as dist
 from collections import OrderedDict
 
 # for counting model parameters
-from makani.networks.helpers import count_parameters
+from makani.models.helpers import count_parameters
 
 # profile stuff
 from ctypes import cdll
@@ -340,7 +342,7 @@ class Trainer:
             with open(config_path, "w") as f:
                 json.dump(params.to_dict(), f)
 
-        self.model = get_model(params).to(self.device)
+        self.model = model_registry.get_model(params).to(self.device)
         self.preprocessor = self.model.preprocessor
         # self.preprocessor = get_preprocessor(params).to(self.device)
 
@@ -382,10 +384,6 @@ class Trainer:
         self.loss_obj = self.loss_obj.to(self.device)
         if self.params.enable_nhwc:
             self.loss_obj = self.loss_obj.to(memory_format=torch.channels_last)
-
-        if not params.resuming:
-            if params.nettype == "unet":
-                self.model.apply(self.model.get_weights_function(params.weight_init))
 
         self.capturable_optimizer = False
         betas = (params.optimizer_beta1, params.optimizer_beta2)

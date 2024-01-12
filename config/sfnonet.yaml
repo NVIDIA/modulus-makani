@@ -21,7 +21,7 @@ base_config: &BASE_CONFIG
     time_diff_stds_path: "/stats/time_diff_stds.npy"
 
     # architecture related 
-    nettype: "sfno"
+    nettype: "SFNO"
     model_grid_type: "equiangular"
     sht_grid_type: "legendre-gauss"
     filter_type: "linear"

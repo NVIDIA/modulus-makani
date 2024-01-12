@@ -10,7 +10,8 @@ makani
 │   ├── afnonet.yaml        # baseline configurations for original FourCastNet paper
 │   ├── icml_models.yaml    # contains various dataloaders
 │   ├── sfnonet.yaml        # stable SFNO baselines
-│   └── Readme.md           # this file
+│   ├── Readme.md           # this file
+│   └── vit.yaml            # ViT architecture
 ...
 
 ```

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,10 +30,11 @@ import logging
 import wandb
 
 from makani.utils.dataloader import get_dataloader
-from makani.networks.models import get_model
 from makani.utils.trainer import Trainer
 from makani.utils.losses import LossHandler
 from makani.utils.metric import MetricsHandler
+
+from makani.models import model_registry
 
 # distributed computing stuff
 from makani.utils import comm
@@ -122,7 +123,7 @@ class Inferencer(Trainer):
         # save params
         self.params = params
 
-        self.model = get_model(params).to(self.device)
+        self.model = model_registry.get_model(params).to(self.device)
         self.preprocessor = self.model.preprocessor
 
         # print model

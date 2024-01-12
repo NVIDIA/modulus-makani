@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,7 @@ class ComplexReLU(nn.Module):
     """
 
     def __init__(self, negative_slope=0.0, mode="real", bias_shape=None, scale=1.0):
-        super(ComplexReLU, self).__init__()
+        super().__init__()
 
         # store parameters
         self.mode = mode
@@ -69,7 +69,7 @@ class ComplexReLU(nn.Module):
 
 class ComplexActivation(nn.Module):
     def __init__(self, activation, mode="cartesian", bias_shape=None):
-        super(ComplexActivation, self).__init__()
+        super().__init__()
 
         # store parameters
         self.mode = mode

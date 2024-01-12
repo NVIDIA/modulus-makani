@@ -17,6 +17,7 @@ authors = [
     { name="Peter Harrington" },
     { name="Pedram Hassanzadeh" },
     { name="Christian Hundt" },
+    { name="Alexey Kamenev"},
     { name="Karthik Kashinath" },
     { name="Zongyi Li" },
     { name="Morteza Mardani" },
@@ -96,3 +97,14 @@ exclude = '''
   | dist
 )/
 '''
+
+[project.entry-points."makani.models"]
+AFNOv1   = "makani.models.networks.afnonet:AdaptiveFourierNeuralOperatorNet"
+AFNO     = "makani.models.networks.afnonet_v2:AdaptiveFourierNeuralOperatorNet"
+FNO      = "makani.models.networks.sfnonet:FourierNeuralOperatorNet"
+SFNO     = "makani.models.networks.sfnonet:SphericalFourierNeuralOperatorNet"
+DebugNet = "makani.models.networks.debug:DebugNet"
+ViT      = "makani.models.networks.vit:VisionTransformer"
+
+[project.entry-points."modulus.models"]
+SFNO     = "makani.models.networks.sfnonet:SFNO"

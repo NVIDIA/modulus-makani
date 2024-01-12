@@ -18,7 +18,7 @@ base_config: &BASE_CONFIG
     time_diff_stds_path: "/stats/time_diff_stds.npy"
 
     # architecture
-    nettype: "sfno"
+    nettype: "SFNO"
     scale_factor: 4
     num_blocks: 8
     embed_dim: 256
@@ -112,7 +112,7 @@ base_config: &BASE_CONFIG
 
 sfno_dhealy: &SFNO_BASELINE_DHEALY
     <<: *BASE_CONFIG
-    nettype: "sfno"
+    nettype: "SFNO"
     filter_type: "linear"
     use_mlp: !!bool True
     separable: !!bool False
@@ -175,7 +175,7 @@ sfno_nonlinear_26ch_2step:
 
 fno_linear_26ch: &FNO_LINEAR_26CH
     <<: *SFNO_BASELINE_DHEALY_26CH
-    nettype: "fno"
+    nettype: "FNO"
     filter_type: "linear"
     operator_type: "diagonal"
     embed_dim: 64
@@ -190,7 +190,7 @@ fno_linear_26ch_2step:
 
 fno_nonlinear_26ch: &FNO_NONLINEAR_26CH
     <<: *SFNO_BASELINE_DHEALY_26CH
-    nettype: "fno"
+    nettype: "FNO"
     filter_type: "non-linear"
     operator_type: "diagonal"
     lr: 5E-4
@@ -236,7 +236,7 @@ sfno_nonlinear_73ch_2step:
 
 fno_linear_73ch: &FNO_LINEAR_73CH
     <<: *SFNO_BASELINE_DHEALY_73CH
-    nettype: "fno"
+    nettype: "FNO"
     filter_type: "linear"
     operator_type: "diagonal"
     embed_dim: 64
@@ -251,7 +251,7 @@ fno_linear_73ch_2step:
 
 fno_nonlinear_73ch: &FNO_NONLINEAR_73CH
     <<: *SFNO_BASELINE_DHEALY_73CH
-    nettype: "fno"
+    nettype: "FNO"
     filter_type: "non-linear"
     operator_type: "diagonal"
 

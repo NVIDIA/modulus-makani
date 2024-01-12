@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,21 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
-
 import torch
 import torch.nn as nn
 
-# preprocessor we need too
-from makani.networks.preprocessor import Preprocessor2D
-import makani.networks as networks
-
-_supported_models = ["fno", "sfno", "afno", "afno:v1", "vit", "debug"]
-
-
-def list_models():
-    return _supported_models
-
+from makani.models.preprocessor import Preprocessor2D
 
 class SingleStepWrapper(nn.Module):
     def __init__(self, params, model_handle):
@@ -139,59 +128,3 @@ class MultiStepWrapper(nn.Module):
             y = self._forward_eval(inp)
 
         return y
-
-
-def get_model(params):
-    """
-    Convenience routine that returns a model handle to construct the model.
-    Unloads all the parameters in the params datastructure as a dict.
-    This is to keep models as modular as possible, by not having them depend
-    on the params datastructure.
-    """
-
-    model_handle = None
-
-    # makani requires that these entries are set in params for now
-    inp_shape = (params.img_crop_shape_x, params.img_crop_shape_y)
-    out_shape = (params.out_shape_x, params.out_shape_y) if hasattr(params, "out_shape_x") and hasattr(params, "out_shape_y") else inp_shape
-    inp_chans = params.N_in_channels
-    out_chans = params.N_out_channels
-
-    # choose the right model handle depending on specified architecture
-    if params.nettype in ["fno", "sfno"]:
-        if params.nettype == "fno":
-            params.spectral_transform = "fft"
-        else:
-            params.spectral_transform = "sht"
-
-        from makani.networks.sfnonet import SphericalFourierNeuralOperatorNet
-
-        model_handle = partial(SphericalFourierNeuralOperatorNet, inp_shape=inp_shape, out_shape=out_shape, inp_chans=inp_chans, out_chans=out_chans, **params.to_dict())
-
-    elif params.nettype == "afno" or params.nettype == "afno:v1":
-        if params.nettype == "afno":
-            from makani.networks.afnonet_v2 import AdaptiveFourierNeuralOperatorNet
-        else:
-            from makani.networks.afnonet import AdaptiveFourierNeuralOperatorNet
-
-        model_handle = partial(AdaptiveFourierNeuralOperatorNet, inp_shape=inp_shape, inp_chans=inp_chans, out_chans=out_chans, use_complex_kernels=True, **params.to_dict())
-    elif params.nettype == "vit":
-        from makani.networks.vit import VisionTransformer
-
-        model_handle = partial(VisionTransformer, inp_shape=inp_shape, inp_chans=inp_chans, out_chans=out_chans, qkv_bias=True, **params.to_dict())
-
-    elif params.nettype == "debug":
-        from makani.networks.debug import DebugNet
-
-        model_handle = DebugNet
-
-    else:
-        raise NotImplementedError(f"Error, net type {params.nettype} not implemented")
-
-    # wrap into Multi-Step if requested
-    if params.n_future > 0:
-        model = MultiStepWrapper(params, model_handle)
-    else:
-        model = SingleStepWrapper(params, model_handle)
-
-    return model

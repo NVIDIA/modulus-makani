@@ -13,18 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
-import os
-import datetime
+from .preprocessor import Preprocessor2D
+from .stepper import SingleStepWrapper, MultiStepWrapper
 
-
-def filename_to_year(path: str) -> int:
-    filename = os.path.basename(path)
-    return int(filename[:4])
-
-
-def datetime_range(
-    year: int, time_step: datetime.timedelta, n: int
-) -> List[datetime.datetime]:
-    initial_time = datetime.datetime(year=year, month=1, day=1)
-    return [initial_time + time_step * i for i in range(n)]
+import makani.models.model_registry

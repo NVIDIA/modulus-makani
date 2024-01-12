@@ -5,11 +5,9 @@ import torch
 import torch.nn as nn
 from functools import partial
 
-from makani.networks.layers import DropPath
-
 # mp stuff
 from makani.utils import comm
-from makani.networks.layers import MLP, PatchEmbed
+from makani.models.common import DropPath, MLP, PatchEmbed
 from makani.mpu.layers import DistributedMatmul, DistributedMLP, DistributedAttention
 
 
@@ -133,7 +131,7 @@ class VisionTransformer(nn.Module):
         depth=12,
         num_heads=12,
         mlp_ratio=4.0,
-        qkv_bias=False,
+        qkv_bias=True,
         mlp_drop_rate=0.0,
         attn_drop_rate=0.0,
         path_drop_rate=0.0,
