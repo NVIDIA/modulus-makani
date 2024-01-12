@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,7 @@ import unittest
 from parameterized import parameterized
 import torch
 
-from makani.networks.models import list_models, get_model
+from makani.models import model_registry
 
 from testutils import get_default_parameters
 
@@ -41,15 +41,15 @@ class TestModels(unittest.TestCase):
         # also set the batch size for testing
         self.params.batch_size = 4
 
-    @parameterized.expand(list_models())
+    @parameterized.expand(model_registry.list_models())
     def test_model(self, nettype):
         """
         Tests initialization of all the models and the forward and backward pass
         """
         self.params.nettype = nettype
-        if nettype == "debug":
+        if nettype == "DebugNet":
             return
-        model = get_model(self.params)
+        model = model_registry.get_model(self.params)
 
         inp_shape = (self.params.batch_size, self.params.N_in_channels, self.params.img_shape_x, self.params.img_shape_y)
         out_shape = (self.params.batch_size, self.params.N_out_channels, self.params.img_shape_x, self.params.img_shape_y)

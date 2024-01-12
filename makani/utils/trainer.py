@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,19 +37,21 @@ from collections import OrderedDict
 # makani depenedencies
 from makani.utils.YParams import YParams
 from makani.utils.features import get_auxiliary_channels
-from makani.networks.models import get_model
 from makani.utils.dataloader import get_dataloader
 from makani.mpu.mappings import init_gradient_reduction_hooks
 from makani.mpu.helpers import sync_params, gather_uneven
 from makani.utils.losses import LossHandler
 from makani.utils.metric import MetricsHandler
 
+# model registry
+from makani.models import model_registry
+
 # distributed computing stuff
 from makani.utils import comm
 from makani.utils import visualize
 
 # for counting model parameters
-from makani.networks.helpers import count_parameters
+from makani.models.helpers import count_parameters
 
 
 class Trainer:
@@ -380,12 +382,12 @@ class Trainer:
 
         # record data required for inference
         if self.world_rank == 0:
-            from makani.networks.model_package import save_model_package
+            from makani.models.model_package import save_model_package
 
             save_model_package(self.params)
 
         # init preprocessor and model
-        self.model = get_model(params).to(self.device)
+        self.model = model_registry.get_model(params).to(self.device)
         self.preprocessor = self.model.preprocessor
 
         # print aux channel names:
@@ -417,11 +419,6 @@ class Trainer:
         # loss handler
         self.loss_obj = LossHandler(self.params)
         self.loss_obj = self.loss_obj.to(self.device)
-
-        # resume or not
-        if not params.resuming:
-            if params.nettype == "unet":
-                self.model.apply(self.model.get_weights_function(params.weight_init))
 
         self.capturable_optimizer = False
         betas = (params.optimizer_beta1, params.optimizer_beta2)
@@ -1072,7 +1069,7 @@ class Trainer:
         """
 
         # debug network has to be used
-        assert self.params.nettype == "debug"
+        assert self.params.nettype == "DebugNet"
 
         # set to eval
         self._set_eval()

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -120,11 +120,14 @@ class DummyLoader(object):
         assert self.img_crop_offset_y + self.img_crop_shape_y <= self.img_shape_y
 
         # for x
-        read_shape_x = compute_split_shapes(self.crop_size[0], self.io_grid[0])[self.io_rank[0]]
-        read_anchor_x = self.img_crop_offset_x + read_shape_x * self.io_rank[0]
+        split_shapes_x = compute_split_shapes(self.crop_size[0], self.io_grid[0])
+        read_shape_x = split_shapes_x[self.io_rank[0]]
+        read_anchor_x = self.crop_anchor[0] + sum(split_shapes_x[:self.io_rank[0]])
+        
         # for y
-        read_shape_y = compute_split_shapes(self.crop_size[1], self.io_grid[1])[self.io_rank[1]]
-        read_anchor_y = self.img_crop_offset_y + read_shape_y * self.io_rank[1]
+        split_shapes_y = compute_split_shapes(self.crop_size[1], self.io_grid[1])
+        read_shape_y = split_shapes_y[self.io_rank[1]]
+        read_anchor_y = self.crop_anchor[1] + sum(split_shapes_y[:self.io_rank[1]])
 
         # store exposed variables
         self.img_local_offset_x = read_anchor_x

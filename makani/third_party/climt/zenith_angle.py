@@ -2,7 +2,7 @@
 climt/LICENSE
 @mcgibbon
 BSD License
-Copyright (c) 2016, Rodrigo Caballero, modified by NVIDIA 2023
+Copyright (c) 2016, Rodrigo Caballero, modified by NVIDIA 2024
 All rights reserved.
 Redistribution and use in source and binary forms, with or without modification,
 are permitted provided that the following conditions are met:
@@ -27,7 +27,7 @@ OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
 # code taken from climt repo https://github.com/CliMT/climt
-# modified 2023: vectorization over coordinates and JIT compilation added
+# modified 2024: vectorization over coordinates and JIT compilation added
 
 import datetime
 import numpy as np

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
@@ -22,17 +23,17 @@ from torch.cuda import amp
 from functools import partial
 
 # helpers
-from makani.networks.layers import DropPath, MLP, EncoderDecoder
+from makani.models.common import DropPath, MLP, EncoderDecoder
 
 # import global convolution and non-linear spectral layers
-from makani.networks.spectral_convolution import SpectralConv, FactorizedSpectralConv, SpectralAttention
+from makani.models.common import SpectralConv, FactorizedSpectralConv, SpectralAttention
 
 # get spectral transforms from torch_harmonics
 import torch_harmonics as th
 import torch_harmonics.distributed as thd
 
 # wrap fft, to unify interface to spectral transforms
-from makani.networks.layers import RealFFT2, InverseRealFFT2
+from makani.models.common import RealFFT2, InverseRealFFT2
 from makani.mpu.layers import DistributedRealFFT2, DistributedInverseRealFFT2, DistributedMLP, DistributedEncoderDecoder
 
 # more distributed stuff
@@ -41,6 +42,10 @@ from makani.utils import comm
 # layer normalization
 from modulus.distributed.mappings import scatter_to_parallel_region, gather_from_parallel_region
 from makani.mpu.layer_norm import DistributedInstanceNorm2d, DistributedLayerNorm
+
+# for annotation of models
+import modulus
+from modulus.models.meta import ModelMetaData
 
 
 class SpectralFilterLayer(nn.Module):
@@ -633,3 +638,36 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
             x = x + self.residual_transform(residual)
 
         return x
+
+# this part exposes the model to modulus by constructing modulus Modules
+@dataclass
+class SphericalFourierNeuralOperatorNetMetaData(ModelMetaData):
+    name: str = "SFNO"
+
+    jit: bool = False
+    cuda_graphs: bool = False
+    amp_cpu: bool = False
+    amp_gpu: bool = True
+
+SFNO = modulus.Module.from_torch(
+    SphericalFourierNeuralOperatorNet,
+    SphericalFourierNeuralOperatorNetMetaData()
+)
+
+class FourierNeuralOperatorNet(SphericalFourierNeuralOperatorNet):
+    def __init__(self, *args, **kwargs):
+        return super().__init__(*args, spectral_transform="fft", **kwargs)
+
+@dataclass
+class FourierNeuralOperatorNetMetaData(ModelMetaData):
+    name: str = "FNO"
+
+    jit: bool = False
+    cuda_graphs: bool = False
+    amp_cpu: bool = False
+    amp_gpu: bool = True
+
+FNO = modulus.Module.from_torch(
+    FourierNeuralOperatorNet,
+    FourierNeuralOperatorNetMetaData()
+)

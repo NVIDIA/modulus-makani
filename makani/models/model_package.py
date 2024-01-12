@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,9 +23,10 @@ import json
 import jsbeautifier
 import numpy as np
 import torch
-from makani.networks.models import get_model
 from makani.utils.YParams import ParamsBase
 from makani.third_party.climt.zenith_angle import cos_zenith_angle
+
+from makani.models import model_registry
 
 import datetime
 
@@ -174,7 +175,7 @@ def load_model_package(package, pretrained=True, device="cpu"):
     params.img_local_shape_y = params.img_shape_y
 
     # get the model and
-    model = get_model(params).to(device)
+    model = model_registry.get_model(params).to(device)
 
     if pretrained:
         best_checkpoint_path = package.get(MODEL_PACKAGE_CHECKPOINT_PATH)

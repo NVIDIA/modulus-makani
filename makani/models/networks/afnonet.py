@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import torch.fft
 from makani.utils.img_utils import PeriodicPad2d
 
-from makani.networks.layers import DropPath, PatchEmbed
+from makani.models.common import DropPath, PatchEmbed
 
 
 class Mlp(nn.Module):

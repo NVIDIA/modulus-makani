@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,7 @@ import pynvml
 import torch
 import torch.distributed as dist
 
-from makani.networks.model_package import (
+from makani.models.model_package import (
     _load_static_data,
     MODEL_PACKAGE_CHECKPOINT_PATH,
     save_model_package,
@@ -30,7 +30,7 @@ from makani.networks.model_package import (
 )
 from makani.utils import logging_utils
 
-from makani.networks.models import get_model
+from makani.models import model_registry
 
 # distributed computing stuff
 from makani.utils import comm
@@ -56,7 +56,7 @@ class CheckpointSaver(Trainer):
         params["resuming"] = False
 
         self.params = params
-        self.model = get_model(params).to(self.device)
+        self.model = model_registry.get_model(params).to(self.device)
         self.preprocessor = self.model.preprocessor
         self.iters = None
         self.optimizer = None

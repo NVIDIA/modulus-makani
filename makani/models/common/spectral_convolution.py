@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,12 +29,12 @@ from tltorch.factorized_tensors.core import FactorizedTensor
 
 # import convenience functions for factorized tensors
 from makani.utils import comm
-from makani.networks.activations import ComplexReLU
-from makani.networks.contractions import compl_muladd2d_fwd, compl_mul2d_fwd, _contract_rank
-from makani.networks.factorizations import get_contract_fun
+from makani.models.common.activations import ComplexReLU
+from makani.models.common.contractions import compl_muladd2d_fwd, compl_mul2d_fwd, _contract_rank
+from makani.models.common.factorizations import get_contract_fun
 
 # for the experimental module
-from makani.networks.contractions import compl_exp_muladd2d_fwd, compl_exp_mul2d_fwd
+from makani.models.common.contractions import compl_exp_muladd2d_fwd, compl_exp_mul2d_fwd
 
 import torch_harmonics as th
 import torch_harmonics.distributed as thd

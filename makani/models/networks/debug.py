@@ -13,18 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
-import os
-import datetime
+import torch
+from torch import nn
 
 
-def filename_to_year(path: str) -> int:
-    filename = os.path.basename(path)
-    return int(filename[:4])
+class DebugNet(nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
 
+        # create dummy param so that it won't crash in optimizer instantiation
+        self.factor = nn.Parameter(torch.ones((1), dtype=torch.float32))
 
-def datetime_range(
-    year: int, time_step: datetime.timedelta, n: int
-) -> List[datetime.datetime]:
-    initial_time = datetime.datetime(year=year, month=1, day=1)
-    return [initial_time + time_step * i for i in range(n)]
+    def forward(self, x):
+        return self.factor * x

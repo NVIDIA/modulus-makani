@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,8 +29,7 @@ from typing import Optional
 import math
 
 # helpers
-from makani.networks.layers import PatchEmbed, DropPath, MLP
-from makani.networks.activations import ComplexReLU
+from makani.models.common import ComplexReLU, PatchEmbed, DropPath, MLP
 
 
 @torch.jit.script

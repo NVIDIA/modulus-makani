@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -265,11 +265,13 @@ class GeneralES(object):
         assert self.crop_anchor[0] + self.crop_size[0] <= self.img_shape[0]
         assert self.crop_anchor[1] + self.crop_size[1] <= self.img_shape[1]
         # for x
-        read_shape_x = compute_split_shapes(self.crop_size[0], self.io_grid[0])[self.io_rank[0]]
-        read_anchor_x = self.crop_anchor[0] + read_shape_x * self.io_rank[0]
+        split_shapes_x = compute_split_shapes(self.crop_size[0], self.io_grid[0])
+        read_shape_x = split_shapes_x[self.io_rank[0]]
+        read_anchor_x = self.crop_anchor[0] + sum(split_shapes_x[:self.io_rank[0]]) #self.crop_anchor[0] + read_shape_x * self.io_rank[0]
         # for y
-        read_shape_y = compute_split_shapes(self.crop_size[1], self.io_grid[1])[self.io_rank[1]]
-        read_anchor_y = self.crop_anchor[1] + read_shape_y * self.io_rank[1]
+        split_shapes_y = compute_split_shapes(self.crop_size[1], self.io_grid[1])
+        read_shape_y = split_shapes_y[self.io_rank[1]]
+        read_anchor_y = self.crop_anchor[1] + sum(split_shapes_y[:self.io_rank[1]]) #self.crop_anchor[1] + read_shape_y * self.io_rank[1]
         self.read_anchor = [read_anchor_x, read_anchor_y]
         self.read_shape = [read_shape_x, read_shape_y]
 

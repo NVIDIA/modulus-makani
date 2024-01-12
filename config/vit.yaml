@@ -59,7 +59,7 @@ full_field: &BASE_CONFIG
     noise_std: 0.
 
     # network related
-    nettype: "vit"
+    nettype: "ViT"
     depth: 12
     model_grid_type: "equiangular"
     patch_size: [7,8]

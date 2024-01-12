@@ -49,7 +49,7 @@ full_field: &BASE_CONFIG
 
     max_epochs: 150
     batch_size: 32
-    nettype: "afno:v1"
+    nettype: "AFNOv1"
     model_grid_type: "equiangular"
     patch_size: [8,8]
     num_blocks: 8
@@ -107,14 +107,14 @@ full_field: &BASE_CONFIG
 
 afno_26ch_arxiv_network: &AFNO_26CH
     <<: *BASE_CONFIG
-    nettype: "afno:v1"
+    nettype: "AFNOv1"
     lr: 5E-4
     batch_size: 64
     max_epochs: 150
 
 afno_26ch_arxiv_network_finetune:
     <<: *AFNO_26CH
-    nettype: "afno:v1"
+    nettype: "AFNOv1"
     lr: 1E-4
     batch_size: 64
     max_epochs: 50
@@ -132,14 +132,14 @@ afno_26ch_arxiv_network_test_config:
 
 afno_26ch_optimized_network: 
     <<: *AFNO_26CH
-    nettype: "afno"
+    nettype: "AFNO"
     lr: 5E-4
     batch_size: 64
     max_epochs: 150
 
 afno_26ch_optimized_network_finetune:
     <<: *AFNO_26CH
-    nettype: "afno"
+    nettype: "AFNO"
     lr: 1E-4
     batch_size: 64
     max_epochs: 50
