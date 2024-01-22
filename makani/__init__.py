@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0"
 
 from .utils.trainer import Trainer
 from .utils.inferencer import Inferencer

@@ -460,10 +460,10 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
 
         # output transform
         if self.big_skip:
-            self.residual_transform = nn.Conv2d(self.out_chans, self.out_chans, 1, bias=False)
+            self.residual_transform = nn.Conv2d(self.inp_chans, self.out_chans, 1, bias=False)
             self.residual_transform.weight.is_shared_mp = ["spatial"]
             self.residual_transform.weight.sharded_dims_mp = [None, None, None, None]
-            scale = math.sqrt(0.5 / self.out_chans)
+            scale = math.sqrt(0.5 / self.inp_chans)
             nn.init.normal_(self.residual_transform.weight, mean=0.0, std=scale)
 
         # learned position embedding
@@ -591,7 +591,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
             if self.out_shape != self.inp_shape:
                 xtype = x.dtype
                 # only take the predicted channels as residual
-                residual = x[..., : self.out_chans, :, :].to(torch.float32)
+                residual = x.to(torch.float32)
                 with amp.autocast(enabled=False):
                     residual = self.trans_down(residual)
                     residual = residual.contiguous()
@@ -599,7 +599,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
                     residual = residual.to(dtype=xtype)
             else:
                 # only take the predicted channels
-                residual = x[..., : self.out_chans, :, :].contiguous()
+                residual = x
 
         if comm.get_size("fin") > 1:
             x = scatter_to_parallel_region(x, 1, "fin")
