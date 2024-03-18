@@ -1,4 +1,5 @@
 *.h5
+__pycache__
 *.out
 expts/
 wandb/

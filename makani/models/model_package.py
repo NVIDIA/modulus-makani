@@ -47,6 +47,7 @@ class LocalPackage:
 
 logger = logging.getLogger(__name__)
 
+THIS_MODULE = "makani.models.model_package"
 MODEL_PACKAGE_CHECKPOINT_PATH = "training_checkpoints/best_ckpt_mp0.tar"
 MINS_FILE = "mins.npy"
 MAXS_FILE = "maxs.npy"
@@ -129,7 +130,7 @@ def save_model_package(params):
 
     # write out earth2mip metadata.json
     fcn_mip_data = {
-        "entrypoint": {"name": "networks.model_package:load_time_loop"},
+        "entrypoint": {"name": f"{THIS_MODULE}:load_time_loop"},
     }
     with open(os.path.join(params.experiment_dir, "metadata.json"), "w") as f:
         msg = jsbeautifier.beautify(json.dumps(fcn_mip_data), jsopts)
@@ -207,7 +208,7 @@ def load_time_loop(package, device=None, time_step_hours=None):
     """
 
     from earth2mip.networks import Inference
-    from earth2mip.schema import Grid
+    from earth2mip.grid import equiangular_lat_lon_grid
 
     config = package.get("config.json")
     params = ParamsBase.from_json(config)
@@ -244,15 +245,11 @@ def load_time_loop(package, device=None, time_step_hours=None):
     model = load_model_package(package, pretrained=True, device=device)
     shape = (params.img_shape_x, params.img_shape_y)
 
-    grid = None
-    if shape == (721, 1440):
-        grid = Grid.grid_721x1440
-    elif shape == (720, 1440):
-        grid = Grid.grid_720x1440
+    grid = equiangular_lat_lon_grid(nlat=params.img_shape_x, nlon=params.img_shape_y, includes_south_pole=True)
 
     if time_step_hours is None:
-        time_step_data = datetime.timedelta(hours=6)
-        time_step = time_step_data * params.get("dt", 1)
+        hour = datetime.timedelta(hours=1)
+        time_step = hour * params.get("dt", 6)
     else:
         time_step = datetime.timedelta(hours=time_step_hours)
 
