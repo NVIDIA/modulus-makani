@@ -72,7 +72,7 @@ def get_dataloader(params, files_pattern, device, train=True, final_eval=False):
         from makani.utils.dataloaders.data_loader_multifiles import MultifilesDataset as MultifilesDataset2D
         from torch.utils.data.distributed import DistributedSampler
 
-        # multifiles dataset
+        # multifiles
         dataset = MultifilesDataset2D(params, files_pattern, train)
 
         sampler = DistributedSampler(dataset, shuffle=train, num_replicas=params.data_num_shards, rank=params.data_shard_id) if (params.data_num_shards > 1) else None
@@ -81,8 +81,8 @@ def get_dataloader(params, files_pattern, device, train=True, final_eval=False):
             dataset,
             batch_size=int(params.batch_size),
             num_workers=params.num_data_workers,
-            shuffle=False,  # (sampler is None),
-            sampler=sampler if train else None,
+            shuffle=(sampler is None) and train,
+            sampler=sampler,
             drop_last=True,
             pin_memory=torch.cuda.is_available(),
         )

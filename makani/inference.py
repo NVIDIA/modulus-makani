@@ -53,6 +53,7 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon_factor", default=0, type=float)
     parser.add_argument("--split_data_channels", action="store_true")
     parser.add_argument("--mode", default="score", type=str, choices=["score", "ensemble"], help="Select inference mode")
+    parser.add_argument("--enable_odirect", action="store_true")
 
     # checkpoint format
     parser.add_argument("--checkpoint_format", default="legacy", choices=["legacy", "flexible"], type=str, help="Format in which to load checkpoints.")
@@ -124,6 +125,7 @@ if __name__ == "__main__":
     params["amp_mode"] = args.amp_mode
     params["jit_mode"] = args.jit_mode
     params["cuda_graph_mode"] = args.cuda_graph_mode
+    params["enable_odirect"] = args.enable_odirect
     params["enable_benchy"] = args.enable_benchy
     params["disable_ddp"] = args.disable_ddp
     params["enable_nhwc"] = args.enable_nhwc
