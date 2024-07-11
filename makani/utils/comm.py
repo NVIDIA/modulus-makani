@@ -93,7 +93,7 @@ def is_distributed(name: str):
         return False
 
 
-# initialization routine  
+# initialization routine
 def init(model_parallel_sizes=[1, 1, 1, 1],
          model_parallel_names=["h", "w", "fin", "fout"],
          verbose=False):

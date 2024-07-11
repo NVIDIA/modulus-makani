@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import io
 import numpy as np
 import concurrent.futures as cf
