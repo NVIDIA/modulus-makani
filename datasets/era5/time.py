@@ -16,7 +16,7 @@
 from typing import List
 import os
 import datetime
-
+import pytz
 
 def filename_to_year(path: str) -> int:
     filename = os.path.basename(path)
@@ -26,5 +26,5 @@ def filename_to_year(path: str) -> int:
 def datetime_range(
     year: int, time_step: datetime.timedelta, n: int
 ) -> List[datetime.datetime]:
-    initial_time = datetime.datetime(year=year, month=1, day=1)
+    initial_time = datetime.datetime(year=year, month=1, day=1, tzinfo=pytz.utc)
     return [initial_time + time_step * i for i in range(n)]

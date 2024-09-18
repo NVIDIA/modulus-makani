@@ -32,6 +32,7 @@ import torch
 
 # we need this for the zenith angle feature
 import datetime
+import pytz
 
 # import splitting logic
 from modulus.distributed.utils import compute_split_shapes
@@ -359,7 +360,7 @@ class GeneralES(object):
 
         # compute hours into the year
         year = self.years[year_idx]
-        jan_01_epoch = datetime.datetime(year, 1, 1, 0, 0, 0)
+        jan_01_epoch = datetime.datetime(year, 1, 1, 0, 0, 0, tzinfo=pytz.utc)
 
         # zenith angle for input
         inp_times = np.asarray([jan_01_epoch + datetime.timedelta(hours=idx * self.dhours) for idx in range(local_idx - self.dt * self.n_history, local_idx + 1, self.dt)])
