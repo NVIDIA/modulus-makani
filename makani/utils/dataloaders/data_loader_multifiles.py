@@ -27,6 +27,7 @@ import h5py
 
 # for the zenith angle
 import datetime
+import pytz
 
 # for grid conversion
 from makani.utils.grids import GridConverter
@@ -204,7 +205,7 @@ class MultifilesDataset(Dataset):
 
         # compute hours into the year
         year = self.years[year_idx]
-        jan_01_epoch = datetime.datetime(year, 1, 1, 0, 0, 0)
+        jan_01_epoch = datetime.datetime(year, 1, 1, 0, 0, 0, tzinfo=pytz.utc)
 
         # zenith angle for input
         inp_times = np.asarray([jan_01_epoch + datetime.timedelta(hours=idx * self.dhours) for idx in range(local_idx - self.dt * self.n_history, local_idx + 1, self.dt)])

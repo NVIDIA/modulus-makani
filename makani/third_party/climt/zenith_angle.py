@@ -30,6 +30,7 @@ OF THE POSSIBILITY OF SUCH DAMAGE.
 # modified 2024: vectorization over coordinates and JIT compilation added
 
 import datetime
+import pytz
 import numpy as np
 from typing import Union, Tuple, TypeVar
 
@@ -45,7 +46,7 @@ dtype = np.float32
 def _days_from_2000(model_time: np.ndarray) -> np.ndarray:
     """Get the days since year 2000."""
     # compute total days
-    time_diff = model_time - datetime.datetime(2000, 1, 1, 12, 0)
+    time_diff = model_time - datetime.datetime(2000, 1, 1, 12, 0, tzinfo=pytz.utc)
     result = np.asarray(time_diff).astype("timedelta64[us]") / np.timedelta64(1, "D")
     result = result.astype(dtype)
 
@@ -233,7 +234,9 @@ if __name__ == "__main__":
     lon_grid, lat_grid = np.meshgrid(lon, lat)
 
     # model time
-    model_time = np.asarray([datetime.datetime(2002, 1, 1, 12, 0, 0), datetime.datetime(2002, 6, 1, 12, 0, 0), datetime.datetime(2003, 1, 1, 12, 0, 0)])
+    model_time = np.asarray([datetime.datetime(2002, 1, 1, 12, 0, 0, tzinfo=pytz.utc),
+                             datetime.datetime(2002, 6, 1, 12, 0, 0, tzinfo=pytz.utc),
+                             datetime.datetime(2003, 1, 1, 12, 0, 0, tzinfo=pytz.utc)])
 
     # test _days_from_2000
     days = _days_from_2000(model_time)
