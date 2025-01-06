@@ -18,7 +18,7 @@ import io
 import numpy as np
 import concurrent.futures as cf
 from PIL import Image
-from moviepy.editor import ImageSequenceClip
+from moviepy.video.io import ImageSequenceClip
 import wandb
 
 import torch

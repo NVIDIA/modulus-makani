@@ -17,7 +17,6 @@ from functools import partial
 from collections import OrderedDict
 from copy import Error, deepcopy
 from re import S
-from numpy.lib.arraypad import pad
 import numpy as np
 import torch
 import torch.nn as nn

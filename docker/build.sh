@@ -16,7 +16,7 @@
 # limitations under the License.
 
 # which version to take:
-dlfw_version=23.11
+dlfw_version=24.10
 
 # gitlab credentials
 gitlab_tag=latest
@@ -24,6 +24,6 @@ gitlab_tag=latest
 cd ../
 
 # build and push
-docker build --network host -t era5_wind:${gitlab_tag} \
+docker build --network host -t modulus-makani:${gitlab_tag} \
        --build-arg DLFW_VERSION=${dlfw_version} \
        -f docker/Dockerfile .
