@@ -24,10 +24,7 @@ RUN apt remove cmake -y && \
     pip install cmake --upgrade
 
 # install mpi4py
-#RUN pip install mpi4py
-RUN git clone -b 3.1.5 --single-branch https://github.com/mpi4py/mpi4py.git && \
-    cd mpi4py && \
-    python setup.py install
+RUN SETUPTOOLS_USE_DISTUTILS=local pip install mpi4py
 
 # hdf5 and h5py
 RUN cd /tmp && wget https://support.hdfgroup.org/ftp/HDF5/releases/hdf5-1.14/hdf5-1.14.3/src/hdf5-1.14.3.tar.gz && \
