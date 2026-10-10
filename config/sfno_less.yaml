@@ -77,8 +77,8 @@ base_config: &BASE_CONFIG
     num_data_workers: 2
     num_visualization_workers: 2
 
-    # time stepping
-    dt: 6
+    # time stepping: trained on the 6-hourly dataset, one step = 6 h
+    dt: 1
     n_history: 0
     prediction_type: "iterative"
 
@@ -130,6 +130,10 @@ base_config: &BASE_CONFIG
 
 sfno_less_deterministic: &SFNO_LESS_DETERMINISTIC
     <<: *BASE_CONFIG
+
+    # original SFNO baseline recipe: 64 samples per step, 1 per GPU on 8 nodes
+    batch_size: 64
+    lr: 1E-3
 
     losses:
     -   type: "l2"
