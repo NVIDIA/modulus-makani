@@ -123,7 +123,7 @@ class TestModels(unittest.TestCase):
             ("FNO", 2e-5, 2e-5),
             ("ViT", 2e-5, 2e-5),
             ("SFNO", 2e-5, 2e-5),
-            ("SFNOv3", 2e-5, 2e-5),
+            ("SFNOv2", 2e-5, 2e-5),
             ("SNO", 2e-5, 2e-5),
             ("FCN3", 2e-5, 2e-5),
             ("Pangu", 2e-5, 2e-5),

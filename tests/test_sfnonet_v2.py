@@ -13,21 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the SFNOv3 network: channel layout, cutoff, symmetry and initialization."""
+"""Tests for the SFNOv2 network: channel layout, cutoff, symmetry and initialization."""
 
 import unittest
 
 import torch
 
 from makani.models.model_registry import _check_vector_wind_normalization
-from makani.models.networks.sfnonet_v3 import SphericalFourierNeuralOperatorNetV3, _compute_channel_layout
+from makani.models.networks.sfnonet_v2 import SphericalFourierNeuralOperatorNetV2, _compute_channel_layout
 from .testutils import disable_tf32, set_seed
 
 
 CHANNEL_NAMES = ["u10m", "v10m", "t2m", "u500", "v500", "z500"]
 
 
-class TestSFNOv3(unittest.TestCase):
+class TestSFNOv2(unittest.TestCase):
     def setUp(self):
         disable_tf32()
         set_seed(333)
@@ -46,7 +46,7 @@ class TestSFNOv3(unittest.TestCase):
             num_layers=2,
         )
         args.update(kwargs)
-        return SphericalFourierNeuralOperatorNetV3(**args).to(self.device)
+        return SphericalFourierNeuralOperatorNetV2(**args).to(self.device)
 
     def test_channel_layout(self):
         layout = _compute_channel_layout(CHANNEL_NAMES, ["xzen", "xoro"], 1, 2 * 7 + 1, 6)
@@ -107,23 +107,23 @@ class TestSFNOv3(unittest.TestCase):
         self.assertTrue(torch.allclose(torch.roll(out, shift, dims=-1), out_rot, atol=1e-4, rtol=1e-4))
 
     def test_vector_wind_normalization_guard(self):
-        self.assertTrue(SphericalFourierNeuralOperatorNetV3.requires_vector_wind_normalization)
+        self.assertTrue(SphericalFourierNeuralOperatorNetV2.requires_vector_wind_normalization)
         scale = torch.tensor([3.0, 3.0, 1.0, 9.0, 9.0, 1.0])
         bias = torch.tensor([0.0, 0.0, 280.0, 0.0, 0.0, 5000.0])
-        _check_vector_wind_normalization(bias, scale, CHANNEL_NAMES, "SFNOv3")
+        _check_vector_wind_normalization(bias, scale, CHANNEL_NAMES, "SFNOv2")
         # stats without wind pairs or without normalization pass trivially
-        _check_vector_wind_normalization(bias, scale, ["t2m"] * 6, "SFNOv3")
-        _check_vector_wind_normalization(None, None, CHANNEL_NAMES, "SFNOv3")
+        _check_vector_wind_normalization(bias, scale, ["t2m"] * 6, "SFNOv2")
+        _check_vector_wind_normalization(None, None, CHANNEL_NAMES, "SFNOv2")
         # componentwise wind means, as plain z-scoring produces
         with self.assertRaisesRegex(ValueError, "u500"):
             bad_bias = bias.clone()
             bad_bias[3] = 6.65
-            _check_vector_wind_normalization(bad_bias, scale, CHANNEL_NAMES, "SFNOv3")
+            _check_vector_wind_normalization(bad_bias, scale, CHANNEL_NAMES, "SFNOv2")
         # componentwise wind scales
         with self.assertRaisesRegex(ValueError, "u10m"):
             bad_scale = scale.clone()
             bad_scale[1] = 2.5
-            _check_vector_wind_normalization(bias, bad_scale, CHANNEL_NAMES, "SFNOv3")
+            _check_vector_wind_normalization(bias, bad_scale, CHANNEL_NAMES, "SFNOv2")
 
     def test_wind_roundtrip(self):
         # a band-limited vector field passes projection and synthesis unchanged

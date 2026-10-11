@@ -14,7 +14,7 @@
 # limitations under the License.
 
 r"""
-Spherical Fourier Neural Operator, version 3.
+Spherical Fourier Neural Operator, version 2.
 
 A cleaned-up, purely spectral SFNO. Compared to :mod:`makani.models.networks.sfnonet`:
 
@@ -211,7 +211,7 @@ def _compute_channel_layout(channel_names, aux_channel_names, n_history, inp_cha
 
     n_pred = len(channel_names)
     if n_pred == 0:
-        raise ValueError("SFNOv3 needs channel_names to tell wind components from scalar fields")
+        raise ValueError("SFNOv2 needs channel_names to tell wind components from scalar fields")
 
     _, _, dyn_aux, stat_aux, _ = get_channel_groups(channel_names, aux_channel_names)
     n_dyn = n_pred + len(dyn_aux)
@@ -403,7 +403,7 @@ class FilmS2(nn.Module):
 
 class NeuralOperatorBlock(nn.Module):
     r"""
-    One SFNOv3 processor block.
+    One SFNOv2 processor block.
 
     .. code-block:: text
 
@@ -520,9 +520,9 @@ class NeuralOperatorBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class SphericalFourierNeuralOperatorNetV3(nn.Module):
+class SphericalFourierNeuralOperatorNetV2(nn.Module):
     r"""
-    Spherical Fourier Neural Operator, version 3. See the module docstring for
+    Spherical Fourier Neural Operator, version 2. See the module docstring for
     what distinguishes it from :class:`~makani.models.networks.sfnonet.SphericalFourierNeuralOperatorNet`.
 
     Parameters
@@ -725,7 +725,7 @@ class SphericalFourierNeuralOperatorNetV3(nn.Module):
         elif pos_embed in ("none", "None", None):
             pass
         else:
-            raise ValueError(f"Unknown position embedding type {pos_embed}; SFNOv3 supports 'latitude' and 'none'")
+            raise ValueError(f"Unknown position embedding type {pos_embed}; SFNOv2 supports 'latitude' and 'none'")
 
         # normalization on the internal grid
         norm_layer = self._get_norm_layer_handle(normalization_layer)
@@ -892,9 +892,9 @@ class SphericalFourierNeuralOperatorNetV3(nn.Module):
 
 
 @dataclass
-class SphericalFourierNeuralOperatorNetV3MetaData(ModelMetaData):
+class SphericalFourierNeuralOperatorNetV2MetaData(ModelMetaData):
     r"""
-    PhysicsNeMo metadata for :class:`SphericalFourierNeuralOperatorNetV3`.
+    PhysicsNeMo metadata for :class:`SphericalFourierNeuralOperatorNetV2`.
 
     Same feature declaration as the other makani models: no TorchScript, no
     CUDA graphs, mixed precision on GPU only. The name is passed to
@@ -908,8 +908,8 @@ class SphericalFourierNeuralOperatorNetV3MetaData(ModelMetaData):
     amp_gpu: bool = True
 
 
-SFNOv3 = module_from_torch(
-    SphericalFourierNeuralOperatorNetV3,
-    SphericalFourierNeuralOperatorNetV3MetaData(),
-    name="SFNOv3",
+SFNOv2 = module_from_torch(
+    SphericalFourierNeuralOperatorNetV2,
+    SphericalFourierNeuralOperatorNetV2MetaData(),
+    name="SFNOv2",
 )
