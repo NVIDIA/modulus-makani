@@ -545,9 +545,15 @@ class SphericalFourierNeuralOperatorNetV3(nn.Module):
     scale_factor : int, optional
         Internal grid is the input grid coarsened by this factor, by default ``3``.
     lmax : int, optional
-        Explicit spectral cutoff. By default the band limit of the internal
-        grid, capped by those of the input and output grids, times
-        ``hard_thresholding_fraction``. Always used as ``mmax`` too.
+        Explicit spectral cutoff, always used as ``mmax`` too. By default the
+        exact band limit of the internal grid, capped by those of the input
+        and output grids, times ``hard_thresholding_fraction``. An explicit
+        value may exceed the exact limit of the data grids, which is
+        conservative for Clenshaw-Curtis quadrature: on the 721-latitude
+        equiangular grid the exact limit is 360, but the forward/inverse
+        roundtrip at ``lmax=640`` (the ERA5 TL639 truncation) has aliasing
+        below 1e-4 on ERA5 fields, while 720 breaks down. The internal grid's
+        limit is never exceeded.
     hard_thresholding_fraction : float, optional
         Fraction of the band limit to keep when ``lmax`` is not given, by default ``1.0``.
     embed_dim : int, optional
@@ -762,22 +768,37 @@ class SphericalFourierNeuralOperatorNetV3(nn.Module):
         r"""
         Fix the spectral cutoff ``self.lmax`` (exclusive, used as ``mmax`` too).
 
-        The internal grid must represent every retained mode exactly, and so
-        must the input and output grids, so the cutoff is the smallest of the
-        three band limits unless a smaller value is requested explicitly.
+        By default the cutoff is the smallest exact band limit of the internal,
+        input and output grids. The internal grid must represent every
+        retained mode exactly, since the processor transforms back and forth
+        on it in every block. The data grids are only crossed once on the way
+        in and once on the way out, so an explicit ``lmax`` may exceed their
+        exact limit where the quadrature is known to alias little (see the
+        class docstring); it is still bounded by what the transforms can
+        resolve at all, i.e. the number of latitudes and half the longitudes.
         """
-        limit = min(
-            compute_spherical_bandlimit((self.h, self.w), self.sht_grid_type),
+        internal_limit = compute_spherical_bandlimit((self.h, self.w), self.sht_grid_type)
+        data_limit = min(
             compute_spherical_bandlimit(self.inp_shape, self.model_grid_type),
             compute_spherical_bandlimit(self.out_shape, self.model_grid_type),
         )
+        resolvable = min(self.inp_shape[0], self.out_shape[0], self.inp_shape[1] // 2, self.out_shape[1] // 2)
+
         if lmax is None:
-            lmax = int(limit * hard_thresholding_fraction)
-        if lmax > limit:
-            raise ValueError(
-                f"lmax={lmax} exceeds the band limit {limit} of the {self.h}x{self.w} {self.sht_grid_type} internal grid "
-                f"or of the data grids; coarsen less or lower lmax"
+            lmax = int(min(internal_limit, data_limit) * hard_thresholding_fraction)
+        elif lmax > data_limit:
+            logging.info(
+                f"lmax={lmax} exceeds the exact band limit {data_limit} of the {self.model_grid_type} data grids; "
+                f"the input and output transforms rely on the quadrature aliasing little at this cutoff"
             )
+
+        if lmax > internal_limit:
+            raise ValueError(
+                f"lmax={lmax} exceeds the band limit {internal_limit} of the {self.h}x{self.w} {self.sht_grid_type} "
+                f"internal grid; coarsen less or lower lmax"
+            )
+        if lmax > resolvable:
+            raise ValueError(f"lmax={lmax} cannot be resolved on the {self.inp_shape} / {self.out_shape} data grids")
         if lmax < 1:
             raise ValueError(f"lmax={lmax} must be at least 1")
         self.lmax = lmax

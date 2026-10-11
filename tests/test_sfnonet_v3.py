@@ -64,8 +64,15 @@ class TestSFNOv3(unittest.TestCase):
         self.assertEqual(model.lmax, 15)
         for t in (model.project_in.sht, model.project_in.vsht, model.synthesize_internal.isht, model.synthesize_out.ivsht, model.sht, model.isht):
             self.assertEqual((t.lmax, t.mmax), (15, 15))
+        # above the internal grid's limit: refused
         with self.assertRaises(ValueError):
             self._model(lmax=16)
+        # scale_factor 1: a 32x64 Legendre-Gauss internal grid resolves lmax 31, and an explicit cutoff may go
+        # beyond the equiangular data grid's exact limit of 15 (Clenshaw-Curtis aliases little there)
+        model = self._model(scale_factor=1, lmax=24)
+        self.assertEqual((model.lmax, model.project_in.sht.lmax, model.sht.lmax), (24, 24, 24))
+        with self.assertRaises(ValueError):
+            self._model(scale_factor=1, lmax=32)
 
     def test_forward_backward(self):
         for kwargs in (

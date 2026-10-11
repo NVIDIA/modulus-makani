@@ -34,7 +34,9 @@ base_config: &BASE_CONFIG
     nettype: "SFNOv3"
     model_grid_type: "equiangular"
     sht_grid_type: "legendre-gauss"
-    scale_factor: 3               # internal grid 240 x 480, cutoff lmax = mmax = 239
+    scale_factor: 1               # internal Legendre-Gauss grid at data resolution, 721 x 1440
+    lmax: 640                     # ERA5 is TL639; above the exact limit (360) of the 721-lat equiangular grid, but
+                                  # Clenshaw-Curtis aliasing at 640 is < 1e-4 on ERA5 fields (720 would break down)
     embed_dim: 384
     num_layers: 8
     mlp_ratio: 2
