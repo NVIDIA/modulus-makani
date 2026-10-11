@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+import logging
+
 import torch
 
 import torch.amp as amp
@@ -143,13 +146,16 @@ def get_disco_conv(
     torch.nn.Module
         The convolution.
     """
-    if kwargs.get("fused", None) is False:
-        kwargs.pop("fused")
-
     if transpose:
         handle = thd.DistributedDiscreteContinuousConvTransposeS2 if distributed else th.DiscreteContinuousConvTransposeS2
     else:
         handle = thd.DistributedDiscreteContinuousConvS2 if distributed else th.DiscreteContinuousConvS2
+
+    # fused kernels arrived in torch-harmonics 0.9.2; older releases do not know the argument
+    if "fused" in kwargs and "fused" not in inspect.signature(handle.__init__).parameters:
+        if kwargs["fused"]:
+            logging.warning("this torch-harmonics does not support fused DISCO kernels; falling back to the unfused path")
+        kwargs.pop("fused")
 
     if hasattr(th, "as_grid"):
         return handle(
