@@ -149,8 +149,10 @@ class TestSFNOv2(unittest.TestCase):
             _check_vector_wind_normalization(bias, bad_scale, CHANNEL_NAMES, "SFNOv2")
 
     def test_wind_components(self):
-        # solid-body rotation u = cos(lat), v = 0 is purely rotational: no divergent component, and the
-        # rotational one carries the field's energy. Pins the (u_theta, u_phi) ordering of the vector SHT.
+        # Pins the convention documented in HopfProjection: (u, v) is passed to the vector SHT as
+        # (u_theta, u_phi), so a solid-body rotation u = cos(lat), v = 0, which is purely rotational, shows up
+        # entirely in component 0 (the "spheroidal" slot) as a single l=1, m=0 mode, and component 1 vanishes.
+        # Changing this would permute the wind inputs of trained checkpoints.
         model = self._model()
         nlat, nlon = self.inp_shape
         lat = torch.linspace(torch.pi / 2, -torch.pi / 2, nlat, device=self.device)
@@ -158,10 +160,9 @@ class TestSFNOv2(unittest.TestCase):
         x[0, 0] = torch.cos(lat)[:, None]  # u10m
         with torch.no_grad():
             _, wind_coeffs = model.project_in(x, model.scalar_out, model.wind_out)
-        div, rot = wind_coeffs[0, 0, 0], wind_coeffs[0, 0, 1]
-        self.assertLess(div.abs().max().item(), 1e-4 * rot.abs().max().item())
-        # the rotation is the l=1, m=0 mode; with the energy scaling its coefficient squared is the field energy
-        self.assertGreater(rot[1, 0].abs().item(), 0.99 * rot.abs().max().item())
+        c0, c1 = wind_coeffs[0, 0, 0], wind_coeffs[0, 0, 1]
+        self.assertLess(c1.abs().max().item(), 1e-4 * c0.abs().max().item())
+        self.assertGreater(c0[1, 0].abs().item(), 0.99 * c0.abs().max().item())
 
     def test_wind_roundtrip(self):
         # a band-limited vector field passes projection and synthesis unchanged

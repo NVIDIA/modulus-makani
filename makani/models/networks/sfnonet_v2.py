@@ -310,9 +310,23 @@ class HopfProjection(nn.Module):
         scalar_coeffs : torch.Tensor
             Complex coefficients of shape ``(B, n_scalar, lmax, lmax)``.
         wind_coeffs : torch.Tensor or None
-            Complex coefficients of shape ``(B, n_pairs, 2, lmax, lmax)``;
-            index 0 is the divergent (spheroidal), index 1 the rotational
-            (toroidal) component.
+            Complex coefficients of shape ``(B, n_pairs, 2, lmax, lmax)``, the
+            spheroidal (index 0) and toroidal (index 1) components of the
+            field ``(u_theta, u_phi) := (u, v)``; see the note below.
+
+        Notes
+        -----
+        The vector SHT takes its components in the spherical frame,
+        ``(u_theta, u_phi)`` with ``theta`` the colatitude, so the physical
+        wind would be ``(-v, u)``. Passing ``(u, v)`` instead feeds the field
+        rotated by 90 degrees at every point (``k x``, up to sign), which is
+        a smooth, invertible and equivariant map, so the encoding remains an
+        exact, equivariant representation of the wind and the matching
+        :class:`HopfSynthesis` undoes it. Only the labels are swapped: index 0
+        then carries the physical wind's *rotational* part and index 1 its
+        *divergent* part. The ordering is kept as is on purpose, so that
+        trained checkpoints stay loadable; changing it would permute the
+        encoder's and decoder's wind inputs.
         """
         with amp.autocast(device_type=x.device.type, enabled=False):
             x = x.to(torch.float32)
@@ -320,11 +334,8 @@ class HopfProjection(nn.Module):
             wind_coeffs = None
             if wind_channels.numel() > 0:
                 B, _, H, W = x.shape
+                # (u, v) passed as (u_theta, u_phi): see the note in the docstring
                 wind = x[:, wind_channels].reshape(B, -1, 2, H, W)
-                # the vector SHT takes (u_theta, u_phi): colatitudinal (southward, i.e. -v) first, zonal second.
-                # Passing (u, v) would still be an equivariant bijection, but would swap which component is
-                # divergent and which is rotational.
-                wind = torch.stack([-wind[:, :, 1], wind[:, :, 0]], dim=2)
                 wind_coeffs = self.vsht(wind) * self.wind_scale
         return scalar_coeffs, wind_coeffs
 
@@ -369,9 +380,9 @@ class HopfSynthesis(nn.Module):
         with amp.autocast(device_type=scalar_coeffs.device.type, enabled=False):
             fields = [self.isht(scalar_coeffs)]
             if wind_coeffs is not None:
-                wind = self.ivsht(wind_coeffs / self.wind_scale)  # (B, n_pairs, 2, H, W) as (u_theta, u_phi)
+                # components come back in the same (u, v)-as-(u_theta, u_phi) convention the projection used
+                wind = self.ivsht(wind_coeffs / self.wind_scale)
                 B, _, _, H, W = wind.shape
-                wind = torch.stack([wind[:, :, 1], -wind[:, :, 0]], dim=2)  # back to (u, v)
                 fields.append(wind.reshape(B, -1, H, W))
             x = torch.cat(fields, dim=1)[:, inverse_permutation]
         return x
