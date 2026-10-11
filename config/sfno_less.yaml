@@ -158,16 +158,11 @@ sfno_less_crps: &SFNO_LESS_CRPS
     # is biased towards under-dispersion, severely so with 4 members
     ensemble_size: 4
 
+    # pointwise fair CRPS only: this study is about how to train, so no spectral CRPS term on top
     losses:
     -   type: "ensemble_crps"
         channel_weights: "constant"
         relative_weight: 1.0
-        temp_diff_normalization: !!bool True
-        parameters:
-            crps_type: "skillspread"
-    -   type: "ensemble_spectral_crps"
-        channel_weights: "constant"
-        relative_weight: 0.1
         temp_diff_normalization: !!bool True
         parameters:
             crps_type: "skillspread"
