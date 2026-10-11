@@ -82,9 +82,9 @@ base_config: &BASE_CONFIG
     num_data_workers: 2
     num_visualization_workers: 2
 
-    # time stepping: trained on the 6-hourly dataset, one step = 6 h
+    # time stepping: trained on the 6-hourly dataset, one step = 6 h; the model sees the last two states
     dt: 1
-    n_history: 0
+    n_history: 1
     prediction_type: "iterative"
 
     # validation
@@ -142,7 +142,7 @@ sfno_less_deterministic: &SFNO_LESS_DETERMINISTIC
 
     losses:
     -   type: "l2"
-        channel_weights: "auto"
+        channel_weights: "constant"
         temp_diff_normalization: !!bool True
         parameters:
             squared: !!bool True
@@ -155,13 +155,13 @@ sfno_less_crps: &SFNO_LESS_CRPS
     # standard CRPS; underestimates spread with small ensembles, switch to "skillspread" for fine-tuning
     losses:
     -   type: "ensemble_crps"
-        channel_weights: "auto"
+        channel_weights: "constant"
         relative_weight: 1.0
         temp_diff_normalization: !!bool True
         parameters:
             crps_type: "cdf"
     -   type: "ensemble_spectral_crps"
-        channel_weights: "auto"
+        channel_weights: "constant"
         relative_weight: 0.1
         temp_diff_normalization: !!bool True
         parameters:
