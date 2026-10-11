@@ -34,11 +34,12 @@ base_config: &BASE_CONFIG
     nettype: "SFNOv2"
     model_grid_type: "equiangular"
     sht_grid_type: "equiangular"  # internal grid = data grid, 721 x 1440, Clenshaw-Curtis quadrature everywhere
-    scale_factor: 1
+    scale_factor: 1               # keep the full 721 x 1440 grid internally: oversampled relative to lmax, so that
+                                  # products from the nonlinearities alias less before the next spectral truncation
     lmax: 640                     # ERA5 is TL639 (l <= 639). Above the exact limit (360) of this grid, but the
                                   # Clenshaw-Curtis aliasing at 640 is < 1e-4 on ERA5 fields (720 would break down)
-    embed_dim: 384
-    num_layers: 8
+    embed_dim: 512
+    num_layers: 6
     mlp_ratio: 2
     encoder_layers: 1
     normalization_layer: "instance_norm"
