@@ -84,6 +84,8 @@ class TestSFNOv2(unittest.TestCase):
             {"pos_embed": "none", "use_film": False, "skip": "linear", "normalization_layer": "instance_norm_s2"},
             {"out_shape": (16, 32)},
             {"scale_factor": 1, "sht_grid_type": "equiangular", "lmax": 24},
+            {"num_groups": 4},
+            {"separable": True},
         ):
             with self.subTest(**kwargs):
                 model = self._model(**kwargs)
@@ -108,6 +110,22 @@ class TestSFNOv2(unittest.TestCase):
             out = model(inp)
             out_rot = model(torch.roll(inp, shift, dims=-1))
         self.assertTrue(torch.allclose(torch.roll(out, shift, dims=-1), out_rot, atol=1e-4, rtol=1e-4))
+
+    def test_filter_parametrization(self):
+        # spectral weight count: embed_dim^2 * lmax / num_groups, or embed_dim * lmax when separable
+        def n_filter_params(model):
+            return sum(p.numel() for p in model.blocks[0].filter.parameters())
+
+        dense = n_filter_params(self._model())
+        self.assertEqual(dense, 16 * 16 * 15)
+        self.assertEqual(n_filter_params(self._model(num_groups=4)), dense // 4)
+        self.assertEqual(n_filter_params(self._model(separable=True)), 16 * 15)
+        # transforms are shared when the internal grid is the data grid
+        model = self._model(scale_factor=1, sht_grid_type="equiangular", lmax=24)
+        self.assertIs(model.project_internal, model.project_in)
+        self.assertIs(model.synthesize_out, model.synthesize_internal)
+        model = self._model()
+        self.assertIsNot(model.project_internal, model.project_in)
 
     def test_vector_wind_normalization_guard(self):
         self.assertTrue(SphericalFourierNeuralOperatorNetV2.requires_vector_wind_normalization)

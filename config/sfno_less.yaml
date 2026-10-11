@@ -40,6 +40,8 @@ base_config: &BASE_CONFIG
                                   # Clenshaw-Curtis aliasing at 640 is < 1e-4 on ERA5 fields (720 would break down)
     embed_dim: 512
     num_layers: 6
+    num_groups: 8                 # per-degree channel mixing in 64-channel groups: 42M spectral params per block
+                                  # (dense would be 335M per block, 2B total, and does not fit at lmax 640)
     mlp_ratio: 2
     encoder_layers: 1
     normalization_layer: "instance_norm"

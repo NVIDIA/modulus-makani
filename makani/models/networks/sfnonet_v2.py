@@ -448,6 +448,13 @@ class NeuralOperatorBlock(nn.Module):
         ``"identity"`` (default) or ``"linear"``, a learned 1x1 convolution.
     layer_scale_init : float, optional
         Initial value of the per-channel branch scale, by default ``0.1``.
+    num_groups : int, optional
+        Channel groups of the spectral filter, by default ``1``. The filter
+        mixes channels per degree within each group; the weight count is
+        ``embed_dim**2 * lmax / num_groups``.
+    separable : bool, optional
+        Depthwise spectral filter (no channel mixing in the filter), by default
+        ``False``.
     checkpointing_level : int, optional
         The MLP is checkpointed at level 2 and above, by default ``0``.
     """
@@ -465,12 +472,24 @@ class NeuralOperatorBlock(nn.Module):
         film=None,
         skip="identity",
         layer_scale_init=0.1,
+        num_groups=1,
+        separable=False,
         checkpointing_level=0,
     ):
         super().__init__()
 
         self.norm0 = norm_layer()
-        self.filter = SpectralConv(sht, isht, embed_dim, embed_dim, operator_type="dhconv", separable=False, bias=False, gain=1.0)
+        self.filter = SpectralConv(
+            sht,
+            isht,
+            embed_dim,
+            embed_dim,
+            num_groups=num_groups,
+            operator_type="dhconv",
+            separable=separable,
+            bias=False,
+            gain=1.0,
+        )
         self.norm1 = norm_layer()
         self.film = film() if film is not None else None
 
@@ -587,6 +606,13 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
     layer_scale_init : float, optional
         Initial value of the per-channel scale on each block's residual
         branch, by default ``0.1``.
+    num_groups : int, optional
+        Channel groups of the spectral filters, by default ``1`` (dense
+        per-degree channel mixing). The spectral weights scale as
+        ``embed_dim**2 * lmax / num_groups`` per block, which at full
+        resolution is what decides whether the model fits in memory.
+    separable : bool, optional
+        Depthwise spectral filters, by default ``False``.
     big_skip : bool, optional
         Add the input state to the output so the network predicts a tendency,
         by default ``True``. Resampled spectrally if the grids differ.
@@ -630,6 +656,8 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
         wind_spectral_scaling="energy",
         skip="identity",
         layer_scale_init=0.1,
+        num_groups=1,
+        separable=False,
         big_skip=True,
         path_drop_rate=0.0,
         mlp_drop_rate=0.0,
@@ -672,11 +700,20 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
 
         wind_scale = _wind_spectral_scale(self.lmax, wind_spectral_scaling)
 
-        # transforms: input grid -> coefficients -> internal grid, and back out
+        # transforms: input grid -> coefficients -> internal grid, and back out. Each transform holds an
+        # (mmax, lmax, nlat) fp32 Legendre table, 1-2 GB at full resolution, so transforms on the same grid
+        # are shared rather than built twice.
+        internal_grid = ((self.h, self.w), sht_grid_type)
         self.project_in = SphericalProjection(self.inp_shape, model_grid_type, self.lmax, wind_scale)
-        self.synthesize_internal = SphericalSynthesis((self.h, self.w), sht_grid_type, self.lmax, wind_scale)
-        self.project_internal = SphericalProjection((self.h, self.w), sht_grid_type, self.lmax, wind_scale)
-        self.synthesize_out = SphericalSynthesis(self.out_shape, model_grid_type, self.lmax, wind_scale)
+        if internal_grid == (self.inp_shape, model_grid_type):
+            self.project_internal = self.project_in
+        else:
+            self.project_internal = SphericalProjection(*internal_grid, self.lmax, wind_scale)
+        self.synthesize_internal = SphericalSynthesis(*internal_grid, self.lmax, wind_scale)
+        if internal_grid == (self.out_shape, model_grid_type):
+            self.synthesize_out = self.synthesize_internal
+        else:
+            self.synthesize_out = SphericalSynthesis(self.out_shape, model_grid_type, self.lmax, wind_scale)
 
         # the processor shares one scalar transform pair
         self.sht = self.project_internal.sht
@@ -762,6 +799,8 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
                     film=film,
                     skip=skip,
                     layer_scale_init=layer_scale_init,
+                    num_groups=num_groups,
+                    separable=separable,
                     checkpointing_level=checkpointing_level,
                 )
                 for i in range(num_layers)
