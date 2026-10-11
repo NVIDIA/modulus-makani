@@ -119,7 +119,7 @@ base_config: &BASE_CONFIG
     # logging
     log_to_screen: !!bool True
     log_to_wandb: !!bool True
-    log_video: 0
+    log_video: 5                  # rollout video to W&B every 5th epoch
     save_checkpoint: "legacy"
     checkpoint_num_versions: 6
     verbose: !!bool False
