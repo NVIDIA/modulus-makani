@@ -122,7 +122,7 @@ base_config: &BASE_CONFIG
     wandb_name: None
     wandb_group: "sfno_less"
     wandb_project: "sfno_less"
-    wandb_entity: "yourwandb"
+    wandb_entity: "bbonev"
 
 ###########################################################################################################################
 # targets
