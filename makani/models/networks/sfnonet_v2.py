@@ -154,6 +154,21 @@ def _make_transform(kind, nlat, nlon, grid_type, lmax):
     return transform.float()
 
 
+def _local_degrees(transform):
+    r"""
+    Degrees held by this rank in the output of ``transform``.
+
+    Distributed transforms shard the spectral coefficients over degree across
+    the polar process group and expose the per-rank counts as ``l_shapes``;
+    serial transforms hold every degree.
+    """
+    if hasattr(transform, "l_shapes"):
+        rank = comm.get_rank("h")
+        offset = sum(transform.l_shapes[:rank])
+        return slice(offset, offset + transform.l_shapes[rank])
+    return slice(None)
+
+
 def _wind_spectral_scale(lmax, mode):
     r"""
     Per-degree scaling applied to the vector SHT coefficients of the wind.
@@ -265,7 +280,8 @@ class SphericalProjection(nn.Module):
         super().__init__()
         self.sht = _make_transform("sht", *shape, grid_type, lmax)
         self.vsht = _make_transform("vsht", *shape, grid_type, lmax)
-        self.register_buffer("wind_scale", wind_scale.clone(), persistent=False)
+        # the coefficients may be sharded over degree; keep the matching slice of the scaling
+        self.register_buffer("wind_scale", wind_scale[_local_degrees(self.vsht)].clone(), persistent=False)
 
     def forward(self, x, scalar_channels, wind_channels):
         r"""
@@ -317,7 +333,7 @@ class SphericalSynthesis(nn.Module):
         super().__init__()
         self.isht = _make_transform("isht", *shape, grid_type, lmax)
         self.ivsht = _make_transform("ivsht", *shape, grid_type, lmax)
-        self.register_buffer("wind_scale", wind_scale.clone(), persistent=False)
+        self.register_buffer("wind_scale", wind_scale[_local_degrees(self.ivsht)].clone(), persistent=False)
 
     def forward(self, scalar_coeffs, wind_coeffs, inverse_permutation):
         r"""
