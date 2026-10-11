@@ -17,12 +17,80 @@ import torch
 
 import torch.amp as amp
 
+import torch_harmonics as th
+import torch_harmonics.distributed as thd
 from torch_harmonics.quadrature import legendre_gauss_weights, clenshaw_curtiss_weights, precompute_latitudes
 
 
 from makani.utils import comm
 from torch_harmonics.distributed import compute_split_shapes, split_tensor_along_dim
 from makani.mpu.mappings import reduce_from_parallel_region
+
+
+_SERIAL_TRANSFORMS = {
+    "sht": th.RealSHT,
+    "isht": th.InverseRealSHT,
+    "vsht": th.RealVectorSHT,
+    "ivsht": th.InverseRealVectorSHT,
+}
+
+_DISTRIBUTED_TRANSFORMS = {
+    "sht": thd.DistributedRealSHT,
+    "isht": thd.DistributedInverseRealSHT,
+    "vsht": thd.DistributedRealVectorSHT,
+    "ivsht": thd.DistributedInverseRealVectorSHT,
+}
+
+
+def get_spectral_transform(kind, nlat, nlon, grid_type, lmax=None, mmax=None, distributed=False):
+    r"""
+    Construct a (vector) spherical harmonic transform from a grid name and resolution.
+
+    The one place in makani that calls torch-harmonics transform constructors.
+    It accepts both constructor conventions: the ``(nlat, nlon, grid=...)``
+    signature of torch-harmonics 0.9.x and the grid-descriptor signature of
+    1.0, which is used whenever :func:`torch_harmonics.as_grid` exists.
+    Callers that use the distributed transforms must have initialized
+    ``torch_harmonics.distributed`` themselves.
+
+    Parameters
+    ----------
+    kind : str
+        ``"sht"``, ``"isht"``, ``"vsht"`` or ``"ivsht"``.
+    nlat, nlon : int
+        Grid resolution.
+    grid_type : str
+        Grid name, e.g. ``"equiangular"`` or ``"legendre-gauss"``.
+    lmax, mmax : int, optional
+        Cutoffs (exclusive). ``None`` leaves the choice to torch-harmonics.
+    distributed : bool, optional
+        Use the spatially distributed transform, by default ``False``.
+
+    Returns
+    -------
+    torch.nn.Module
+        The transform.
+
+    Raises
+    ------
+    ValueError
+        If an explicitly requested cutoff is not the one the transform ends up
+        with, which would mean torch-harmonics silently truncated it.
+    """
+    handle = (_DISTRIBUTED_TRANSFORMS if distributed else _SERIAL_TRANSFORMS)[kind]
+
+    if hasattr(th, "as_grid"):
+        transform = handle(th.as_grid(grid_type, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax)
+    else:
+        transform = handle(nlat, nlon, lmax=lmax, mmax=mmax, grid=grid_type)
+
+    if ((lmax is not None) and (transform.lmax != lmax)) or ((mmax is not None) and (transform.mmax != mmax)):
+        raise ValueError(
+            f"{kind} on a {nlat}x{nlon} {grid_type} grid was built with (lmax, mmax)=({transform.lmax}, {transform.mmax}) "
+            f"instead of the requested ({lmax}, {mmax})"
+        )
+
+    return transform
 
 
 def grid_to_quadrature_rule(grid_type):

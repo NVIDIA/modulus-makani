@@ -26,6 +26,7 @@ import h5py as h5
 from torch import amp
 import torch.distributed as dist
 from makani.utils import comm
+from makani.utils.grids import get_spectral_transform
 from makani.models.common import RealFFT1
 from makani.mpu.fft import DistributedRealFFT1
 from torch_harmonics.distributed import compute_split_shapes, split_tensor_along_dim
@@ -1141,14 +1142,14 @@ class SpectrumAverageBuffer(MeanStdBuffer):
                 polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
                 azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
                 thd.init(polar_group, azimuth_group)
-            self.sht = thd.DistributedRealSHT(*img_shape, grid=grid_type)
+            self.sht = get_spectral_transform("sht", *img_shape, grid_type, distributed=True)
             self.lmax = self.sht.lmax
             self.lmax_local = self.sht.l_shapes[comm.get_rank("h")]
             # compute loffset
             offsets = [0] + np.cumsum(self.sht.l_shapes).tolist()
             self.lmax_offset = offsets[comm.get_rank("h")]
         else:
-            self.sht = th.RealSHT(*img_shape, grid=grid_type)
+            self.sht = get_spectral_transform("sht", *img_shape, grid_type)
             self.lmax = self.sht.lmax
             self.lmax_local = self.lmax
             self.lmax_offset = 0

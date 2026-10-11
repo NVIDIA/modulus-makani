@@ -82,75 +82,23 @@ from makani.mpu.layers import DistributedMLP, DistributedEncoderDecoder
 from makani.mpu.layer_norm import DistributedInstanceNorm2d, DistributedLayerNorm, DistributedGeometricInstanceNormS2
 from makani.utils import comm
 from makani.utils.features import get_channel_groups, get_wind_channels
-from makani.utils.grids import GridQuadrature, compute_spherical_bandlimit, grid_to_quadrature_rule
+from makani.utils.grids import GridQuadrature, compute_spherical_bandlimit, get_spectral_transform, grid_to_quadrature_rule
 
 
 # ---------------------------------------------------------------------------
 # spectral transforms
 # ---------------------------------------------------------------------------
 
-_SERIAL_TRANSFORMS = {
-    "sht": th.RealSHT,
-    "isht": th.InverseRealSHT,
-    "vsht": th.RealVectorSHT,
-    "ivsht": th.InverseRealVectorSHT,
-}
-
-_DISTRIBUTED_TRANSFORMS = {
-    "sht": thd.DistributedRealSHT,
-    "isht": thd.DistributedInverseRealSHT,
-    "vsht": thd.DistributedRealVectorSHT,
-    "ivsht": thd.DistributedInverseRealVectorSHT,
-}
-
-
 def _make_transform(kind, nlat, nlon, grid_type, lmax):
     r"""
-    Construct a (vector) spherical harmonic transform with an explicit triangular cutoff.
-
-    The single place in this file that calls into torch-harmonics constructors.
-    Handles the serial/distributed choice and both constructor conventions:
-    the ``(nlat, nlon, grid=...)`` signature of torch-harmonics 0.9.x, which
-    the rest of makani uses, and the grid-descriptor signature of 1.0, which
-    is selected whenever :func:`torch_harmonics.as_grid` exists. Migrating the
-    model to grid descriptors therefore touches only this function.
-
-    Parameters
-    ----------
-    kind : str
-        ``"sht"``, ``"isht"``, ``"vsht"`` or ``"ivsht"``.
-    nlat, nlon : int
-        Grid resolution.
-    grid_type : str
-        Grid name, e.g. ``"equiangular"`` or ``"legendre-gauss"``.
-    lmax : int
-        Cutoff degree (exclusive). Also used as ``mmax``.
-
-    Returns
-    -------
-    torch.nn.Module
-        The transform, with fp32 buffers.
-
-    Raises
-    ------
-    ValueError
-        If the constructed transform does not carry the requested cutoff,
-        which would mean the library silently truncated it.
+    Build a (vector) SHT with an explicit triangular cutoff ``lmax = mmax``,
+    serial or spatially distributed as the process grid dictates, with fp32
+    buffers. Wraps :func:`makani.utils.grids.get_spectral_transform`, which
+    handles both torch-harmonics constructor conventions.
     """
-    handles = _DISTRIBUTED_TRANSFORMS if comm.get_size("spatial") > 1 else _SERIAL_TRANSFORMS
-    handle = handles[kind]
-
-    if hasattr(th, "as_grid"):
-        transform = handle(th.as_grid(grid_type, nlat=nlat, nlon=nlon), lmax=lmax, mmax=lmax)
-    else:
-        transform = handle(nlat, nlon, lmax=lmax, mmax=lmax, grid=grid_type)
-
-    if (transform.lmax != lmax) or (transform.mmax != lmax):
-        raise ValueError(
-            f"{kind} on a {nlat}x{nlon} {grid_type} grid was built with (lmax, mmax)=({transform.lmax}, {transform.mmax}) "
-            f"instead of the requested cutoff {lmax}"
-        )
-
+    transform = get_spectral_transform(
+        kind, nlat, nlon, grid_type, lmax=lmax, mmax=lmax, distributed=(comm.get_size("spatial") > 1)
+    )
     return transform.float()
 
 

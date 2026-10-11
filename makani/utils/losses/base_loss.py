@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch_harmonics as th
 import torch_harmonics.distributed as thd
 
-from makani.utils.grids import grid_to_quadrature_rule, GridQuadrature, compute_spherical_bandlimit
+from makani.utils.grids import grid_to_quadrature_rule, GridQuadrature, compute_spherical_bandlimit, get_spectral_transform
 from makani.utils import comm
 from makani.utils.features import get_wind_channels
 from torch_harmonics.distributed import split_tensor_along_dim
@@ -395,9 +395,9 @@ class SpectralBaseLoss(nn.Module, metaclass=ABCMeta):
                 polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
                 azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
                 thd.init(polar_group, azimuth_group)
-            self.sht = thd.DistributedRealSHT(*img_shape, lmax=lmax, mmax=lmax, grid=grid_type)
+            self.sht = get_spectral_transform("sht", *img_shape, grid_type, lmax=lmax, mmax=lmax, distributed=True)
         else:
-            self.sht = th.RealSHT(*img_shape, lmax=lmax, mmax=lmax, grid=grid_type).float()
+            self.sht = get_spectral_transform("sht", *img_shape, grid_type, lmax=lmax, mmax=lmax).float()
 
         # get the local l weights
         l_weights = torch.ones(self.sht.lmax, dtype=torch.float32)
@@ -477,15 +477,11 @@ class VortDivBaseLoss(nn.Module, metaclass=ABCMeta):
                 polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
                 azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
                 thd.init(polar_group, azimuth_group)
-            self.vsht = thd.DistributedRealVectorSHT(*img_shape, lmax=lmax, mmax=lmax, grid=grid_type)
-            self.isht = thd.DistributedInverseRealVectorSHT(
-                nlat=self.vsht.nlat, nlon=self.vsht.nlon, lmax=lmax, mmax=lmax, grid=grid_type
-            )
+            self.vsht = get_spectral_transform("vsht", *img_shape, grid_type, lmax=lmax, mmax=lmax, distributed=True)
+            self.isht = get_spectral_transform("ivsht", *img_shape, grid_type, lmax=lmax, mmax=lmax, distributed=True)
         else:
-            self.vsht = th.RealVectorSHT(*img_shape, lmax=lmax, mmax=lmax, grid=grid_type)
-            self.isht = th.InverseRealVectorSHT(
-                nlat=self.vsht.nlat, nlon=self.vsht.nlon, lmax=lmax, mmax=lmax, grid=grid_type
-            )
+            self.vsht = get_spectral_transform("vsht", *img_shape, grid_type, lmax=lmax, mmax=lmax)
+            self.isht = get_spectral_transform("ivsht", *img_shape, grid_type, lmax=lmax, mmax=lmax)
 
         # get the quadrature rule for the corresponding grid
         quadrature_rule = grid_to_quadrature_rule(grid_type)
@@ -562,15 +558,11 @@ class GradientBaseLoss(nn.Module, metaclass=ABCMeta):
                 polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
                 azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
                 thd.init(polar_group, azimuth_group)
-            self.sht = thd.DistributedRealSHT(*img_shape, lmax=lmax, mmax=lmax, grid=grid_type)
-            self.ivsht = thd.DistributedInverseRealVectorSHT(
-                nlat=self.sht.nlat, nlon=self.sht.nlon, lmax=lmax, mmax=lmax, grid=grid_type
-            )
+            self.sht = get_spectral_transform("sht", *img_shape, grid_type, lmax=lmax, mmax=lmax, distributed=True)
+            self.ivsht = get_spectral_transform("ivsht", *img_shape, grid_type, lmax=lmax, mmax=lmax, distributed=True)
         else:
-            self.sht = th.RealSHT(*img_shape, lmax=lmax, mmax=lmax, grid=grid_type)
-            self.ivsht = th.InverseRealVectorSHT(
-                nlat=self.sht.nlat, nlon=self.sht.nlon, lmax=lmax, mmax=lmax, grid=grid_type
-            )
+            self.sht = get_spectral_transform("sht", *img_shape, grid_type, lmax=lmax, mmax=lmax)
+            self.ivsht = get_spectral_transform("ivsht", *img_shape, grid_type, lmax=lmax, mmax=lmax)
 
         # get the quadrature rule for the corresponding grid
         quadrature_rule = grid_to_quadrature_rule(grid_type)
