@@ -72,7 +72,9 @@ class TestSFNOv2(unittest.TestCase):
         # exact limit of 15 (resolvable up to 32)
         model = self._model(scale_factor=1, sht_grid_type="equiangular", lmax=24)
         self.assertEqual((model.lmax, model.project_in.sht.lmax, model.sht.lmax), (24, 24, 24))
-        self.assertEqual((model.sht.nlat, model.sht.nlon, model.sht.grid), (32, 64, "equiangular"))
+        # torch-harmonics < 1.0 stores the grid name, >= 1.0 a grid descriptor with a grid_type
+        grid_type = getattr(model.sht.grid, "grid_type", model.sht.grid)
+        self.assertEqual((model.sht.nlat, model.sht.nlon, grid_type), (32, 64, "equiangular"))
         with self.assertRaises(ValueError):
             self._model(scale_factor=1, sht_grid_type="equiangular", lmax=33)
 
