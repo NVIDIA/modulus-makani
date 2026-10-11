@@ -64,15 +64,17 @@ class TestSFNOv2(unittest.TestCase):
         self.assertEqual(model.lmax, 15)
         for t in (model.project_in.sht, model.project_in.vsht, model.synthesize_internal.isht, model.synthesize_out.ivsht, model.sht, model.isht):
             self.assertEqual((t.lmax, t.mmax), (15, 15))
-        # above the internal grid's limit: refused
+        # an explicit cutoff may exceed the exact limit, but not what the 16x32 internal grid resolves
+        self.assertEqual(self._model(lmax=16).lmax, 16)
         with self.assertRaises(ValueError):
-            self._model(lmax=16)
-        # scale_factor 1: a 32x64 Legendre-Gauss internal grid resolves lmax 31, and an explicit cutoff may go
-        # beyond the equiangular data grid's exact limit of 15 (Clenshaw-Curtis aliases little there)
-        model = self._model(scale_factor=1, lmax=24)
+            self._model(lmax=17)
+        # the LESS setting: internal grid = data grid, equiangular with Clenshaw-Curtis, cutoff beyond the
+        # exact limit of 15 (resolvable up to 32)
+        model = self._model(scale_factor=1, sht_grid_type="equiangular", lmax=24)
         self.assertEqual((model.lmax, model.project_in.sht.lmax, model.sht.lmax), (24, 24, 24))
+        self.assertEqual((model.sht.nlat, model.sht.nlon, model.sht.grid), (32, 64, "equiangular"))
         with self.assertRaises(ValueError):
-            self._model(scale_factor=1, lmax=32)
+            self._model(scale_factor=1, sht_grid_type="equiangular", lmax=33)
 
     def test_forward_backward(self):
         for kwargs in (
@@ -81,6 +83,7 @@ class TestSFNOv2(unittest.TestCase):
             {"channel_names": ["t2m", "z500"], "inp_chans": 2, "out_chans": 2},
             {"pos_embed": "none", "use_film": False, "skip": "linear", "normalization_layer": "instance_norm_s2"},
             {"out_shape": (16, 32)},
+            {"scale_factor": 1, "sht_grid_type": "equiangular", "lmax": 24},
         ):
             with self.subTest(**kwargs):
                 model = self._model(**kwargs)
