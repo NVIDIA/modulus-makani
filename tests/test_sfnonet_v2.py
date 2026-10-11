@@ -148,6 +148,21 @@ class TestSFNOv2(unittest.TestCase):
             bad_scale[1] = 2.5
             _check_vector_wind_normalization(bias, bad_scale, CHANNEL_NAMES, "SFNOv2")
 
+    def test_wind_components(self):
+        # solid-body rotation u = cos(lat), v = 0 is purely rotational: no divergent component, and the
+        # rotational one carries the field's energy. Pins the (u_theta, u_phi) ordering of the vector SHT.
+        model = self._model()
+        nlat, nlon = self.inp_shape
+        lat = torch.linspace(torch.pi / 2, -torch.pi / 2, nlat, device=self.device)
+        x = torch.zeros(1, 6, nlat, nlon, device=self.device)
+        x[0, 0] = torch.cos(lat)[:, None]  # u10m
+        with torch.no_grad():
+            _, wind_coeffs = model.project_in(x, model.scalar_out, model.wind_out)
+        div, rot = wind_coeffs[0, 0, 0], wind_coeffs[0, 0, 1]
+        self.assertLess(div.abs().max().item(), 1e-4 * rot.abs().max().item())
+        # the rotation is the l=1, m=0 mode; with the energy scaling its coefficient squared is the field energy
+        self.assertGreater(rot[1, 0].abs().item(), 0.99 * rot.abs().max().item())
+
     def test_wind_roundtrip(self):
         # a band-limited vector field passes projection and synthesis unchanged
         model = self._model()

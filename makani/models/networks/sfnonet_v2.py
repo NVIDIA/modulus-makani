@@ -255,14 +255,25 @@ def _compute_channel_layout(channel_names, aux_channel_names, n_history, inp_cha
 # ---------------------------------------------------------------------------
 
 
-class SphericalProjection(nn.Module):
+class HopfProjection(nn.Module):
     r"""
-    Grid-to-spectral projection that handles scalar fields and wind vectors.
+    Grid-to-spectral projection that handles scalar fields and wind vectors:
+    the "Hopf encoding" of the state.
 
-    Scalar channels go through the scalar SHT, wind pairs through the vector
-    SHT. Both are truncated at the same ``lmax``. The result is a pair of
-    coefficient tensors, so that a matching :class:`SphericalSynthesis` on any
+    Scalar channels go through the scalar SHT. Wind pairs go through the
+    vector SHT, which is the spectral form of the Helmholtz-Hodge
+    decomposition: each tangent vector field becomes a divergent (curl-free)
+    and a rotational (divergence-free) scalar component, so that the wind can
+    be carried by scalar machinery without losing its vector character. Both
+    transforms are truncated at the same ``lmax``. The result is a pair of
+    coefficient tensors, so that a matching :class:`HopfSynthesis` on any
     other grid can evaluate the band-limited field there.
+
+    The per-degree ``wind_scale`` decides which quantity the two wind
+    components represent (potentials, energy-matched, or vorticity and
+    divergence); see :func:`_wind_spectral_scale`. What matters for the MLPs
+    downstream is that the resulting fields are of order one like the
+    normalized scalar channels.
 
     Parameters
     ----------
@@ -300,7 +311,8 @@ class SphericalProjection(nn.Module):
             Complex coefficients of shape ``(B, n_scalar, lmax, lmax)``.
         wind_coeffs : torch.Tensor or None
             Complex coefficients of shape ``(B, n_pairs, 2, lmax, lmax)``;
-            index 0 is the divergent, index 1 the rotational component.
+            index 0 is the divergent (spheroidal), index 1 the rotational
+            (toroidal) component.
         """
         with amp.autocast(device_type=x.device.type, enabled=False):
             x = x.to(torch.float32)
@@ -309,13 +321,17 @@ class SphericalProjection(nn.Module):
             if wind_channels.numel() > 0:
                 B, _, H, W = x.shape
                 wind = x[:, wind_channels].reshape(B, -1, 2, H, W)
+                # the vector SHT takes (u_theta, u_phi): colatitudinal (southward, i.e. -v) first, zonal second.
+                # Passing (u, v) would still be an equivariant bijection, but would swap which component is
+                # divergent and which is rotational.
+                wind = torch.stack([-wind[:, :, 1], wind[:, :, 0]], dim=2)
                 wind_coeffs = self.vsht(wind) * self.wind_scale
         return scalar_coeffs, wind_coeffs
 
 
-class SphericalSynthesis(nn.Module):
+class HopfSynthesis(nn.Module):
     r"""
-    Spectral-to-grid synthesis, the inverse of :class:`SphericalProjection`.
+    Spectral-to-grid synthesis, the inverse of :class:`HopfProjection`.
 
     Parameters
     ----------
@@ -340,7 +356,7 @@ class SphericalSynthesis(nn.Module):
         Parameters
         ----------
         scalar_coeffs, wind_coeffs
-            As returned by :class:`SphericalProjection`.
+            As returned by :class:`HopfProjection`.
         inverse_permutation : torch.Tensor
             Channel order that restores the original layout from the
             concatenation ``[scalars, u0, v0, u1, v1, ...]``.
@@ -353,8 +369,9 @@ class SphericalSynthesis(nn.Module):
         with amp.autocast(device_type=scalar_coeffs.device.type, enabled=False):
             fields = [self.isht(scalar_coeffs)]
             if wind_coeffs is not None:
-                wind = self.ivsht(wind_coeffs / self.wind_scale)
+                wind = self.ivsht(wind_coeffs / self.wind_scale)  # (B, n_pairs, 2, H, W) as (u_theta, u_phi)
                 B, _, _, H, W = wind.shape
+                wind = torch.stack([wind[:, :, 1], -wind[:, :, 0]], dim=2)  # back to (u, v)
                 fields.append(wind.reshape(B, -1, H, W))
             x = torch.cat(fields, dim=1)[:, inverse_permutation]
         return x
@@ -720,16 +737,16 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
         # (mmax, lmax, nlat) fp32 Legendre table, 1-2 GB at full resolution, so transforms on the same grid
         # are shared rather than built twice.
         internal_grid = ((self.h, self.w), sht_grid_type)
-        self.project_in = SphericalProjection(self.inp_shape, model_grid_type, self.lmax, wind_scale)
+        self.project_in = HopfProjection(self.inp_shape, model_grid_type, self.lmax, wind_scale)
         if internal_grid == (self.inp_shape, model_grid_type):
             self.project_internal = self.project_in
         else:
-            self.project_internal = SphericalProjection(*internal_grid, self.lmax, wind_scale)
-        self.synthesize_internal = SphericalSynthesis(*internal_grid, self.lmax, wind_scale)
+            self.project_internal = HopfProjection(*internal_grid, self.lmax, wind_scale)
+        self.synthesize_internal = HopfSynthesis(*internal_grid, self.lmax, wind_scale)
         if internal_grid == (self.out_shape, model_grid_type):
             self.synthesize_out = self.synthesize_internal
         else:
-            self.synthesize_out = SphericalSynthesis(self.out_shape, model_grid_type, self.lmax, wind_scale)
+            self.synthesize_out = HopfSynthesis(self.out_shape, model_grid_type, self.lmax, wind_scale)
 
         # the processor shares one scalar transform pair
         self.sht = self.project_internal.sht
