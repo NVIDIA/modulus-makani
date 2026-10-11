@@ -42,7 +42,7 @@ _DISTRIBUTED_TRANSFORMS = {
 }
 
 
-def get_spectral_transform(kind, nlat, nlon, grid_type, lmax=None, mmax=None, distributed=False):
+def get_spectral_transform(kind, nlat, nlon, grid_type, lmax=None, mmax=None, distributed=False, strict=False):
     r"""
     Construct a (vector) spherical harmonic transform from a grid name and resolution.
 
@@ -65,6 +65,11 @@ def get_spectral_transform(kind, nlat, nlon, grid_type, lmax=None, mmax=None, di
         Cutoffs (exclusive). ``None`` leaves the choice to torch-harmonics.
     distributed : bool, optional
         Use the spatially distributed transform, by default ``False``.
+    strict : bool, optional
+        Require the transform to carry exactly the requested cutoffs, by
+        default ``False``. torch-harmonics >= 0.9 applies a triangular
+        truncation ``lmax = mmax = min(lmax, mmax)``; the older models rely
+        on that, models that treat the cutoff as an invariant pass ``True``.
 
     Returns
     -------
@@ -74,8 +79,8 @@ def get_spectral_transform(kind, nlat, nlon, grid_type, lmax=None, mmax=None, di
     Raises
     ------
     ValueError
-        If an explicitly requested cutoff is not the one the transform ends up
-        with, which would mean torch-harmonics silently truncated it.
+        With ``strict=True``, if an explicitly requested cutoff is not the one
+        the transform ends up with.
     """
     handle = (_DISTRIBUTED_TRANSFORMS if distributed else _SERIAL_TRANSFORMS)[kind]
 
@@ -84,7 +89,8 @@ def get_spectral_transform(kind, nlat, nlon, grid_type, lmax=None, mmax=None, di
     else:
         transform = handle(nlat, nlon, lmax=lmax, mmax=mmax, grid=grid_type)
 
-    if ((lmax is not None) and (transform.lmax != lmax)) or ((mmax is not None) and (transform.mmax != mmax)):
+    mismatch = ((lmax is not None) and (transform.lmax != lmax)) or ((mmax is not None) and (transform.mmax != mmax))
+    if strict and mismatch:
         raise ValueError(
             f"{kind} on a {nlat}x{nlon} {grid_type} grid was built with (lmax, mmax)=({transform.lmax}, {transform.mmax}) "
             f"instead of the requested ({lmax}, {mmax})"

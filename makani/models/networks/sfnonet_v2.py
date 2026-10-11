@@ -97,7 +97,7 @@ def _make_transform(kind, nlat, nlon, grid_type, lmax):
     handles both torch-harmonics constructor conventions.
     """
     transform = get_spectral_transform(
-        kind, nlat, nlon, grid_type, lmax=lmax, mmax=lmax, distributed=(comm.get_size("spatial") > 1)
+        kind, nlat, nlon, grid_type, lmax=lmax, mmax=lmax, distributed=(comm.get_size("spatial") > 1), strict=True
     )
     return transform.float()
 
