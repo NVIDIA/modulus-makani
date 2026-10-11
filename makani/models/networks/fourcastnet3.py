@@ -35,6 +35,7 @@ from makani.mpu.layers import DistributedMLP
 
 # more distributed stuff
 from makani.utils import comm
+from makani.utils.grids import get_spectral_transform, get_disco_conv, get_resample
 
 # for annotation of models
 from dataclasses import dataclass
@@ -187,12 +188,10 @@ class DiscreteContinuousEncoder(nn.Module):
         theta_cutoff = _compute_cutoff_radius(nlat=inp_shape[0], kernel_shape=kernel_shape, basis_type=basis_type)
 
         # set up local convolution
-        conv_handle = (
-            thd.DistributedDiscreteContinuousConvS2 if comm.get_size("spatial") > 1 else th.DiscreteContinuousConvS2
-        )
-        self.conv = conv_handle(
+        self.conv = get_disco_conv(
             inp_chans,
             out_chans,
+            distributed=comm.get_size("spatial") > 1,
             in_shape=inp_shape,
             out_shape=out_shape,
             kernel_shape=kernel_shape,
@@ -348,29 +347,24 @@ class DiscreteContinuousDecoder(nn.Module):
         # spatial parallelism in the SHT
         if upsample_sht:
             # set up sht for upsampling
-            sht_handle = thd.DistributedRealSHT if comm.get_size("spatial") > 1 else th.RealSHT
-            isht_handle = thd.DistributedInverseRealSHT if comm.get_size("spatial") > 1 else th.InverseRealSHT
 
             # set upsampling module
-            self.sht = sht_handle(*inp_shape, grid=grid_in).float()
-            self.isht = isht_handle(*out_shape, lmax=self.sht.lmax, mmax=self.sht.mmax, grid=grid_out).float()
+            self.sht = get_spectral_transform("sht", *inp_shape, grid_in, distributed=comm.get_size("spatial") > 1).float()
+            self.isht = get_spectral_transform("isht", *out_shape, grid_out, lmax=self.sht.lmax, mmax=self.sht.mmax, distributed=comm.get_size("spatial") > 1).float()
             self.upsample = nn.Sequential(self.sht, self.isht)
         else:
-            resample_handle = thd.DistributedResampleS2 if comm.get_size("spatial") > 1 else th.ResampleS2
 
-            self.upsample = resample_handle(*inp_shape, *out_shape, grid_in=grid_in, grid_out=grid_out, mode="bilinear")
+            self.upsample = get_resample(inp_shape, out_shape, grid_in, grid_out, mode="bilinear", distributed=comm.get_size("spatial") > 1)
 
         # heuristic for finding theta_cutoff
         # nto entirely clear if out or in shape should be used here with a non-conv method for upsampling
         theta_cutoff = _compute_cutoff_radius(nlat=out_shape[0], kernel_shape=kernel_shape, basis_type=basis_type)
 
         # set up DISCO convolution
-        conv_handle = (
-            thd.DistributedDiscreteContinuousConvS2 if comm.get_size("spatial") > 1 else th.DiscreteContinuousConvS2
-        )
-        self.conv = conv_handle(
+        self.conv = get_disco_conv(
             inp_chans,
             out_chans,
+            distributed=comm.get_size("spatial") > 1,
             in_shape=out_shape,
             out_shape=out_shape,
             kernel_shape=kernel_shape,
@@ -532,12 +526,10 @@ class NeuralOperatorBlock(nn.Module):
                 nlat=self.inp_shape[0], kernel_shape=kernel_shape, basis_type=basis_type
             )
 
-            conv_handle = (
-                thd.DistributedDiscreteContinuousConvS2 if comm.get_size("spatial") > 1 else th.DiscreteContinuousConvS2
-            )
-            self.local_conv = conv_handle(
+            self.local_conv = get_disco_conv(
                 inp_chans,
                 inp_chans,
+                distributed=comm.get_size("spatial") > 1,
                 in_shape=self.inp_shape,
                 out_shape=self.out_shape,
                 kernel_shape=kernel_shape,
@@ -946,20 +938,16 @@ class AtmoSphericNeuralOperatorNet(nn.Module):
             modes_lat = int(self.h * hard_thresholding_fraction)
             modes_lon = int((self.w // 2 + 1) * hard_thresholding_fraction)
 
-        sht_handle = th.RealSHT
-        isht_handle = th.InverseRealSHT
 
         # spatial parallelism in the SHT
         if comm.get_size("spatial") > 1:
             polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
             azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
             thd.init(polar_group, azimuth_group)
-            sht_handle = thd.DistributedRealSHT
-            isht_handle = thd.DistributedInverseRealSHT
 
         # set up
-        self.sht = sht_handle(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
-        self.isht = isht_handle(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
+        self.sht = get_spectral_transform("sht", self.h, self.w, sht_grid_type, lmax=modes_lat, mmax=modes_lon, distributed=comm.get_size("spatial") > 1).float()
+        self.isht = get_spectral_transform("isht", self.h, self.w, sht_grid_type, lmax=modes_lat, mmax=modes_lon, distributed=comm.get_size("spatial") > 1).float()
 
     @torch.compiler.disable(recursive=True)
     def _precompute_channel_groups(

@@ -38,6 +38,7 @@ from makani.mpu.layers import DistributedMLP, DistributedEncoderDecoder
 
 # more distributed stuff
 from makani.utils import comm
+from makani.utils.grids import get_spectral_transform
 
 # layer normalization
 from makani.mpu.layer_norm import DistributedInstanceNorm2d, DistributedLayerNorm, DistributedGeometricInstanceNormS2
@@ -790,19 +791,13 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
 
         # prepare the spectral transforms
         if spectral_transform == "sht":
-            sht_handle = th.RealSHT
-            isht_handle = th.InverseRealSHT
-
-            # parallelism
-            if comm.get_size("spatial") > 1:
-                sht_handle = thd.DistributedRealSHT
-                isht_handle = thd.DistributedInverseRealSHT
+            distributed = comm.get_size("spatial") > 1
 
             # set up
-            self.trans_down = sht_handle(*self.inp_shape, lmax=modes_lat, mmax=modes_lon, grid=model_grid_type).float()
-            self.itrans_up = isht_handle(*self.out_shape, lmax=modes_lat, mmax=modes_lon, grid=model_grid_type).float()
-            self.trans = sht_handle(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
-            self.itrans = isht_handle(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
+            self.trans_down = get_spectral_transform("sht", *self.inp_shape, model_grid_type, lmax=modes_lat, mmax=modes_lon, distributed=distributed).float()
+            self.itrans_up = get_spectral_transform("isht", *self.out_shape, model_grid_type, lmax=modes_lat, mmax=modes_lon, distributed=distributed).float()
+            self.trans = get_spectral_transform("sht", self.h, self.w, sht_grid_type, lmax=modes_lat, mmax=modes_lon, distributed=distributed).float()
+            self.itrans = get_spectral_transform("isht", self.h, self.w, sht_grid_type, lmax=modes_lat, mmax=modes_lon, distributed=distributed).float()
 
         elif spectral_transform == "fft":
             fft_handle = RealFFT2

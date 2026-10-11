@@ -80,7 +80,7 @@ def get_spectral_transform(kind, nlat, nlon, grid_type, lmax=None, mmax=None, di
     handle = (_DISTRIBUTED_TRANSFORMS if distributed else _SERIAL_TRANSFORMS)[kind]
 
     if hasattr(th, "as_grid"):
-        transform = handle(th.as_grid(grid_type, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax)
+        transform = handle(_as_grid(grid_type, nlat, nlon), lmax=lmax, mmax=mmax)
     else:
         transform = handle(nlat, nlon, lmax=lmax, mmax=mmax, grid=grid_type)
 
@@ -91,6 +91,105 @@ def get_spectral_transform(kind, nlat, nlon, grid_type, lmax=None, mmax=None, di
         )
 
     return transform
+
+
+def _as_grid(grid, nlat, nlon):
+    """Grid descriptor for torch-harmonics >= 1.0; accepts a grid name or an existing descriptor."""
+    if not isinstance(grid, str):
+        return grid
+    return th.as_grid(grid, nlat=nlat, nlon=nlon)
+
+
+def get_disco_conv(
+    in_channels, out_channels, in_shape, out_shape, kernel_shape, grid_in, grid_out, transpose=False, distributed=False, **kwargs
+):
+    r"""
+    Construct a DISCO convolution on the sphere, in either torch-harmonics API.
+
+    Same role as :func:`get_spectral_transform` for the discrete-continuous
+    convolutions: torch-harmonics 0.9.x takes resolutions and grid names, 1.0
+    takes grid descriptors. ``theta_cutoff`` should be passed explicitly,
+    since its default differs between versions.
+
+    Parameters
+    ----------
+    in_channels, out_channels : int
+        Channel counts.
+    in_shape, out_shape : (int, int)
+        Input and output grid resolutions.
+    kernel_shape : int or tuple of int
+        Filter basis shape.
+    grid_in, grid_out : str or grid descriptor
+        Grids of input and output; descriptors returned by an existing
+        transform's ``grid`` attribute are accepted.
+    transpose : bool, optional
+        Build the transposed convolution, by default ``False``.
+    distributed : bool, optional
+        Use the spatially distributed layer, by default ``False``.
+    **kwargs
+        Forwarded: ``basis_type``, ``basis_norm_mode``, ``groups``, ``bias``,
+        ``theta_cutoff``, ``fused``, ... A ``fused=False`` is dropped, since
+        older torch-harmonics releases do not know the argument and it is the
+        default where it exists.
+
+    Returns
+    -------
+    torch.nn.Module
+        The convolution.
+    """
+    if kwargs.get("fused", None) is False:
+        kwargs.pop("fused")
+
+    if transpose:
+        handle = thd.DistributedDiscreteContinuousConvTransposeS2 if distributed else th.DiscreteContinuousConvTransposeS2
+    else:
+        handle = thd.DistributedDiscreteContinuousConvS2 if distributed else th.DiscreteContinuousConvS2
+
+    if hasattr(th, "as_grid"):
+        return handle(
+            grid_in=_as_grid(grid_in, *in_shape),
+            grid_out=_as_grid(grid_out, *out_shape),
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_shape=kernel_shape,
+            **kwargs,
+        )
+    return handle(
+        in_channels,
+        out_channels,
+        in_shape=tuple(in_shape),
+        out_shape=tuple(out_shape),
+        kernel_shape=kernel_shape,
+        grid_in=grid_in,
+        grid_out=grid_out,
+        **kwargs,
+    )
+
+
+def get_resample(in_shape, out_shape, grid_in, grid_out, mode="bilinear", distributed=False):
+    r"""
+    Construct a resampling layer between two grids, in either torch-harmonics API.
+
+    Parameters
+    ----------
+    in_shape, out_shape : (int, int)
+        Input and output grid resolutions.
+    grid_in, grid_out : str or grid descriptor
+        Grids of input and output.
+    mode : str, optional
+        Interpolation mode, by default ``"bilinear"``.
+    distributed : bool, optional
+        Use the spatially distributed layer, by default ``False``.
+
+    Returns
+    -------
+    torch.nn.Module
+        The resampling layer.
+    """
+    handle = thd.DistributedResampleS2 if distributed else th.ResampleS2
+    if hasattr(th, "as_grid"):
+        return handle(_as_grid(grid_in, *in_shape), _as_grid(grid_out, *out_shape), mode=mode)
+    return handle(*in_shape, *out_shape, grid_in=grid_in, grid_out=grid_out, mode=mode)
 
 
 def grid_to_quadrature_rule(grid_type):

@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 import torch_harmonics as th
+from makani.utils.grids import get_spectral_transform
 import torch_harmonics.distributed as thd
 
 from makani.utils import comm
@@ -85,13 +86,13 @@ class TestDistributedLayers(unittest.TestCase):
         from makani.models.common import SpectralConv
 
         # set up handles
-        forward_transform_local = th.RealSHT(nlat=Hi, nlon=Wi).to(self.device)
-        inverse_transform_local = th.InverseRealSHT(
-            nlat=Ho, nlon=Wo, lmax=forward_transform_local.lmax, mmax=forward_transform_local.mmax
+        forward_transform_local = get_spectral_transform("sht", Hi, Wi, "equiangular").to(self.device)
+        inverse_transform_local = get_spectral_transform(
+            "isht", Ho, Wo, "equiangular", lmax=forward_transform_local.lmax, mmax=forward_transform_local.mmax
         ).to(self.device)
-        forward_transform_dist = thd.DistributedRealSHT(nlat=Hi, nlon=Wi).to(self.device)
-        inverse_transform_dist = thd.DistributedInverseRealSHT(
-            nlat=Ho, nlon=Wo, lmax=forward_transform_dist.lmax, mmax=forward_transform_dist.mmax
+        forward_transform_dist = get_spectral_transform("sht", Hi, Wi, "equiangular", distributed=True).to(self.device)
+        inverse_transform_dist = get_spectral_transform(
+            "isht", Ho, Wo, "equiangular", lmax=forward_transform_dist.lmax, mmax=forward_transform_dist.mmax, distributed=True
         ).to(self.device)
 
         set_seed(333)

@@ -29,6 +29,7 @@ from makani.utils.losses.base_loss import (
     GradientBaseLoss,
 )
 from makani.utils import comm
+from makani.utils.grids import get_disco_conv
 
 # distributed stuff
 from torch_harmonics.distributed import split_tensor_along_dim
@@ -1030,16 +1031,14 @@ class KernelScoreLoss(GeometricBaseLoss):
                 thd.init(polar_group, azimuth_group)
 
         # set up DISCO convolution (one per kernel)
-        conv_handle = (
-            thd.DistributedDiscreteContinuousConvS2 if self.spatial_distributed else th.DiscreteContinuousConvS2
-        )
 
         fb = th.filter_basis.get_filter_basis(tuple(kernel_shape), kernel_basis_type)
         self.kernel_basis_size = fb.kernel_size
 
-        self.conv = conv_handle(
+        self.conv = get_disco_conv(
             self.n_channels,
             self.n_channels * self.kernel_basis_size,
+            distributed=self.spatial_distributed,
             in_shape=img_shape,
             out_shape=img_shape,
             kernel_shape=tuple(kernel_shape),
