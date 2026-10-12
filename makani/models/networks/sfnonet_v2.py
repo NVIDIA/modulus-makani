@@ -874,14 +874,21 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
         return x
 
     def decode(self, x):
-        r"""Project to the output channels on the internal grid and evaluate them on the output grid."""
-        dtype = x.dtype
+        r"""
+        Project to the output channels on the internal grid and evaluate them on the output grid.
+
+        Returns fp32: the synthesis runs in fp32 anyway, and the result is a
+        tendency that is added to the fp32 input state. Rounding it to the
+        autocast dtype would quantize the state update, which for channels
+        with a small tendency relative to their value (upper-level humidity:
+        a few bf16 ulps per 6 h step) destroys the rollout.
+        """
         if self.checkpointing_level >= 1:
             x = checkpoint(self.decoder, x, use_reentrant=False)
         else:
             x = self.decoder(x)
         coeffs = self.project_internal(x, self.scalar_out, self.wind_out)
-        return self.synthesize_out(*coeffs, self.out_inverse_perm).to(dtype)
+        return self.synthesize_out(*coeffs, self.out_inverse_perm)
 
     def _forward_features(self, x):
         for blk in self.blocks:
@@ -901,10 +908,12 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
         Returns
         -------
         torch.Tensor
-            Prediction of shape ``(B, out_chans, nlat, nlon)`` on ``out_shape``.
+            Prediction of shape ``(B, out_chans, nlat, nlon)`` on ``out_shape``,
+            in fp32 regardless of autocast.
         """
         if self.big_skip:
-            residual = x[:, self.pred_in]
+            # keep the skipped state in fp32; it is added to the fp32 tendency below
+            residual = x[:, self.pred_in].to(torch.float32)
             if self.out_shape != self.inp_shape:
                 # move the skipped state through the same band limit onto the output grid
                 coeffs = self.project_in(residual, self.scalar_out, self.wind_out)
@@ -915,7 +924,8 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
         x = self.decode(x)
 
         if self.big_skip:
-            x = x + residual.to(x.dtype)
+            # fp32 state update, outside autocast's reach: tendencies of a few bf16 ulps survive
+            x = x + residual
 
         return x
 
