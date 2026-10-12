@@ -125,9 +125,7 @@ def get_default_parameters():
     # extra channels
     params.add_grid = False
     params.add_zenith = False
-    params.add_orography = False
-    params.add_landmask = False
-    params.add_soiltype = False
+    params.invariants = None
 
     # logging stuff, needed for higher level tests
     params.log_to_screen = False

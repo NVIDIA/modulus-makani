@@ -72,10 +72,6 @@ base_config: &BASE_CONFIG
 
     # invariants
     add_grid: !!bool False
-    add_orography: !!bool False
-    orography_path: /invariants/orography.nc
-    add_landmask: !!bool False
-    landmask_path: /invariants/land_sea_mask.nc
 
     pretrained: !!bool False
 

@@ -38,7 +38,7 @@ from wandb.sdk.lib.runid import generate_id as generate_run_id
 
 # makani dependencies
 from makani.utils.YParams import YParams
-from makani.utils.features import get_auxiliary_channels
+from makani.utils.features import get_auxiliary_channels, is_dynamic_aux_channel, is_static_aux_channel
 from makani.utils.grid_types import DEFAULT_GRID_TYPE
 from makani.utils import comm
 from makani.utils.benchmark import StepTimer
@@ -265,30 +265,15 @@ class Driver(metaclass=abc.ABCMeta):
                     params.n_noise_chan = 1
         params.N_dynamic_channels += params.n_noise_chan
 
-        # initialize static channels
-        params["N_static_channels"] = 0
-
-        # these are static and the same for all samples in the same time history
-        if params.get("add_grid", False):
-            n_grid_chan = 2
-            gridtype = params.get("gridtype", "sinusoidal")
-            if gridtype == "sinusoidal":
-                n_grid_chan *= 2 * params.get("grid_num_frequencies", 1)
-
-            params.N_static_channels += n_grid_chan
-
-        if params.get("add_orography", False):
-            params.N_static_channels += 1
-
-        if params.get("add_landmask", False):
-            landmask_preprocessing = params.get("landmask_preprocessing", "floor")
-            if landmask_preprocessing == "raw":
-                params.N_static_channels += 1
-            elif landmask_preprocessing in ["round", "floor"]:
-                params.N_static_channels += 2
-
-        if params.get("add_soiltype", False):
-            params.N_static_channels += 8
+        # get names of additional channels; the static channel count follows from them
+        params["aux_channel_names"] = get_auxiliary_channels(**params.to_dict())
+        params["N_static_channels"] = len([c for c in params.aux_channel_names if is_static_aux_channel(c)])
+        n_dynamic_aux = len([c for c in params.aux_channel_names if is_dynamic_aux_channel(c)])
+        if n_dynamic_aux != params.N_dynamic_channels:
+            raise ValueError(
+                f"Auxiliary channel names {params.aux_channel_names} account for {n_dynamic_aux} dynamic channels, "
+                f"but {params.N_dynamic_channels} are appended."
+            )
 
         # update input channels withj the dynamic channels
         params.N_in_channels += params.N_dynamic_channels
@@ -300,9 +285,6 @@ class Driver(metaclass=abc.ABCMeta):
 
         # update input channels with the static channels
         params.N_in_channels += params.N_static_channels
-
-        # get names of additional channels
-        params["aux_channel_names"] = get_auxiliary_channels(**params.to_dict())
 
         # target channels
         params.N_target_channels = (params.n_future + 1) * params.N_out_channels

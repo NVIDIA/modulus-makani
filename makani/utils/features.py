@@ -17,52 +17,71 @@ import re
 from collections import OrderedDict
 
 
+from makani.utils.invariants import check_legacy_invariant_options, parse_invariant_features
+
+# Auxiliary channels are the inputs the model consumes but does not predict. They are
+# named with a prefix that says how they are laid out in the input: dynamic ones are
+# appended at every history step, static ones once after the whole history.
+DYNAMIC_AUX_PREFIX = "xd_"
+STATIC_AUX_PREFIX = "xs_"
+
+
+def is_dynamic_aux_channel(channel_name):
+    return channel_name.startswith(DYNAMIC_AUX_PREFIX)
+
+
+def is_static_aux_channel(channel_name):
+    return channel_name.startswith(STATIC_AUX_PREFIX)
+
+
 def get_auxiliary_channels(
     add_zenith=False,
-    add_grid=False,
-    grid_type=None,
-    grid_num_frequencies=0,
-    add_orography=False,
-    add_landmask=False,
-    landmask_preprocessing="floor",
-    add_soiltype=False,
-    add_copernicus_emb=False,
     n_noise_chan=0,
+    add_grid=False,
+    gridtype="sinusoidal",
+    grid_num_frequencies=1,
+    add_cos_to_grid=True,
+    invariants=None,
+    add_copernicus_emb=False,
     **kwargs,
 ):
     """
-    Auxiliary routine to return the list of appended channel names. Must match behavior of preprocessor and dataloader
+    Return the names of the auxiliary channels, in the order in which they are appended to the input.
+
+    This is the single account of the auxiliary channels: the driver derives the channel counts
+    from it, and it has to match what the preprocessor appends. The keyword names are those of the
+    run parameters, so that the parameters can be passed as ``**params.to_dict()``.
     """
+    check_legacy_invariant_options(kwargs)
+
     channel_names = []
 
+    # dynamic, in the order the preprocessor appends them at every step
     if add_zenith:
-        channel_names.append("xzen")
+        channel_names.append(f"{DYNAMIC_AUX_PREFIX}zen")
 
     if n_noise_chan > 0:
         for c in range(n_noise_chan):
-            channel_names.append(f"xnoise{c}")
+            channel_names.append(f"{DYNAMIC_AUX_PREFIX}noise{c}")
 
+    # static, in the order of get_static_features
     if add_grid:
-        if grid_type == "sinusoidal":
+        if gridtype == "sinusoidal":
             for f in range(1, grid_num_frequencies + 1):
-                channel_names += [f"xsgrlat{f}", f"xsgrlon{f}"]
+                channel_names += [f"{STATIC_AUX_PREFIX}sinlat{f}", f"{STATIC_AUX_PREFIX}sinlon{f}"]
+                if add_cos_to_grid:
+                    channel_names += [f"{STATIC_AUX_PREFIX}coslat{f}", f"{STATIC_AUX_PREFIX}coslon{f}"]
         else:
-            channel_names += ["xgrlat", "xgrlon"]
+            channel_names += [f"{STATIC_AUX_PREFIX}lat", f"{STATIC_AUX_PREFIX}lon"]
 
-    if add_orography:
-        channel_names.append("xoro")
-
-    if add_landmask:
-        if landmask_preprocessing in ["floor", "round"]:
-            channel_names += ["xlsml", "xlsms"]
-        elif landmask_preprocessing == "raw":
-            channel_names += ["xlsm"]
-
-    if add_soiltype:
-        channel_names += [f"xst{i}" for i in range(8)]
+    for feature in parse_invariant_features(invariants):
+        if feature.encoding == "onehot":
+            channel_names += [f"{STATIC_AUX_PREFIX}{feature.channel}{k}" for k in range(feature.num_classes)]
+        else:
+            channel_names.append(f"{STATIC_AUX_PREFIX}{feature.channel}")
 
     if add_copernicus_emb:
-        channel_names += [f"xcop{i}" for i in range(8)]
+        channel_names += [f"{STATIC_AUX_PREFIX}cop{i}" for i in range(8)]
 
     return channel_names
 
@@ -167,9 +186,13 @@ def get_channel_groups(channel_names, aux_channel_names=[]):
 
     # append the auxiliary variable to the surface channels
     for idx, chn in enumerate(aux_channel_names):
-        if chn in ["xoro", "xlsml", "xlsms"]:
+        if is_static_aux_channel(chn):
             stat_aux_chans.append(idx + len(channel_names))
-        else:
+        elif is_dynamic_aux_channel(chn):
             dyn_aux_chans.append(idx + len(channel_names))
+        else:
+            raise ValueError(
+                f"Auxiliary channel '{chn}' is neither dynamic ('{DYNAMIC_AUX_PREFIX}') nor static ('{STATIC_AUX_PREFIX}')."
+            )
 
     return atmo_chans, surf_chans, dyn_aux_chans, stat_aux_chans, atmo_groups.keys()

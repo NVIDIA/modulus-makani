@@ -52,7 +52,7 @@ classifiers = [
 dynamic = ["version"]
 
 dependencies = [
-    "torch>=2.4.0",
+    "torch>=2.9.1",
     "numpy>=1.22.4",
     "h5py>=3.11.0",
     # Both 1.x and 2.x are supported; the API differences between them are

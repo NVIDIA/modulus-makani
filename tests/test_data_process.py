@@ -34,7 +34,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from .testutils import disable_tf32, init_hdf5_dataset, H5_PATH, IMG_SIZE_H, IMG_SIZE_W, compare_arrays
 from data_process.date_range import add_date_range_arguments, date_range_from_args, parse_date, yearly_sample_times
 from data_process.convert_era5_to_makani_input import _batched, _create_output_file, _write_missing
-from data_process.sources import Source
+from data_process.sources import InvariantSource, Source
 
 
 def _utc(year, month, day, hour=0):
@@ -1340,6 +1340,7 @@ _CONVERTERS = [
     ("data_process.convert_era5_to_makani_input", ["h5py"]),
     ("data_process.sources.ncar", ["h5py"]),
     ("data_process.sources.wb2", ["xarray", "h5py"]),
+    ("data_process.convert_era5_invariants_to_makani_input", ["h5py"]),
     ("data_process.convert_makani_output_to_wb2", ["mpi4py", "xarray", "dask", "h5py"]),
     ("data_process.generate_wb2_climatology", ["mpi4py", "xarray", "h5py"]),
 ]
@@ -1769,6 +1770,260 @@ class TestConvert(unittest.TestCase):
                 # the skipped channel is written as missing rather than left unwritten
                 self.assertTrue(np.all(np.isnan(fields[:, 2])))
                 self.assertTrue(np.all(valid[:, 2] == 0))
+
+
+# ---------------------------------------------------------------------------
+# Invariant converter and its sources: data_process/convert_era5_invariants_to_makani_input.py
+# ---------------------------------------------------------------------------
+#
+# The time invariant counterpart of the suites above. It is serial throughout, so
+# the full conversion runs without MPI as well.
+
+
+def _invariant_metadata(channels):
+    return {"coords": {"channel": channels, "lat": _LAT, "lon": _LON}}
+
+
+def _invariant_field(offset):
+    return (offset + np.arange(len(_LAT) * len(_LON), dtype=np.float32)).reshape(len(_LAT), len(_LON))
+
+
+class _InvariantOutputFileCase(unittest.TestCase):
+    """Provides a serial invariant output file laid out like the converter's."""
+
+    channels = ["z", "lsm", "not_a_variable"]
+
+    def setUp(self):
+        from data_process.convert_era5_invariants_to_makani_input import _create_output_file
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.out = _create_output_file(
+            os.path.join(self._tmpdir.name, "invariants.h5"), "fields", self.channels, _LAT, _LON
+        )
+
+    def tearDown(self):
+        self.out.close()
+        self._tmpdir.cleanup()
+
+
+class TestInvariantOutputFile(_InvariantOutputFileCase):
+    def test_layout(self):
+        self.assertEqual(self.out["fields"].shape, (3, len(_LAT), len(_LON)))
+        self.assertTrue(np.all(self.out["valid_data"][...] == 1))
+        self.assertEqual([c.decode() for c in self.out["channel"][...]], self.channels)
+        self.assertNotIn("timestamp", self.out)
+
+    def test_unwritten_channels_are_nan(self):
+        self.assertTrue(np.all(np.isnan(self.out["fields"][...])))
+
+    def test_write_missing_touches_only_the_given_channels(self):
+        from data_process.convert_era5_invariants_to_makani_input import _write_missing
+
+        self.out["fields"][...] = 1.0
+        _write_missing(self.out, "fields", [0, 2])
+
+        fields = self.out["fields"][...]
+        valid = self.out["valid_data"][...]
+        self.assertTrue(np.all(np.isnan(fields[[0, 2]])))
+        self.assertTrue(np.all(valid[[0, 2]] == 0))
+        self.assertTrue(np.all(fields[1] == 1.0))
+        self.assertEqual(valid[1], 1)
+
+
+class TestNcarInvariantSource(_InvariantOutputFileCase):
+    """Filling of the NCAR invariant source against local stand-ins for the bucket objects."""
+
+    def setUp(self):
+        super().setUp()
+
+        # lsm carries the netCDF fill value at one point, which has to come out as NaN
+        self.z = _invariant_field(0.0)
+        self.lsm = _invariant_field(100.0)
+        self.lsm[1, 1] = 9.999e20
+        files = {}
+        for marker, name, data in [("128_129_z", "Z", self.z), ("128_172_lsm", "LSM", self.lsm)]:
+            path = os.path.join(self._tmpdir.name, f"{marker}.nc")
+            with h5.File(path, "w") as f:
+                f["latitude"] = np.array(_LAT)
+                f["longitude"] = np.array(_LON)
+                f.create_dataset(name, data=data[np.newaxis])
+                f[name].attrs["_FillValue"] = np.float32(9.999e20)
+            files[marker] = path
+        self.store = _FakeNcarStore(files)
+
+    def tearDown(self):
+        self.store.close()
+        super().tearDown()
+
+    def _make(self, channels=None, **options):
+        from data_process.sources.ncar import NcarInvariantSource
+
+        channels = self.channels if channels is None else channels
+        with mock.patch("data_process.sources.ncar.NcarStore", lambda *args, **kwargs: self.store):
+            return NcarInvariantSource(_invariant_metadata(channels), **options)
+
+    def test_unknown_channel_fails_without_skipping(self):
+        with self.assertRaises(ValueError):
+            self._make()
+
+    def test_unknown_channels_are_reported_as_skipped(self):
+        self.assertEqual(self._make(skip_missing_channels=True).skipped_channel_indices(), [2])
+
+    def test_fill(self):
+        self._make(skip_missing_channels=True).fill(self.out, "fields")
+        fields = self.out["fields"][...]
+
+        self.assertTrue(compare_arrays("z", fields[0], self.z, atol=0.0, rtol=0.0, shape_check=True))
+        self.assertTrue(np.isnan(fields[1, 1, 1]))
+        lsm = self.lsm.copy()
+        lsm[1, 1] = np.nan
+        self.assertTrue(np.array_equal(fields[1], lsm, equal_nan=True))
+        # every object is released once read
+        self.assertEqual(len(self.store.handles), 0)
+
+    def test_field_absent_from_the_bucket_fails(self):
+        source = self._make(channels=["z", "slt"])
+        with self.assertRaises(FileNotFoundError):
+            source.fill(self.out, "fields")
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("xarray") is not None and importlib.util.find_spec("zarr") is not None,
+    "needs xarray and zarr",
+)
+class TestWb2InvariantSource(_InvariantOutputFileCase):
+    """Filling and skipping of the WB2 invariant source against a small local zarr store."""
+
+    channels = ["z", "lsm", "slt", "not_a_variable"]
+
+    def setUp(self):
+        super().setUp()
+        import xarray as xr
+
+        # z without a time axis as in WB2, lsm repeated along one as in ARCO-ERA5,
+        # and slt absent from the store; latitude ascending, to exercise the matching
+        self.z = _invariant_field(0.0)
+        self.lsm = _invariant_field(100.0)
+        times = np.array([np.datetime64("2023-06-15T00", "ns"), np.datetime64("2023-06-15T06", "ns")])
+        data = xr.Dataset(
+            {
+                "geopotential_at_surface": (("latitude", "longitude"), self.z[::-1]),
+                "land_sea_mask": (("time", "latitude", "longitude"), np.stack([self.lsm[::-1], -self.lsm[::-1]])),
+            },
+            coords={"time": times, "latitude": _LAT[::-1], "longitude": _LON},
+        )
+        self.store = os.path.join(self._tmpdir.name, "wb2.zarr")
+        data.to_zarr(self.store)
+
+    def _make(self, **options):
+        from data_process.sources.wb2 import Wb2InvariantSource
+
+        return Wb2InvariantSource(_invariant_metadata(self.channels), input_file=self.store, **options)
+
+    def test_missing_variable_fails_without_skipping(self):
+        with self.assertRaises(IndexError):
+            self._make()
+
+    def test_missing_variables_are_reported_as_skipped(self):
+        self.assertEqual(self._make(skip_missing_channels=True).skipped_channel_indices(), [2, 3])
+
+    def test_fill(self):
+        self._make(skip_missing_channels=True).fill(self.out, "fields")
+        fields = self.out["fields"][...]
+
+        self.assertTrue(compare_arrays("z", fields[0], self.z, atol=0.0, rtol=0.0, shape_check=True))
+        # read at the first timestep
+        self.assertTrue(compare_arrays("lsm", fields[1], self.lsm, atol=0.0, rtol=0.0, shape_check=True))
+
+
+class _FakeInvariantSource(InvariantSource):
+    """Writes the channel index into every channel it provides and skips the last one."""
+
+    def fill(self, out, entry_key):
+        for cidx in range(len(self.channel_names) - 1):
+            out[entry_key][cidx, ...] = np.full((len(self.lat), len(self.lon)), cidx, dtype=np.float32)
+
+    def skipped_channel_indices(self):
+        return [len(self.channel_names) - 1]
+
+
+class _FailingInvariantSource(_FakeInvariantSource):
+    """Fails after writing the first channel, as an interrupted download would."""
+
+    closed = False
+
+    def fill(self, out, entry_key):
+        out[entry_key][0, ...] = np.zeros((len(self.lat), len(self.lon)), dtype=np.float32)
+        raise FileNotFoundError("lost connection")
+
+    def close(self):
+        _FailingInvariantSource.closed = True
+
+
+class TestConvertInvariants(unittest.TestCase):
+    """A full invariant conversion with a source that skips a channel."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        # the dataset metadata, whose channels are not the invariant ones
+        self.metadata_file = os.path.join(self._tmpdir.name, "metadata.json")
+        with open(self.metadata_file, "w") as f:
+            json.dump(_metadata(["z500", "t2m"]), f)
+        self.output_file = os.path.join(self._tmpdir.name, "invariants.h5")
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _convert(self, **options):
+        from data_process.convert_era5_invariants_to_makani_input import convert
+
+        convert(_FakeInvariantSource, self.output_file, self.metadata_file, ["z", "lsm", "slt"], **options)
+
+    def test_invariant_file(self):
+        self._convert()
+        with h5.File(self.output_file, "r") as f:
+            self.assertEqual([c.decode() for c in f["channel"][...]], ["z", "lsm", "slt"])
+            self.assertEqual(list(f["lat"][...]), _LAT)
+            fields = f["fields"][...]
+            valid = f["valid_data"][...]
+        self.assertTrue(np.all(fields[0] == 0) and np.all(fields[1] == 1))
+        self.assertTrue(np.all(valid[:2] == 1))
+        # the skipped channel is written as missing
+        self.assertTrue(np.all(np.isnan(fields[2])))
+        self.assertEqual(valid[2], 0)
+
+    def test_existing_file_is_kept_unless_forced(self):
+        with open(self.output_file, "w") as f:
+            f.write("sentinel")
+        self._convert()
+        with open(self.output_file, "r") as f:
+            self.assertEqual(f.read(), "sentinel")
+
+        self._convert(force_overwrite=True)
+        with h5.File(self.output_file, "r") as f:
+            self.assertEqual(f["fields"].shape, (3, len(_LAT), len(_LON)))
+
+    def test_failed_conversion_leaves_no_file_behind(self):
+        from data_process.convert_era5_invariants_to_makani_input import convert
+
+        _FailingInvariantSource.closed = False
+        with self.assertRaises(FileNotFoundError):
+            convert(_FailingInvariantSource, self.output_file, self.metadata_file, ["z", "lsm", "slt"])
+
+        # neither the output nor its temporary file, so that a rerun converts afresh
+        self.assertEqual(os.listdir(self._tmpdir.name), ["metadata.json"])
+        self.assertTrue(_FailingInvariantSource.closed)
+
+        self._convert()
+        with h5.File(self.output_file, "r") as f:
+            self.assertTrue(np.all(f["fields"][1] == 1))
+
+    def test_command_line_defaults_to_all_invariants(self):
+        from data_process.convert_era5_invariants_to_makani_input import build_parser
+        from makani.utils.dataloaders.ncar_helpers import invariant_variables
+
+        args = build_parser().parse_args(["ncar", "--output_file", "out.h5", "--metadata_file", "m.json"])
+        self.assertEqual(args.channels, list(invariant_variables))
 
 
 # ---------------------------------------------------------------------------

@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ERA5 sources for ``data_process/convert_era5_to_makani_input.py``.
+"""ERA5 sources for ``data_process/convert_era5_to_makani_input.py`` and
+``data_process/convert_era5_invariants_to_makani_input.py``.
 
 The converter owns everything the sources have in common: the metadata, the
 date range, the yearly output files and their layout, the split of work over
 MPI ranks and the progress bar. A source only knows how to read its archive
-and is expected to subclass :class:`Source`.
+and is expected to subclass :class:`Source`. The invariant converter is the
+same arrangement without the time axis and without MPI, and its sources
+subclass :class:`InvariantSource`.
 
 Sources are kept free of MPI, so each backend module can be imported, and its
 pieces tested, without an MPI installation; the backend modules are imported
@@ -89,6 +92,39 @@ class Source(object):
         ``valid_data``. A source that cannot provide a channel and is not told to
         skip it should fail in its constructor instead.
         """
+        return []
+
+    def summary(self) -> Optional[str]:
+        """Optional line printed once the conversion is done."""
+        return None
+
+    def close(self):
+        """Release whatever the source holds open."""
+        pass
+
+
+class InvariantSource(object):
+    """Base class for the archives the invariant converter can read from.
+
+    The time invariant counterpart of :class:`Source`: there are no samples to
+    distribute, so the converter calls :meth:`fill` exactly once and
+    :meth:`close` after it.
+
+    Constructors take the metadata dictionary, whose ``coords["channel"]`` lists
+    the invariant fields to extract, followed by source specific keyword options.
+    """
+
+    def __init__(self, metadata: Dict):
+        self.channel_names = metadata["coords"]["channel"]
+        self.lat = metadata["coords"]["lat"]
+        self.lon = metadata["coords"]["lon"]
+
+    def fill(self, out: h5.File, entry_key: str):
+        """Write every field the source can provide into ``out[entry_key][cidx]``."""
+        raise NotImplementedError
+
+    def skipped_channel_indices(self) -> List[int]:
+        """Indices of the channels this source cannot provide, see :meth:`Source.skipped_channel_indices`."""
         return []
 
     def summary(self) -> Optional[str]:

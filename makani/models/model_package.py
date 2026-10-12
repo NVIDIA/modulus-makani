@@ -57,9 +57,7 @@ class LocalPackage:
     MAXS_FILE = "maxs.npy"
     MEANS_FILE = "global_means.npy"
     STDS_FILE = "global_stds.npy"
-    OROGRAPHY_FILE = "orography.nc"
-    LANDMASK_FILE = "land_mask.nc"
-    SOILTYPE_FILE = "soil_type.nc"
+    INVARIANTS_FILE = "invariants.h5"
 
     def __init__(self, root):
         self.root = root
@@ -83,12 +81,8 @@ class LocalPackage:
 
     @staticmethod
     def _load_static_data(package, params):
-        if params.get("add_orography", False):
-            params.orography_path = package.get(LocalPackage.OROGRAPHY_FILE)
-        if params.get("add_landmask", False):
-            params.landmask_path = package.get(LocalPackage.LANDMASK_FILE)
-        if params.get("add_soiltype", False):
-            params.soiltype_path = package.get(LocalPackage.SOILTYPE_FILE)
+        if params.get("invariants", None):
+            params.invariants_path = package.get(LocalPackage.INVARIANTS_FILE)
 
         # alweays load all normalization files
         if params.get("global_means_path", None) is not None:
@@ -404,7 +398,7 @@ def save_model_package(params):
     if params.get("enable_synthetic_data", False):
         # A package exists to make a checkpoint usable for inference elsewhere: it bundles the
         # normalization statistics and the invariant fields next to the config. A synthetic run
-        # has neither -- the .npy and .nc files it would copy do not exist, which is what used to
+        # has neither -- the .npy and .h5 files it would copy do not exist, which is what used to
         # make this raise -- and its checkpoint is random weights over made-up data, so there is
         # nothing worth packaging even if the files were there.
         logging.info("Skipping model package: synthetic data carries no statistics or invariants to package.")
@@ -420,14 +414,8 @@ def save_model_package(params):
     # copy static data into the package under the canonical file names expected
     # by LocalPackage, so packages are self-consistent regardless of how the
     # source files happen to be named on a given system
-    if params.get("add_orography", False):
-        shutil.copy(params.orography_path, os.path.join(params.experiment_dir, LocalPackage.OROGRAPHY_FILE))
-
-    if params.get("add_landmask", False):
-        shutil.copy(params.landmask_path, os.path.join(params.experiment_dir, LocalPackage.LANDMASK_FILE))
-
-    if params.get("add_soiltype", False):
-        shutil.copy(params.soiltype_path, os.path.join(params.experiment_dir, LocalPackage.SOILTYPE_FILE))
+    if params.get("invariants", None):
+        shutil.copy(params.invariants_path, os.path.join(params.experiment_dir, LocalPackage.INVARIANTS_FILE))
 
     # always save out all normalization files under their canonical names
     if params.get("global_means_path", None) is not None:

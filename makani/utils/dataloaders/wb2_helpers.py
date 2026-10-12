@@ -59,7 +59,7 @@ class Wb2Variable(NamedTuple):
     name : str
         WB2 long name, i.e. the variable name in the zarr store.
     kind : str
-        ``"pl"``, ``"sfc"`` or ``"accum"``.
+        ``"pl"``, ``"sfc"``, ``"accum"`` or ``"invariant"``.
     units : str, optional
         Units the store is expected to carry.
     accumulation : str
@@ -96,6 +96,25 @@ atmospheric_variables: Dict[str, Wb2Variable] = {
     "t": Wb2Variable("temperature", "pl", units="K"),
     "r": Wb2Variable("relative_humidity", "pl", units="%"),
     "q": Wb2Variable("specific_humidity", "pl", units="kg kg-1"),
+}
+
+# time invariant fields, keyed by ECMWF short name like their NCAR counterparts.
+# WB2 stores them without a time axis, ARCO-ERA5 repeats them along it.
+invariant_variables: Dict[str, Wb2Variable] = {
+    "z": Wb2Variable("geopotential_at_surface", "invariant", units="m2 s-2"),
+    "lsm": Wb2Variable("land_sea_mask", "invariant"),
+    "slt": Wb2Variable("soil_type", "invariant"),
+    "cl": Wb2Variable("lake_cover", "invariant"),
+    "dl": Wb2Variable("lake_depth", "invariant", units="m"),
+    "cvl": Wb2Variable("low_vegetation_cover", "invariant"),
+    "cvh": Wb2Variable("high_vegetation_cover", "invariant"),
+    "tvl": Wb2Variable("type_of_low_vegetation", "invariant"),
+    "tvh": Wb2Variable("type_of_high_vegetation", "invariant"),
+    "sdor": Wb2Variable("standard_deviation_of_orography", "invariant", units="m"),
+    "isor": Wb2Variable("anisotropy_of_sub_gridscale_orography", "invariant"),
+    "anor": Wb2Variable("angle_of_sub_gridscale_orography", "invariant", units="radians"),
+    "slor": Wb2Variable("slope_of_sub_gridscale_orography", "invariant"),
+    "sdfor": Wb2Variable("standard_deviation_of_filtered_subgrid_orography", "invariant", units="m"),
 }
 
 # reverse lookups
@@ -183,6 +202,24 @@ def atmospheric_wb2_name(prefix):
     except KeyError:
         raise ValueError(
             f"Unknown atmospheric variable prefix '{prefix}'. Known prefixes: {list(atmospheric_variables)}"
+        ) from None
+
+
+def invariant_wb2_name(channel_name):
+    """Return the WB2 long name of a time invariant field.
+
+    ``"lsm"`` -> ``"land_sea_mask"``.
+
+    Raises
+    ------
+    ValueError
+        If the field has no WB2 counterpart.
+    """
+    try:
+        return invariant_variables[channel_name].name
+    except KeyError:
+        raise ValueError(
+            f"Unknown invariant variable '{channel_name}'. Known names: {list(invariant_variables)}"
         ) from None
 
 

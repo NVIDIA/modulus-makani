@@ -22,8 +22,37 @@ import datetime as dt
 import warnings
 import xarray as xr
 
-from makani.utils.dataloaders.wb2_helpers import split_convert_channel_names, gcs_storage_options
-from data_process.sources import Source, Unit
+from makani.utils.dataloaders.wb2_helpers import (
+    split_convert_channel_names,
+    gcs_storage_options,
+    invariant_variables,
+    invariant_wb2_name,
+)
+from data_process.sources import InvariantSource, Source, Unit
+
+
+def _open_aligned(input_file: str, lat: List[float], lon: List[float], coord_mode: str, verbose: bool) -> xr.Dataset:
+    """Open a zarr store and align it to the metadata grid according to ``coord_mode``."""
+    # storage options only for remote stores: zarr 3 rejects them, even empty, for a local path
+    open_options = {}
+    if input_file.startswith(("gs://", "gcs://")):
+        open_options["storage_options"] = gcs_storage_options()
+    wb2_data = xr.open_dataset(input_file, engine="zarr", **open_options)
+    # some WB2 zarrs store atmospheric/surface fields as (..., longitude, latitude);
+    # the readers assume (..., latitude, longitude).
+    wb2_data = wb2_data.transpose(..., "latitude", "longitude")
+    if coord_mode == "match":
+        wb2_data = wb2_data.sel(latitude=lat, longitude=lon)
+    elif coord_mode == "force-flip-lat":
+        if verbose:
+            warnings.warn("coord_mode='force-flip-lat': flipping latitude axis without coordinate matching")
+        wb2_data = wb2_data.isel(latitude=slice(None, None, -1))
+    elif coord_mode == "force":
+        if verbose:
+            warnings.warn("coord_mode='force': reading data as-is, assuming ordering matches metadata")
+    else:
+        raise ValueError(f"Unknown coord_mode: {coord_mode}. Must be one of: match, force-flip-lat, force")
+    return wb2_data
 
 
 class Wb2Source(Source):
@@ -80,26 +109,7 @@ class Wb2Source(Source):
             self.atmospheric_levels,
         ) = split_convert_channel_names(self.channel_names)
 
-        # open cloud dataset and align to metadata grid
-        # storage options only for remote stores: zarr 3 rejects them, even empty, for a local path
-        open_options = {}
-        if input_file.startswith(("gs://", "gcs://")):
-            open_options["storage_options"] = gcs_storage_options()
-        wb2_data = xr.open_dataset(input_file, engine="zarr", **open_options)
-        # some WB2 zarrs store atmospheric/surface fields as (..., longitude, latitude);
-        # the rest of this routine assumes (..., latitude, longitude).
-        wb2_data = wb2_data.transpose(..., "latitude", "longitude")
-        if coord_mode == "match":
-            wb2_data = wb2_data.sel(latitude=self.lat, longitude=self.lon)
-        elif coord_mode == "force-flip-lat":
-            if comm_rank == 0:
-                warnings.warn("coord_mode='force-flip-lat': flipping latitude axis without coordinate matching")
-            wb2_data = wb2_data.isel(latitude=slice(None, None, -1))
-        elif coord_mode == "force":
-            if comm_rank == 0:
-                warnings.warn("coord_mode='force': reading data as-is, assuming ordering matches metadata")
-        else:
-            raise ValueError(f"Unknown coord_mode: {coord_mode}. Must be one of: match, force-flip-lat, force")
+        wb2_data = _open_aligned(input_file, self.lat, self.lon, coord_mode, verbose=(comm_rank == 0))
         self.wb2_data = wb2_data
 
         # variables absent from the store, settled up front so that the
@@ -183,3 +193,59 @@ class Wb2Source(Source):
 
     def summary(self) -> Optional[str]:
         return f"Skipped channels: {self.missing_wb2}"
+
+
+class Wb2InvariantSource(InvariantSource):
+    """Read the time invariant ERA5 fields from a WeatherBench2 style zarr store.
+
+    WB2 stores the invariants without a time axis, while ARCO-ERA5 repeats them
+    along it; the latter are read at the first timestep.
+
+    Parameters
+    ----------
+    metadata : Dict
+        Invariant metadata, see :class:`data_process.sources.InvariantSource`.
+    input_file : str
+        Path or GCS specifier of the zarr store.
+    coord_mode: str
+        How to align input lat/lon to the metadata grid, see :class:`Wb2Source`.
+    skip_missing_channels: bool
+        Setting this flag to True will skip channels that are unknown or absent
+        from the store instead of failing.
+    """
+
+    def __init__(
+        self,
+        metadata: Dict,
+        input_file: str,
+        coord_mode: Optional[str] = "match",
+        skip_missing_channels: Optional[bool] = False,
+    ):
+        super().__init__(metadata)
+        self.wb2_data = _open_aligned(input_file, self.lat, self.lon, coord_mode, verbose=True)
+
+        # unknown names and names absent from the store are both missing
+        self.missing = [
+            name
+            for name in self.channel_names
+            if name not in invariant_variables or invariant_wb2_name(name) not in self.wb2_data
+        ]
+        if self.missing:
+            if not skip_missing_channels:
+                raise IndexError(f"Invariants {self.missing} not found in dataset.")
+            print(f"Invariants {self.missing} not found in dataset, skipping")
+
+    def skipped_channel_indices(self) -> List[int]:
+        return [self.channel_names.index(name) for name in self.missing]
+
+    def fill(self, out: h5.File, entry_key: str):
+        for cidx, name in enumerate(self.channel_names):
+            if name in self.missing:
+                continue
+            field = self.wb2_data[invariant_wb2_name(name)]
+            if "time" in field.dims:
+                field = field.isel(time=0)
+            out[entry_key][cidx, ...] = field.values
+
+    def summary(self) -> Optional[str]:
+        return f"Skipped channels: {self.missing}" if self.missing else None

@@ -36,10 +36,12 @@ from makani.utils.dataloaders.ncar_helpers import (
     analysis_pl_key,
     analysis_sfc_key,
     build_ncar_channel_groups,
+    invariant_key,
+    invariant_variables,
     resolve_accumulation_segments,
     to_ncar_hours,
 )
-from data_process.sources import Sample, Source, Unit
+from data_process.sources import InvariantSource, Sample, Source, Unit
 
 
 class NcarStore(object):
@@ -506,6 +508,65 @@ class NcarSource(Source):
             for cidx in group.channel_indices:
                 out[entry_key][sample_index, cidx, ...] = nan
                 out["valid_data"][sample_index, cidx] = 0
+
+    def close(self):
+        self.store.close()
+
+
+class NcarInvariantSource(InvariantSource):
+    """Read the time invariant ERA5 fields from the NSF NCAR bucket on S3.
+
+    Each field is a single small object holding one timestep, so every object is
+    simply opened and read whole.
+
+    Parameters
+    ----------
+    metadata : Dict
+        Invariant metadata, see :class:`data_process.sources.InvariantSource`.
+    bucket : str
+        Name of the S3 bucket holding the NCAR ERA5 data.
+    skip_missing_channels : bool
+        Setting this flag to True will skip channels without an NCAR counterpart
+        instead of failing. A field with a counterpart that is absent from the
+        bucket always fails.
+    """
+
+    def __init__(
+        self,
+        metadata: Dict,
+        bucket: Optional[str] = NCAR_ERA5_BUCKET,
+        skip_missing_channels: Optional[bool] = False,
+    ):
+        super().__init__(metadata)
+
+        self.missing = [name for name in self.channel_names if name not in invariant_variables]
+        if self.missing:
+            if not skip_missing_channels:
+                raise ValueError(
+                    f"Channels {self.missing} have no NCAR invariant counterpart. Known names: {list(invariant_variables)}"
+                )
+            warnings.warn(f"Skipping channels without an NCAR invariant counterpart: {self.missing}")
+
+        self.store = NcarStore(bucket)
+
+    def skipped_channel_indices(self) -> List[int]:
+        return [self.channel_names.index(name) for name in self.missing]
+
+    def fill(self, out: h5.File, entry_key: str):
+        for cidx, name in enumerate(self.channel_names):
+            if name in self.missing:
+                continue
+            variable = invariant_variables[name]
+            key = invariant_key(variable)
+            handle = self.store.open(key)
+            _check_grid(handle, self.lat, self.lon)
+            dset = handle[variable.h5_name]
+            # the single timestep of the stream
+            out[entry_key][cidx, ...] = _mask_fill(dset[0], dset)
+            self.store.release(key)
+
+    def summary(self) -> Optional[str]:
+        return f"Skipped channels: {self.missing}" if self.missing else None
 
     def close(self):
         self.store.close()

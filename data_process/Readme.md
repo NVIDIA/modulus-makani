@@ -17,6 +17,7 @@ makani
 │   ├── concatenate_dataset.py           # concatenation of data files across several years
 │   ├── convert_makani_output_to_wb2.py  # converting makani output to wb2 format
 │   ├── convert_era5_to_makani_input.py  # convert ERA5 (WB2/ARCO or NSF NCAR) in makani format
+│   ├── convert_era5_invariants_to_makani_input.py  # convert time invariant ERA5 fields (WB2/ARCO or NSF NCAR) in makani format
 │   ├── data_process_helpers.py          # helper functions for distributed Welford reductions
 │   ├── date_range.py                    # date range options shared by the yearly converters
 │   ├── generate_wb2_climatology.py      # generate mask and dataset for climatology data
@@ -26,7 +27,7 @@ makani
 │   ├── h5_convert.py                    # reformat h5 files to enable compression/chunking
 │   ├── merge_wb2_dataset.py             # add additional fields to an existing makani dataset from the Weatherbench dataset repo
 │   ├── postprocess_stats.py             # postprocessg of stats
-│   ├── sources                          # ERA5 sources of convert_era5_to_makani_input.py (wb2, ncar)
+│   ├── sources                          # ERA5 sources of the two convert_era5_* scripts (wb2, ncar)
 │   ├── wb2_helpers.py                   # wb2 helper functions
 │   └── Readme.md                        # this file
 ...
@@ -230,3 +231,45 @@ Key flags:
 - `--fail_on_nan`: abort if NaNs appear instead of masking them. This should not be used when computing stats for fields with missing numbers such as `sst`.
 - `--batch_size`: samples per read; tune for memory.
 - `--reduction_group_size`: MPI all-reduce group size (performance tuning).
+
+### Time invariant fields
+
+`convert_era5_invariants_to_makani_input.py` is the counterpart of
+`convert_era5_to_makani_input.py` for fields without a time axis. It takes the same
+subcommands (`wb2` or `ncar`) and the same metadata json, of which only the grid is used,
+so the metadata of the dataset the invariants belong to can be passed as is. The fields
+are selected with `--channels` by ECMWF short name and default to all of them:
+
+| name | field | name | field |
+|---|---|---|---|
+| `z` | surface geopotential (orography) | `tvl`, `tvh` | type of low / high vegetation |
+| `lsm` | land-sea mask | `sdor` | standard deviation of orography |
+| `slt` | soil type | `isor` | anisotropy of sub-gridscale orography |
+| `cl` | lake cover | `anor` | angle of sub-gridscale orography |
+| `dl` | lake depth | `slor` | slope of sub-gridscale orography |
+| `cvl`, `cvh` | low / high vegetation cover | `sdfor` | standard deviation of filtered subgrid orography |
+
+The invariants are a few megabytes in total, so the script runs serially and writes a
+single file:
+```
+python convert_era5_invariants_to_makani_input.py ncar \
+  --output_file "/path/to/output/invariants.h5" \
+  --metadata_file "/path/to/metadata.json" \
+  --channels z lsm slt cvl cvh tvl tvh
+```
+The file has the layout of a yearly file without the time axis: `fields` is
+`(channel, lat, lon)`, `valid_data` is `(channel,)`, and there is no `timestamp`. The
+`wb2` source takes `--input_file` and `--coord_mode` as for the time dependent data; it
+reads the invariants at the first timestep where a store repeats them along time, as
+ARCO-ERA5 does. Not every store holds every field (the WeatherBench2 13 level stores, for
+instance, lack `dl`), and `--skip_missing_channels` writes those as missing rather than
+failing. `--force_overwrite` replaces an existing file.
+
+Training selects channels from this file and says how each is encoded, see
+`makani/utils/invariants.py`:
+```yaml
+invariants_path: /invariants/invariants.h5
+invariants:
+  - {channel: z, encoding: normalize}
+  - {channel: lsm, encoding: onehot, num_classes: 2, rounding: floor}
+```

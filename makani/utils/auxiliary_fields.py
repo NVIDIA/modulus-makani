@@ -18,34 +18,6 @@ import torch
 import h5py
 
 
-def get_orography(orography_path):
-    """returns the surface geopotential for each grid point after normalizing it to be in the range [0, 1]"""
-
-    with h5py.File(orography_path, "r") as f:
-        orography = f["Z"][0, :, :]
-        orography = (orography - orography.min()) / (orography.max() - orography.min())
-
-    return orography
-
-
-def get_land_mask(land_mask_path):
-    """returns the land mask for each grid point. land sea mask is between 0 and 1"""
-
-    with h5py.File(land_mask_path, "r") as f:
-        lsm = f["LSM"][0, :, :]
-
-    return lsm
-
-
-def get_soiltype(soiltype_path):
-    """returns the soiltype mask for each grid point. Values are in between 1 and 7 for land and 0 for sea."""
-
-    with h5py.File(soiltype_path, "r") as f:
-        st = f["slt"][0, :, :]
-
-    return st
-
-
 def get_bias_correction(bias_correction_path, output_channels):
     """returns the bias correction from"""
 
@@ -63,27 +35,3 @@ def get_copernicus_emb(copernicus_emb_path):
     emb = torch.tensor(emb, dtype=torch.float32)
 
     return emb
-
-
-if __name__ == "__main__":
-    # imported here rather than at module scope: matplotlib is an optional
-    # dependency (the "vis" extra) and is only needed by this demo block
-    import matplotlib.pyplot as plt
-
-    lsm = get_land_mask("/code/utils/e5.oper.invariant.128_172_lsm.ll025sc.1979010100_1979010100.nc")
-    figure = plt.figure(figsize=(10, 10))
-    ax = figure.add_subplot(111)
-    im = ax.imshow(lsm)
-    ax.set_title("Land Mask")
-    # add colorbar
-    cbar = figure.colorbar(im, ax=ax)
-    plt.savefig("land_mask.png")
-
-    orography = get_orography("/code/utils/e5.oper.invariant.128_129_z.ll025sc.1979010100_1979010100.nc")
-    figure = plt.figure(figsize=(10, 10))
-    ax = figure.add_subplot(111)
-    im = ax.imshow(orography)
-    ax.set_title("Orography")
-    # add colorbar
-    cbar = figure.colorbar(im, ax=ax)
-    plt.savefig("orography.png")

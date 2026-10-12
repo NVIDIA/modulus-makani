@@ -103,10 +103,10 @@ base_config: &BASE_CONFIG
     grid_num_frequencies: 16
     add_zenith: !!bool True
     # invariants
-    add_orography: !!bool True
-    orography_path: /invariants/orography.nc
-    add_landmask: !!bool True
-    landmask_path: /invariants/land_sea_mask.nc
+    invariants_path: /invariants/invariants.h5
+    invariants:
+      - {channel: z, encoding: normalize}
+      - {channel: lsm, encoding: onehot, num_classes: 2, rounding: floor}
 
     pretrained: !!bool False
 

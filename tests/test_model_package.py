@@ -350,8 +350,8 @@ class TestSaveModelPackage(unittest.TestCase):
 
     def test_synthetic_data_writes_nothing(self):
         self.params.enable_synthetic_data = True
-        self.params.add_orography = True
-        self.params.orography_path = "/nonexistent/orography.nc"
+        self.params.invariants = [{"channel": "z", "encoding": "normalize"}]
+        self.params.invariants_path = "/nonexistent/invariants.h5"
 
         save_model_package(self.params)
 

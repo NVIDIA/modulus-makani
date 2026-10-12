@@ -14,11 +14,14 @@
 # limitations under the License.
 
 import unittest
+import tempfile
 
+import h5py
+import numpy as np
 import torch
 
 from makani.models.preprocessor_helpers import get_bias_correction, get_static_features
-from makani.utils.features import get_auxiliary_channels
+from makani.utils.features import get_auxiliary_channels, get_channel_groups, is_static_aux_channel
 
 import sys
 import os
@@ -205,26 +208,25 @@ class TestGetStaticFeatures(unittest.TestCase):
     # -----------------------------------------------------------------------
     # 2f. IOError guards for file-dependent features
     # -----------------------------------------------------------------------
-    def test_add_orography_missing_file_raises_ioerror(self):
-        """Raises IOError when orography_path does not exist."""
-        self.params.add_orography = True
-        self.params.orography_path = "/nonexistent/orography.npy"
+    def test_invariants_missing_file_raises_ioerror(self):
+        """Raises IOError when invariants_path does not exist."""
+        self.params.invariants = [{"channel": "z", "encoding": "normalize"}]
+        self.params.invariants_path = "/nonexistent/invariants.h5"
         with self.assertRaises(IOError):
             get_static_features(self.params)
 
-    def test_add_landmask_missing_file_raises_ioerror(self):
-        """Raises IOError when landmask_path does not exist."""
-        self.params.add_landmask = True
-        self.params.landmask_path = "/nonexistent/landmask.npy"
-        with self.assertRaises(IOError):
-            get_static_features(self.params)
-
-    def test_add_soiltype_missing_file_raises_ioerror(self):
-        """Raises IOError when soiltype_path does not exist."""
-        self.params.add_soiltype = True
-        self.params.soiltype_path = "/nonexistent/soiltype.npy"
-        with self.assertRaises(IOError):
-            get_static_features(self.params)
+    def test_legacy_invariant_options_raise(self):
+        """The discontinued per-file options are refused rather than silently ignored."""
+        for option in ["add_orography", "add_landmask", "add_soiltype"]:
+            with self.subTest(option=option):
+                params = get_default_parameters()
+                params.img_shape_x = IMG_H
+                params.img_shape_y = IMG_W
+                setattr(params, option, True)
+                with self.assertRaises(ValueError):
+                    get_static_features(params)
+                with self.assertRaises(ValueError):
+                    get_auxiliary_channels(**params.to_dict())
 
     def test_add_copernicus_emb_missing_file_raises_ioerror(self):
         """Raises IOError when copernicus_emb_path does not exist."""
@@ -235,16 +237,120 @@ class TestGetStaticFeatures(unittest.TestCase):
 
 
 # ===========================================================================
-# 3. Synthetic-data stand-ins for the invariants
+# 3. Invariants read from an invariants file
+# ===========================================================================
+_LSM = [{"channel": "lsm", "encoding": "onehot", "num_classes": 2, "rounding": "floor"}]
+
+
+def _write_invariants_file(path, fields, channels, valid=None):
+    """An invariants file laid out like data_process/convert_era5_invariants_to_makani_input.py writes it."""
+    with h5py.File(path, "w") as f:
+        f["fields"] = np.asarray(fields, dtype=np.float32)
+        f["channel"] = np.array(channels, dtype="S")
+        f["lat"] = np.linspace(90.0, -90.0, IMG_H)
+        f["lon"] = np.linspace(0.0, 360.0, IMG_W, endpoint=False)
+        f["valid_data"] = np.ones(len(channels), dtype=np.int32) if valid is None else np.asarray(valid)
+
+
+class TestInvariantFeatures(unittest.TestCase):
+
+    def setUp(self):
+        set_seed(333)
+        self.params = get_default_parameters()
+        self.params.img_shape_x = IMG_H
+        self.params.img_shape_y = IMG_W
+
+        rng = np.random.default_rng(333)
+        self.z = rng.normal(size=(IMG_H, IMG_W)) * 1000.0
+        # fractional land, so that floor and round differ
+        self.lsm = rng.uniform(size=(IMG_H, IMG_W))
+        self.lsm[0, :] = 1.0
+        self.slt = rng.integers(0, 8, size=(IMG_H, IMG_W)).astype(np.float32)
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.params.invariants_path = os.path.join(self._tmpdir.name, "invariants.h5")
+        _write_invariants_file(self.params.invariants_path, [self.z, self.lsm, self.slt], ["z", "lsm", "slt"])
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_channels_follow_the_configured_order(self):
+        self.params.invariants = [
+            {"channel": "slt", "encoding": "raw"},
+            {"channel": "z", "encoding": "normalize"},
+        ]
+        out = get_static_features(self.params)
+
+        self.assertEqual(tuple(out.shape), (1, 2, IMG_H, IMG_W))
+        torch.testing.assert_close(out[0, 0], torch.as_tensor(self.slt, dtype=torch.float32))
+        self.assertAlmostEqual(out[0, 1].mean().item(), 0.0, places=5)
+        self.assertAlmostEqual(out[0, 1].std().item(), 1.0, places=4)
+
+    def test_onehot_floor_marks_only_full_land(self):
+        self.params.invariants = _LSM
+        out = get_static_features(self.params)
+
+        # class 1, land, only where the land fraction is exactly one
+        land = torch.as_tensor(self.lsm == 1.0, dtype=torch.float32)
+        torch.testing.assert_close(out[0, 1], land)
+        torch.testing.assert_close(out[0, 0], 1.0 - land)
+
+    def test_onehot_round(self):
+        self.params.invariants = [{"channel": "lsm", "encoding": "onehot", "num_classes": 2}]
+        out = get_static_features(self.params)
+
+        land = torch.as_tensor(np.round(self.lsm) == 1.0, dtype=torch.float32)
+        torch.testing.assert_close(out[0, 1], land)
+
+    def test_onehot_classes_out_of_range_raise(self):
+        self.params.invariants = [{"channel": "slt", "encoding": "onehot", "num_classes": 4}]
+        with self.assertRaises(ValueError):
+            get_static_features(self.params)
+
+    def test_channel_absent_from_file_raises(self):
+        self.params.invariants = [{"channel": "cvh", "encoding": "raw"}]
+        with self.assertRaises(ValueError):
+            get_static_features(self.params)
+
+    def test_channel_marked_invalid_raises(self):
+        _write_invariants_file(self.params.invariants_path, [self.z], ["z"], valid=[0])
+        self.params.invariants = [{"channel": "z", "encoding": "normalize"}]
+        with self.assertRaises(ValueError):
+            get_static_features(self.params)
+
+    def test_grid_mismatch_raises(self):
+        self.params.img_shape_x = IMG_H * 2
+        self.params.invariants = [{"channel": "z", "encoding": "normalize"}]
+        with self.assertRaises(ValueError):
+            get_static_features(self.params)
+
+    def test_invalid_configuration_raises(self):
+        for invariants in [
+            [{"channel": "lsm", "encoding": "onehot"}],
+            [{"channel": "z", "encoding": "zscore"}],
+            [{"channel": "z", "encoding": "raw", "num_classes": 2}],
+            [{"channel": "z", "encoding": "raw"}, {"channel": "z", "encoding": "normalize"}],
+        ]:
+            with self.subTest(invariants=invariants):
+                self.params.invariants = invariants
+                with self.assertRaises(ValueError):
+                    get_static_features(self.params)
+
+    def test_sharding_and_subsampling(self):
+        self.params.invariants = [{"channel": "slt", "encoding": "raw"}]
+        self.params.img_local_offset_x = 2
+        self.params.img_local_shape_x = 4
+        self.params.subsampling_factor = 2
+        out = get_static_features(self.params)
+
+        torch.testing.assert_close(out[0, 0], torch.as_tensor(self.slt[2:6:2, ::2], dtype=torch.float32))
+
+
+# ===========================================================================
+# 4. Synthetic-data stand-ins for the invariants
 # ===========================================================================
 class TestSyntheticStaticFeatures(unittest.TestCase):
-    """On synthetic data the invariant files do not exist, so they are stood in for.
-
-    The widths are checked against get_auxiliary_channels rather than hard-coded: the stand-in
-    cannot derive its channel count from the data the way the one-hot encoded real fields do, so
-    the two accountings have to be kept in agreement explicitly or the model's input channel
-    count changes without anything complaining.
-    """
+    """On synthetic data the invariants file does not exist, so it is stood in for."""
 
     def setUp(self):
         set_seed(333)
@@ -252,46 +358,17 @@ class TestSyntheticStaticFeatures(unittest.TestCase):
         self.params.img_shape_x = IMG_H
         self.params.img_shape_y = IMG_W
         self.params.enable_synthetic_data = True
+        self.params.invariants_path = "/nonexistent/invariants.h5"
 
-    def _expected_channels(self, **flags):
-        return len(get_auxiliary_channels(**flags))
-
-    def test_orography(self):
-        self.params.add_orography = True
-        self.params.orography_path = "/nonexistent/orography.nc"
+    def test_invariants(self):
+        """The fcn3 configuration: orography plus a one-hot land-sea mask."""
+        self.params.invariants = [{"channel": "z", "encoding": "normalize"}] + _LSM
 
         out = get_static_features(self.params)
 
-        self.assertEqual(tuple(out.shape), (1, self._expected_channels(add_orography=True), IMG_H, IMG_W))
-
-    def test_landmask_one_hot(self):
-        self.params.add_landmask = True
-        self.params.landmask_path = "/nonexistent/land_sea_mask.nc"
-
-        out = get_static_features(self.params)
-
-        expected = self._expected_channels(add_landmask=True, landmask_preprocessing="floor")
-        self.assertEqual(tuple(out.shape), (1, expected, IMG_H, IMG_W))
+        self.assertEqual(tuple(out.shape), (1, 3, IMG_H, IMG_W))
         # one-hot: exactly one channel is set per grid point
-        torch.testing.assert_close(out.sum(dim=1), torch.ones(1, IMG_H, IMG_W))
-
-    def test_landmask_raw(self):
-        self.params.add_landmask = True
-        self.params.landmask_preprocessing = "raw"
-        self.params.landmask_path = "/nonexistent/land_sea_mask.nc"
-
-        out = get_static_features(self.params)
-
-        expected = self._expected_channels(add_landmask=True, landmask_preprocessing="raw")
-        self.assertEqual(tuple(out.shape), (1, expected, IMG_H, IMG_W))
-
-    def test_soiltype(self):
-        self.params.add_soiltype = True
-        self.params.soiltype_path = "/nonexistent/soiltype.nc"
-
-        out = get_static_features(self.params)
-
-        self.assertEqual(tuple(out.shape), (1, self._expected_channels(add_soiltype=True), IMG_H, IMG_W))
+        torch.testing.assert_close(out[:, 1:].sum(dim=1), torch.ones(1, IMG_H, IMG_W))
 
     def test_copernicus_emb(self):
         self.params.add_copernicus_emb = True
@@ -299,28 +376,72 @@ class TestSyntheticStaticFeatures(unittest.TestCase):
 
         out = get_static_features(self.params)
 
-        self.assertEqual(tuple(out.shape), (1, self._expected_channels(add_copernicus_emb=True), IMG_H, IMG_W))
-
-    def test_combined_invariants(self):
-        """The fcn3 configuration: orography plus land-sea mask."""
-        self.params.add_orography = True
-        self.params.orography_path = "/invariants/orography.nc"
-        self.params.add_landmask = True
-        self.params.landmask_path = "/invariants/land_sea_mask.nc"
-
-        out = get_static_features(self.params)
-
-        expected = self._expected_channels(add_orography=True, add_landmask=True, landmask_preprocessing="floor")
-        self.assertEqual(tuple(out.shape), (1, expected, IMG_H, IMG_W))
+        self.assertEqual(tuple(out.shape), (1, 8, IMG_H, IMG_W))
 
     def test_real_data_still_raises(self):
-        """Without synthetic data a missing invariant is still a hard error."""
+        """Without synthetic data a missing invariants file is still a hard error."""
         self.params.enable_synthetic_data = False
-        self.params.add_orography = True
-        self.params.orography_path = "/nonexistent/orography.nc"
+        self.params.invariants = [{"channel": "z", "encoding": "normalize"}]
 
         with self.assertRaises(IOError):
             get_static_features(self.params)
+
+
+# ===========================================================================
+# 5. Auxiliary channel names against the static features
+# ===========================================================================
+class TestAuxiliaryChannelNames(unittest.TestCase):
+    """The driver counts the static channels from their names, so the names have to match the tensor."""
+
+    def setUp(self):
+        set_seed(333)
+        self.params = get_default_parameters()
+        self.params.img_shape_x = IMG_H
+        self.params.img_shape_y = IMG_W
+        self.params.enable_synthetic_data = True
+        self.params.invariants_path = "/nonexistent/invariants.h5"
+
+    def _check(self):
+        names = get_auxiliary_channels(**self.params.to_dict())
+        out = get_static_features(self.params)
+        num_static = 0 if out is None else out.shape[1]
+        self.assertEqual(len([name for name in names if is_static_aux_channel(name)]), num_static)
+        return names
+
+    def test_static_counts_match(self):
+        configurations = [
+            dict(add_grid=True, gridtype="raw"),
+            dict(add_grid=True, gridtype="sinusoidal", grid_num_frequencies=2, add_cos_to_grid=True),
+            dict(add_grid=True, gridtype="sinusoidal", grid_num_frequencies=2, add_cos_to_grid=False),
+            dict(invariants=[{"channel": "z", "encoding": "normalize"}] + _LSM),
+            dict(add_copernicus_emb=True, copernicus_emb_path="/nonexistent/copernicus.npy"),
+        ]
+        for configuration in configurations:
+            with self.subTest(**{k: str(v) for k, v in configuration.items()}):
+                self.setUp()
+                for key, value in configuration.items():
+                    setattr(self.params, key, value)
+                self._check()
+
+    def test_names_and_order(self):
+        self.params.add_zenith = True
+        self.params.n_noise_chan = 2
+        self.params.add_grid = True
+        self.params.gridtype = "raw"
+        self.params.invariants = [{"channel": "z", "encoding": "normalize"}] + _LSM
+
+        names = self._check()
+
+        self.assertEqual(names, ["xd_zen", "xd_noise0", "xd_noise1", "xs_lat", "xs_lon", "xs_z", "xs_lsm0", "xs_lsm1"])
+
+    def test_channel_groups_split_by_prefix(self):
+        _, _, dyn, stat, _ = get_channel_groups(["t2m"], ["xd_zen", "xs_lat", "xs_lon", "xs_lsm1"])
+        self.assertEqual(dyn, [1])
+        self.assertEqual(stat, [2, 3, 4])
+
+    def test_channel_groups_reject_unprefixed_aux_channels(self):
+        with self.assertRaises(ValueError):
+            get_channel_groups(["t2m"], ["xzen"])
 
 
 if __name__ == "__main__":

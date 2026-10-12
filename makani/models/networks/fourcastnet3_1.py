@@ -914,7 +914,8 @@ class AtmoSphericNeuralOperatorNet31(nn.Module):
             channel_names, aux_channel_names
         )
         sst_chans = [channel_names.index("sst")] if "sst" in channel_names else []
-        lsml_chans = [len(channel_names) + aux_channel_names.index("xlsml")] if "xlsml" in aux_channel_names else []
+        # the land class of a one-hot land-sea mask, which marks where sst is undefined
+        lsml_chans = [len(channel_names) + aux_channel_names.index("xs_lsm1")] if "xs_lsm1" in aux_channel_names else []
 
         # compute how many channel groups will be kept internally
         self.n_atmo_groups = len(pressure_lvls)

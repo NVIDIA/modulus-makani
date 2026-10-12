@@ -131,6 +131,28 @@ accumulated_variables: Dict[str, tuple] = {
 }
 
 
+# Time invariant fields. The stream holds a single timestep per variable, stamped
+# 1979-01-01 00Z, and is keyed by ECMWF short name: the surface geopotential is
+# "z" here, which cannot be confused with the pressure level channels since the
+# invariants are written to a file of their own.
+invariant_variables: Dict[str, NcarVariable] = {
+    "z": NcarVariable("e5.oper.invariant", "128_129", "z", "sc", "Z"),
+    "lsm": NcarVariable("e5.oper.invariant", "128_172", "lsm", "sc", "LSM"),
+    "slt": NcarVariable("e5.oper.invariant", "128_043", "slt", "sc", "SLT"),
+    "cl": NcarVariable("e5.oper.invariant", "128_026", "cl", "sc", "CL"),
+    "dl": NcarVariable("e5.oper.invariant", "228_007", "dl", "sc", "DL"),
+    "cvl": NcarVariable("e5.oper.invariant", "128_027", "cvl", "sc", "CVL"),
+    "cvh": NcarVariable("e5.oper.invariant", "128_028", "cvh", "sc", "CVH"),
+    "tvl": NcarVariable("e5.oper.invariant", "128_029", "tvl", "sc", "TVL"),
+    "tvh": NcarVariable("e5.oper.invariant", "128_030", "tvh", "sc", "TVH"),
+    "sdor": NcarVariable("e5.oper.invariant", "128_160", "sdor", "sc", "SDOR"),
+    "isor": NcarVariable("e5.oper.invariant", "128_161", "isor", "sc", "ISOR"),
+    "anor": NcarVariable("e5.oper.invariant", "128_162", "anor", "sc", "ANOR"),
+    "slor": NcarVariable("e5.oper.invariant", "128_163", "slor", "sc", "SLOR"),
+    "sdfor": NcarVariable("e5.oper.invariant", "128_074", "sdfor", "sc", "SDFOR"),
+}
+
+
 def build_ncar_channel_groups(channel_names: List[str], skip_missing_channels: bool = False) -> List[ChannelGroup]:
     """Group makani channel names by the NCAR source file that provides them.
 
@@ -210,6 +232,15 @@ def accumulation_key(variable: NcarVariable, init_time: dt.datetime) -> str:
         nxt = (init_time.replace(day=28) + dt.timedelta(days=7)).replace(day=1)
         start, end = f"{init_time:%Y%m}1606", f"{nxt:%Y%m}0106"
     return f"{variable.stream}/{init_time:%Y%m}/{variable.stream}.{variable.param}_{variable.short_name}.ll025{variable.grid}.{start}_{end}.nc"
+
+
+def invariant_key(variable: NcarVariable) -> str:
+    """Return the object key of a time invariant field.
+
+    The invariant stream holds a single file per variable, filed under January
+    1979 and stamped with that one timestep.
+    """
+    return f"{variable.stream}/197901/{variable.stream}.{variable.param}_{variable.short_name}.ll025{variable.grid}.1979010100_1979010100.nc"
 
 
 # ---------------------------------------------------------------------------

@@ -22,13 +22,13 @@ jobs:
         # Install torch first, then build torch-harmonics against it. Anything
         # after this step must respect the torch version that TH was compiled
         # with, otherwise the prebuilt _C.so will hit ABI-mismatch import errors.
-        python -m pip install torch==2.7.1 --extra-index-url https://download.pytorch.org/whl/cpu
+        python -m pip install torch==2.9.1 --extra-index-url https://download.pytorch.org/whl/cpu
         python -m pip install setuptools_scm
         # All git dependencies are pinned to immutable commit SHAs rather than branches
         # or tags, so that a force-push or a repointed tag upstream cannot change what
         # runs in CI. Bump these deliberately.
-        # torch-harmonics main as of 2026-08-04; move to the next release tag's SHA once it is cut.
-        python -m pip install --no-build-isolation git+https://github.com/NVIDIA/torch-harmonics.git@887006c640f1d61c3f80590ecc2b207bbb647072
+        # torch-harmonics v0.9.3.
+        python -m pip install --no-build-isolation git+https://github.com/NVIDIA/torch-harmonics.git@2028c7768e5ca3ad5a82e1d6bd8c304aa703754f
         # Freeze whatever torch version TH just compiled against. Strip the
         # local label (+cpu) so the constraint matches any build of that
         # public version.
