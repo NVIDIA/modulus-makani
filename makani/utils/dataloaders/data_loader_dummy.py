@@ -121,8 +121,14 @@ class DummyLoader(object):
         # zenith angle yes or no?
         self.add_zenith = add_zenith
         if self.add_zenith:
-            self.zen_dummy = torch.zeros(
+            # input and target zenith span their own windows, n_history+1 and n_future+1 steps
+            self.zen_inp_dummy = torch.zeros(
                 (self.batch_size, self.n_history + 1, 1, self.return_shape[0], self.return_shape[1]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.zen_tar_dummy = torch.zeros(
+                (self.batch_size, self.n_future + 1, 1, self.return_shape[0], self.return_shape[1]),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -295,9 +301,9 @@ class DummyLoader(object):
                 result += (self.tar,)
 
             if self.add_zenith:
-                result += (self.zen_dummy,)
+                result += (self.zen_inp_dummy,)
                 if self.return_target:
-                    result += (self.zen_dummy,)
+                    result += (self.zen_tar_dummy,)
 
             if self.return_timestamp:
                 result += (self.inp_time,)

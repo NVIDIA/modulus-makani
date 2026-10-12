@@ -239,3 +239,33 @@ def get_date_ranges(dates, lookback_hours: int, lookahead_hours: int):
         ((date - dt.timedelta(hours=lookback_hours)), (date + dt.timedelta(hours=lookahead_hours))) for date in dates
     ]
     return time_ranges
+
+
+def parse_data_normalization_mode(mode=None):
+    """Parse the ``data_normalization_mode`` option of the DALI loader.
+
+    The mode is ``"<mode>[-<axes>]"``, e.g. ``"offline"`` or ``"offline-FHWB"``: ``<mode>``
+    is ``offline`` or ``online``, and ``<axes>`` are the DALI axis names normalized over,
+    where a ``B`` normalizes over the batch as well.
+
+    Returns
+    -------
+    norm_mode : str
+    norm_channels : str
+        The axis names without ``B``, ``"FHW"`` by default.
+    norm_batch : bool
+    """
+    if mode is None:
+        return "offline", "FHW", False
+
+    split = mode.split("-")
+    norm_mode = split[0]
+    norm_channels = "FHW"
+    norm_batch = False
+    if len(split) > 1:
+        norm_channels = split[1]
+        if "B" in norm_channels:
+            norm_batch = True
+            norm_channels = norm_channels.replace("B", "")
+
+    return norm_mode, norm_channels, norm_batch

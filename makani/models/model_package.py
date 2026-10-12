@@ -297,7 +297,16 @@ class ModelWrapper(torch.nn.Module):
         for the batching contract on ``time``.
         """
         if not normalized_data:
-            x = (x - self.in_bias) / self.in_scale
+            # the statistics are per channel, (1, C, 1, 1), while the history steps are
+            # stacked along the channel dimension, so normalize each step separately
+            preprocessor = self.model.preprocessor
+            n_steps = self.params.get("n_history", 0) + 1
+            if x.dim() == 4:
+                x = preprocessor.expand_history(x, n_steps)
+                x = (x - self.in_bias.unsqueeze(1)) / self.in_scale.unsqueeze(1)
+                x = preprocessor.flatten_history(x)
+            else:
+                x = (x - self.in_bias.unsqueeze(1)) / self.in_scale.unsqueeze(1)
 
         if self.add_zenith:
             z = self._zenith_features(x, time)

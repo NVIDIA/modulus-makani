@@ -20,6 +20,7 @@ import unittest
 import numpy as np
 
 from makani.utils.dataloaders.data_helpers import (
+    parse_data_normalization_mode,
     get_lat_lon_grid,
     get_data_normalization,
     get_time_diff_stds,
@@ -467,6 +468,21 @@ class TestGetDateRanges(unittest.TestCase):
         _, end1 = ranges[0]
         start2, _ = ranges[1]
         self.assertLess(end1, start2)
+
+
+class TestParseDataNormalizationMode(unittest.TestCase):
+    def test_default_is_offline_over_space(self):
+        self.assertEqual(parse_data_normalization_mode(None), ("offline", "FHW", False))
+
+    def test_mode_without_axes(self):
+        self.assertEqual(parse_data_normalization_mode("online"), ("online", "FHW", False))
+
+    def test_axes(self):
+        self.assertEqual(parse_data_normalization_mode("offline-HW"), ("offline", "HW", False))
+
+    def test_batch_axis_is_split_off(self):
+        # the B used to be left in the axis names, which DALI does not know
+        self.assertEqual(parse_data_normalization_mode("offline-FHWB"), ("offline", "FHW", True))
 
 
 if __name__ == "__main__":

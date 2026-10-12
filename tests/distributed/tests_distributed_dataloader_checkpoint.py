@@ -134,6 +134,8 @@ class TestDistributedDataloaderCheckpoint(unittest.TestCase):
             device=self.device,
             dali_device=self.dali_device,
         )
+        # shut the pipeline down when the test ends instead of leaving it to the garbage collector
+        self.addCleanup(loader.close)
 
         return loader
 

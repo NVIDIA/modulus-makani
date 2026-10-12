@@ -224,7 +224,13 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
         # dali loader
         if dali_device is None:
             dali_device = "gpu" if torch.cuda.is_available() else "cpu"
-        dataloader = DaliDataloader(params, files_pattern, (mode == "train"), dali_device=dali_device)
+        dataloader = DaliDataloader(
+            params,
+            files_pattern,
+            (mode == "train"),
+            dali_device=dali_device,
+            return_timestamp=(True if (mode == "inference") else False),
+        )
 
         data_shapes = dataloader.data_shapes
 

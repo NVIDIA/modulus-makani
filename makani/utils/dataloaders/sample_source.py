@@ -405,6 +405,19 @@ class SampleSource(object):
 
         return self._reorder_channels(self.inp_buff, self.tar_buff)
 
+    def output_layout(self):
+        """DALI layout of each output of :meth:`__call__`, in the order they are returned.
+
+        The pipeline takes the number of outputs from this as well, so that the two
+        cannot drift apart: fields are ``FCHW``, timestamps ``F``.
+        """
+        layout = ["FCHW", "FCHW"]
+        if self.zenith_angle:
+            layout += ["FCHW", "FCHW"]
+        if self.return_timestamp:
+            layout += ["F", "F"]
+        return layout
+
     def _compute_timestamps(self, local_idx, file_idx):
         # the times the backend discovered, not ones derived from the year label:
         # a file need not start on January 1st, a partial year being the obvious case

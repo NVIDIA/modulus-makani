@@ -542,6 +542,18 @@ class _BaseESTests:
         result = self._call0(es)
         self.assertEqual(len(result), 6)  # inp, tar, zen_inp, zen_tar, inp_t, tar_t
 
+    def test_output_layout_matches_outputs(self):
+        # the DALI pipeline takes the number of outputs and their layouts from this
+        for zenith_angle in [False, True]:
+            for return_timestamp in [False, True]:
+                with self.subTest(zenith_angle=zenith_angle, return_timestamp=return_timestamp):
+                    es = self._make(zenith_angle=zenith_angle, return_timestamp=return_timestamp)
+                    result = self._call0(es)
+                    layout = es.output_layout()
+                    self.assertEqual(len(layout), len(result))
+                    for output, axes in zip(result, layout):
+                        self.assertEqual(np.ndim(output), len(axes))
+
     # ---- 11. pickle round-trip ------------------------------------------
 
     def test_pickle_roundtrip(self, verbose=False):

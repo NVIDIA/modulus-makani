@@ -158,6 +158,16 @@ class DataLoaderBase:
     implement ``_get_sample``.
     """
 
+    def _get_dataloader(self, *args, **kwargs):
+        """
+        get_dataloader that shuts a DALI pipeline down when the test ends. Left to the
+        garbage collector, its native threads would outlive the test and run into later ones.
+        """
+        loader, dataset, sampler = get_dataloader(*args, **kwargs)
+        if hasattr(loader, "close"):
+            self.addCleanup(loader.close)
+        return loader, dataset, sampler
+
     def _get_sample(self, path, idx):
         raise NotImplementedError
 
@@ -191,7 +201,7 @@ class DataLoaderBase:
         self.params.multifiles = multifiles
 
         # create dataloaders
-        valid_loader, valid_dataset, _ = get_dataloader(
+        valid_loader, valid_dataset, _ = self._get_dataloader(
             self.params, self.params.valid_data_path, mode="eval", device=self.device
         )
 
@@ -212,7 +222,7 @@ class DataLoaderBase:
         self.params.multifiles = multifiles
 
         # create dataloaders
-        valid_loader, valid_dataset, _ = get_dataloader(
+        valid_loader, valid_dataset, _ = self._get_dataloader(
             self.params, self.params.valid_data_path, mode="eval", device=self.device
         )
 
@@ -266,7 +276,7 @@ class DataLoaderBase:
             params.time_diff_means_path = os.path.join(tmp_stats, "time_diff_means.npy")
             params.time_diff_stds_path = os.path.join(tmp_stats, "time_diff_stds.npy")
 
-            valid_loader, valid_dataset, _ = get_dataloader(
+            valid_loader, valid_dataset, _ = self._get_dataloader(
                 params, params.valid_data_path, mode="eval", device=self.device
             )
 
@@ -310,7 +320,7 @@ class DataLoaderBase:
         self.params.multifiles = multifiles
 
         # create dataloaders
-        valid_loader, valid_dataset, _ = get_dataloader(
+        valid_loader, valid_dataset, _ = self._get_dataloader(
             self.params, self.params.valid_data_path, mode="eval", device=self.device
         )
 
@@ -318,7 +328,7 @@ class DataLoaderBase:
         params = copy.deepcopy(self.params)
         params.in_channels = params.in_channels[::-1]
         params.out_channels = params.out_channels[::-1]
-        valid_loader_flip, valid_dataset_flip, _ = get_dataloader(
+        valid_loader_flip, valid_dataset_flip, _ = self._get_dataloader(
             params, self.params.valid_data_path, mode="eval", device=self.device
         )
 
@@ -343,7 +353,7 @@ class DataLoaderBase:
         self.params.n_history = 3
 
         # create dataloaders
-        valid_loader, valid_dataset, _ = get_dataloader(
+        valid_loader, valid_dataset, _ = self._get_dataloader(
             self.params, self.params.valid_data_path, mode="eval", device=self.device
         )
 
@@ -370,7 +380,7 @@ class DataLoaderBase:
         self.params.n_future = 3
 
         # create dataloaders
-        train_loader, train_dataset, _ = get_dataloader(
+        train_loader, train_dataset, _ = self._get_dataloader(
             self.params, self.params.train_data_path, mode="train", device=self.device
         )
 
@@ -397,7 +407,7 @@ class DataLoaderBase:
         self.params.valid_autoreg_steps = 3
 
         # create dataloaders
-        valid_loader, valid_dataset, _ = get_dataloader(
+        valid_loader, valid_dataset, _ = self._get_dataloader(
             self.params, self.params.valid_data_path, mode="eval", device=self.device
         )
 
@@ -424,7 +434,7 @@ class DataLoaderBase:
         self.params.io_grid = [1, 2, 1]
         self.params.io_rank = [0, 1, 0]
 
-        valid_loader, valid_dataset, _ = get_dataloader(
+        valid_loader, valid_dataset, _ = self._get_dataloader(
             self.params, self.params.valid_data_path, mode="eval", device=self.device
         )
 
@@ -478,7 +488,7 @@ class DataLoaderBase:
         self.params.io_grid = [1, 2, 1]
         self.params.io_rank = [0, 1, 0]
 
-        valid_loader, valid_dataset, _ = get_dataloader(
+        valid_loader, valid_dataset, _ = self._get_dataloader(
             self.params, self.params.valid_data_path, mode="eval", device=self.device
         )
 
@@ -560,7 +570,7 @@ class DataLoaderBase:
         params.valid_autoreg_steps = 3  # n_future=3 in eval mode
         params.batch_size = 1
 
-        loader, _, _ = get_dataloader(
+        loader, _, _ = self._get_dataloader(
             params,
             params.train_data_path,
             mode="eval",
@@ -629,7 +639,7 @@ class DataLoaderBase:
         params.n_eval_samples = 40
         params.num_data_workers = num_workers
 
-        loader, _, _ = get_dataloader(
+        loader, _, _ = self._get_dataloader(
             params,
             params.valid_data_path,
             mode="eval",
@@ -680,7 +690,7 @@ class DataLoaderBase:
         params.n_train_samples = 20  # keep the test fast
         params.n_future = 0
 
-        loader, _, _ = get_dataloader(
+        loader, _, _ = self._get_dataloader(
             params,
             params.train_data_path,
             mode="train",
@@ -734,7 +744,7 @@ class DataLoaderBase:
         params.n_train_samples = 8  # keep the test fast
         params.n_future = 0
 
-        loader, _, _ = get_dataloader(
+        loader, _, _ = self._get_dataloader(
             params,
             params.train_data_path,
             mode="train",
@@ -770,7 +780,7 @@ class DataLoaderBase:
         params.n_future = 0
 
         def _make_loader():
-            loader, _, _ = get_dataloader(
+            loader, _, _ = self._get_dataloader(
                 params,
                 params.train_data_path,
                 mode="train",
@@ -895,10 +905,35 @@ class TestHDF5DataLoader(DataLoaderBase, unittest.TestCase):
     def test_dali_checkpoint_mid_epoch_resume(self):
         self._test_dali_checkpoint_mid_epoch_resume()
 
+    @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
+    def test_dali_training_loader_ignores_return_timestamp_param(self):
+        # timestamps would land where the trainers expect the zenith angle
+        self.params.multifiles = False
+        self.params.return_timestamp = True
+        train_loader, _, _ = self._get_dataloader(
+            self.params, self.params.train_data_path, mode="train", device=self.device, dali_device=self.dali_device
+        )
+        self.assertEqual(len(next(iter(train_loader))), 2)
+
+    @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
+    def test_dali_close_releases_the_pipeline(self):
+        self.params.multifiles = False
+        train_loader, _, _ = self._get_dataloader(
+            self.params, self.params.train_data_path, mode="train", device=self.device, dali_device=self.dali_device
+        )
+        next(iter(train_loader))
+        train_loader.close()
+        self.assertIsNone(train_loader.pipeline)
+        self.assertIsNone(train_loader.iterator)
+        # a second close, e.g. the registered test cleanup, must be harmless
+        train_loader.close()
+
     # HDF5-only: MultifilesDataset date/index retrieval API
     def test_date_retrieval(self):
         self.params.multifiles = True
-        train_loader, _, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+        train_loader, _, _ = self._get_dataloader(
+            self.params, self.params.train_data_path, mode="train", device=self.device
+        )
         dhours = 24
         time1 = train_loader.dataset.get_time_at_index(10)
         time1_comp = dt.datetime(
@@ -911,7 +946,9 @@ class TestHDF5DataLoader(DataLoaderBase, unittest.TestCase):
 
     def test_index_retrieval(self):
         self.params.multifiles = True
-        train_loader, _, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+        train_loader, _, _ = self._get_dataloader(
+            self.params, self.params.train_data_path, mode="train", device=self.device
+        )
         dhours = 24
         tstamp = dt.datetime(
             year=2017, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc
@@ -992,7 +1029,9 @@ class TestZarrDataLoader(DataLoaderBase, unittest.TestCase):
 
     def test_date_retrieval(self):
         self.params.multifiles = True
-        train_loader, _, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+        train_loader, _, _ = self._get_dataloader(
+            self.params, self.params.train_data_path, mode="train", device=self.device
+        )
         dhours = 24
         time1 = train_loader.dataset.get_time_at_index(10)
         time1_comp = dt.datetime(
@@ -1005,7 +1044,9 @@ class TestZarrDataLoader(DataLoaderBase, unittest.TestCase):
 
     def test_index_retrieval(self):
         self.params.multifiles = True
-        train_loader, _, _ = get_dataloader(self.params, self.params.train_data_path, mode="train", device=self.device)
+        train_loader, _, _ = self._get_dataloader(
+            self.params, self.params.train_data_path, mode="train", device=self.device
+        )
         dhours = 24
         tstamp = dt.datetime(
             year=2017, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc
@@ -1129,6 +1170,13 @@ class TestDummyLoader(unittest.TestCase):
         self.assertEqual(len(batch), 4)  # inp, tar, inp_zen, tar_zen
         _, _, inp_zen, _ = batch
         self.assertEqual(tuple(inp_zen.shape), (self.batch_size, 1, 1, *self.img_shape))
+
+    def test_target_zenith_spans_the_target_window(self):
+        # the target zenith used to be the input zenith tensor, n_history+1 steps long
+        loader = self._make_loader(add_zenith=True, n_history=1, n_future=2)
+        _, _, inp_zen, tar_zen = next(iter(loader))
+        self.assertEqual(tuple(inp_zen.shape), (self.batch_size, 2, 1, *self.img_shape))
+        self.assertEqual(tuple(tar_zen.shape), (self.batch_size, 3, 1, *self.img_shape))
 
     def test_return_timestamp_appends_time_tensors(self):
         loader = self._make_loader(return_timestamp=True)
