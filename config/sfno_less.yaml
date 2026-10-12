@@ -158,9 +158,9 @@ sfno_less_crps: &SFNO_LESS_CRPS
     batch_size: 64
     lr: 1E-3
 
-    # small ensemble, so the CRPS estimator must be the fair one ("skillspread"); the plain "cdf" estimator
-    # is biased towards under-dispersion, severely so with 4 members
-    ensemble_size: 4
+    # smallest ensemble the fair CRPS ("skillspread") admits; the plain "cdf" estimator is biased towards
+    # under-dispersion, severely so with few members. One member per rank with ensemble_parallel_size=2.
+    ensemble_size: 2
 
     # pointwise fair CRPS only: this study is about how to train, so no spectral CRPS term on top
     losses:
