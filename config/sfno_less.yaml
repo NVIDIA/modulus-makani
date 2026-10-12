@@ -151,6 +151,13 @@ sfno_less_deterministic: &SFNO_LESS_DETERMINISTIC
         parameters:
             squared: !!bool True
 
+# depthwise-separable spectral filters (no channel mixing in the filter, 0.65M instead of 42M weights per block);
+# memory probe at 2 samples per GPU pair: 64 data-parallel groups x 2 = global batch 128
+sfno_less_deterministic_separable: &SFNO_LESS_DETERMINISTIC_SEPARABLE
+    <<: *SFNO_LESS_DETERMINISTIC
+    separable: !!bool True
+    batch_size: 128
+
 sfno_less_crps: &SFNO_LESS_CRPS
     <<: *BASE_CONFIG
 
