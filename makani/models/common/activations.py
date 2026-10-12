@@ -14,6 +14,35 @@
 # limitations under the License.
 
 import torch
+
+
+def soft_clamp(x: torch.Tensor, offset=0.0) -> torch.Tensor:
+    r"""
+    Smooth one-sided clamp to non-negative values.
+
+    ``0`` for ``x + offset <= 0``, ``(x + offset)^2`` up to ``1/2`` and
+    ``x + offset - 1/4`` beyond, which is continuously differentiable and
+    becomes the identity far from the clamp. Used to keep water channels
+    non-negative at the model output: with ``offset = mean / std`` the clamp
+    sits at the physical zero of a z-scored channel. The caller subtracts
+    ``offset`` again to stay in normalized units.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Values to clamp.
+    offset : float or torch.Tensor, optional
+        Shift applied before clamping, by default ``0.0``.
+
+    Returns
+    -------
+    torch.Tensor
+        Clamped values, shifted by ``offset``.
+    """
+    x = x + offset
+    y = torch.where(x > 0.0, x**2, torch.zeros_like(x))
+    y = torch.where(x >= 0.5, x - 0.25, y)
+    return y
 from torch import nn
 
 

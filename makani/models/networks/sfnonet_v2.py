@@ -76,12 +76,12 @@ import torch_harmonics.distributed as thd
 
 from physicsnemo import ModelMetaData
 
-from makani.models.common import DropPath, MLP, LayerScale, EncoderDecoder, SpectralConv, GeometricInstanceNormS2
+from makani.models.common import DropPath, MLP, LayerScale, EncoderDecoder, SpectralConv, GeometricInstanceNormS2, soft_clamp
 from makani.models.physicsnemo_compat import module_from_torch
 from makani.mpu.layers import DistributedMLP, DistributedEncoderDecoder
 from makani.mpu.layer_norm import DistributedInstanceNorm2d, DistributedLayerNorm, DistributedGeometricInstanceNormS2
 from makani.utils import comm
-from makani.utils.features import get_channel_groups, get_wind_channels
+from makani.utils.features import get_channel_groups, get_water_channels, get_wind_channels
 from makani.utils.grids import GridQuadrature, compute_spherical_bandlimit, get_spectral_transform, grid_to_quadrature_rule
 
 
@@ -613,6 +613,16 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
     checkpointing_level : int, optional
         Gradient checkpointing: 1 for encoder/decoder, 2 adds the MLPs, 3 adds
         whole blocks. By default ``0``.
+    clamp_water : bool, optional
+        Keep the water channels (``q*``, ``r*``, ``tcwv``) non-negative at the
+        output with a smooth clamp at the physical zero, by default ``False``.
+        The clamp is pointwise and the same at every location, so it keeps
+        the model's symmetries.
+    normalization_means, normalization_stds : array-like, optional
+        Per-channel bias and scale of the normalization, in the order of
+        ``channel_names``; place the water clamp at the physical zero. Passed
+        by :func:`~makani.models.model_registry.get_model`. Without them the
+        clamp sits at zero in normalized units.
     **kwargs
         Ignored; present so model configs can pass extra keys.
     """
@@ -654,6 +664,9 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
         path_drop_rate=0.0,
         mlp_drop_rate=0.0,
         checkpointing_level=0,
+        clamp_water=False,
+        normalization_means=None,
+        normalization_stds=None,
         **kwargs,
     ):
         super().__init__()
@@ -680,6 +693,19 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
             order = torch.tensor(layout[f"scalar_{side}"] + layout[f"wind_{side}"], dtype=torch.long)
             self.register_buffer(f"{side}_inverse_perm", torch.argsort(order), persistent=False)
         self.n_wind_pairs = len(layout["wind_out"]) // 2
+
+        # water clamp: offsets place it at the physical zero of each z-scored water channel
+        self.clamp_water = clamp_water
+        if clamp_water:
+            water = get_water_channels(list(channel_names))
+            offset = torch.zeros(len(water), dtype=torch.float32)
+            if (normalization_means is not None) and (normalization_stds is not None) and len(water) > 0:
+                means = torch.as_tensor(normalization_means, dtype=torch.float32).flatten()
+                stds = torch.as_tensor(normalization_stds, dtype=torch.float32).flatten()
+                idx = torch.tensor(water, dtype=torch.long)
+                offset = means[idx] / stds[idx]
+            self.register_buffer("water_channels", torch.tensor(water, dtype=torch.long), persistent=False)
+            self.register_buffer("water_offset", offset.reshape(1, -1, 1, 1), persistent=False)
 
         # spectral cutoff
         self._init_cutoff(lmax, hard_thresholding_fraction)
@@ -926,6 +952,10 @@ class SphericalFourierNeuralOperatorNetV2(nn.Module):
         if self.big_skip:
             # fp32 state update, outside autocast's reach: tendencies of a few bf16 ulps survive
             x = x + residual
+
+        if self.clamp_water and self.water_channels.numel() > 0:
+            w = soft_clamp(x[:, self.water_channels], offset=self.water_offset) - self.water_offset
+            x = x.index_copy(1, self.water_channels, w)
 
         return x
 

@@ -52,6 +52,7 @@ base_config: &BASE_CONFIG
     layer_scale_init: 0.1
     big_skip: !!bool True
     activation_function: "gelu"
+    clamp_water: !!bool True      # smooth clamp of q*/tcwv at the physical zero (z-scored channels can go negative)
 
     # learning dynamics
     lr: 5E-4
@@ -102,9 +103,10 @@ base_config: &BASE_CONFIG
 
     # channels: the FCN3 set (no sp). u/v pairs are recognized by name and encoded as vector fields
     channel_names: ["u10m", "v10m", "u100m", "v100m", "t2m", "msl", "tcwv", "u50", "u100", "u150", "u200", "u250", "u300", "u400", "u500", "u600", "u700", "u850", "u925", "u1000", "v50", "v100", "v150", "v200", "v250", "v300", "v400", "v500", "v600", "v700", "v850", "v925", "v1000", "z50", "z100", "z150", "z200", "z250", "z300", "z400", "z500", "z600", "z700", "z850", "z925", "z1000", "t50", "t100", "t150", "t200", "t250", "t300", "t400", "t500", "t600", "t700", "t850", "t925", "t1000", "q50", "q100", "q150", "q200", "q250", "q300", "q400", "q500", "q600", "q700", "q850", "q925", "q1000"]
-    # zscore everywhere except the water channels. The stats must come from get_stats.py --wind_angle_aware
-    # (zero wind means, one shared scale per u/v pair) so that normalization only rescales the wind vectors
-    normalization: {"tcwv": "minmax", "q50": "minmax", "q100": "minmax", "q150": "minmax", "q200": "minmax", "q250": "minmax", "q300": "minmax", "q400": "minmax", "q500": "minmax", "q600": "minmax", "q700": "minmax", "q850": "minmax", "q925": "minmax", "q1000": "minmax"}
+    # zscore for every channel, water included: minmax squeezes upper-level humidity to a few bf16 steps.
+    # The stats must come from get_stats.py --wind_angle_aware (zero wind means, one shared scale per u/v pair)
+    # so that normalization only rescales the wind vectors
+    normalization: "zscore"
 
     # extra channels: zenith angle and the invariants; no grid channels, they would break equivariance
     add_grid: !!bool False
@@ -140,10 +142,12 @@ sfno_less_deterministic: &SFNO_LESS_DETERMINISTIC
     batch_size: 64
     lr: 1E-3
 
+    # plain L2 on z-scored channels, equal weights: no tendency normalization (its physical-unit clamp
+    # silenced upper-level humidity and let low-level humidity take 40% of the loss)
     losses:
     -   type: "l2"
         channel_weights: "constant"
-        temp_diff_normalization: !!bool True
+        temp_diff_normalization: !!bool False
         parameters:
             squared: !!bool True
 
@@ -163,7 +167,7 @@ sfno_less_crps: &SFNO_LESS_CRPS
     -   type: "ensemble_crps"
         channel_weights: "constant"
         relative_weight: 1.0
-        temp_diff_normalization: !!bool True
+        temp_diff_normalization: !!bool False
         parameters:
             crps_type: "skillspread"
 

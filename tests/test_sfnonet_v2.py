@@ -148,6 +148,26 @@ class TestSFNOv2(unittest.TestCase):
             bad_scale[1] = 2.5
             _check_vector_wind_normalization(bias, bad_scale, CHANNEL_NAMES, "SFNOv2")
 
+    def test_water_clamp(self):
+        # water channels come out non-negative in physical units; other channels are untouched by the clamp
+        names = ["u10m", "v10m", "t2m", "q500", "tcwv"]
+        means = torch.tensor([0.0, 0.0, 280.0, 2e-3, 20.0])
+        stds = torch.tensor([3.0, 3.0, 15.0, 2e-3, 15.0])
+        kw = dict(channel_names=names, inp_chans=5, out_chans=5, normalization_means=means, normalization_stds=stds)
+        set_seed(1)
+        clamped = self._model(clamp_water=True, **kw)
+        set_seed(1)
+        plain = self._model(clamp_water=False, **kw)
+        self.assertEqual(clamped.water_channels.tolist(), [3, 4])
+        x = 3.0 * torch.randn(2, 5, *self.inp_shape, device=self.device)  # large: pushes water below zero
+        with torch.no_grad():
+            yc, yp = clamped(x), plain(x)
+        offset = (means / stds).to(self.device)
+        physical = yc[:, [3, 4]] * stds[[3, 4]].to(self.device).view(1, -1, 1, 1) + means[[3, 4]].to(self.device).view(1, -1, 1, 1)
+        self.assertGreaterEqual(physical.min().item(), -1e-4)
+        self.assertLess((yp[:, [3, 4]] + offset[[3, 4]].view(1, -1, 1, 1)).min().item(), 0.0)  # the plain model did go negative
+        self.assertTrue(torch.allclose(yc[:, [0, 1, 2]], yp[:, [0, 1, 2]]))
+
     def test_wind_components(self):
         # Pins the convention documented in HopfProjection: (u, v) is passed to the vector SHT as
         # (u_theta, u_phi), so a solid-body rotation u = cos(lat), v = 0, which is purely rotational, shows up
