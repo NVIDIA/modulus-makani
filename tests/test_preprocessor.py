@@ -561,6 +561,34 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         out = pp.append_unpredicted_features(x, target=False)
         self.assertTrue(compare_tensors("x unchanged with zero perturb noise", out[:, : self.C], x, verbose=verbose))
 
+    def test_concatenate_noise_without_cached_features(self, verbose=False):
+        """Without zenith the noise is still appended, as the channel count expects."""
+        params = get_default_parameters()
+        params.input_noise = {"type": "dummy", "mode": "concatenate", "n_channels": 2}
+        pp = Preprocessor2D(params)
+        for mode in ["train", "eval"]:
+            with self.subTest(mode=mode):
+                getattr(pp, mode)()
+                x = self._rand(self.B, self.C, self.H, self.W)
+                pp.cache_unpredicted_features(x, x, xz=None, yz=None)
+                out = pp.append_unpredicted_features(x, target=False)
+                self.assertEqual(out.shape[1], self.C + 2)
+                self.assertTrue(compare_tensors("x channels unchanged", out[:, : self.C], x, verbose=verbose))
+
+    def test_concatenate_noise_without_cached_features_with_history(self):
+        """With history, the noise is appended to every step."""
+        params = get_default_parameters()
+        params.n_history = 1
+        params.input_noise = {"type": "dummy", "mode": "concatenate", "n_channels": 1}
+        pp = Preprocessor2D(params)
+        pp.train()
+        x = self._rand(self.B, 2 * self.C, self.H, self.W)
+        out = pp.append_unpredicted_features(x, target=False)
+        self.assertEqual(out.shape[1], 2 * (self.C + 1))
+        # per step: the step's channels first, then its noise channel
+        self.assertTrue(torch.equal(out[:, : self.C], x[:, : self.C]))
+        self.assertTrue(torch.equal(out[:, self.C + 1 : 2 * self.C + 1], x[:, self.C :]))
+
     # -----------------------------------------------------------------------
     # append_history with update_state
     # -----------------------------------------------------------------------

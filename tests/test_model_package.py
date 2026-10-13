@@ -251,6 +251,20 @@ class TestModelPackageForward(_ModelPackageTestBase):
         out = wrapper(x, self._times(2), normalized_data=False)
         self.assertTrue(compare_tensors("denorm_roundtrip", out, 2.0 * x, verbose=True))
 
+    def test_normalization_with_history(self):
+        # the statistics are per channel and have to be applied to every history step
+        wrapper = self._make_wrapper(n_history=1)
+        means = torch.arange(self.C, dtype=torch.float32).reshape(1, self.C, 1, 1)
+        stds = (1.0 + torch.arange(self.C, dtype=torch.float32)).reshape(1, self.C, 1, 1)
+        wrapper.in_bias.copy_(means)
+        wrapper.in_scale.copy_(stds)
+
+        x = torch.randn(2, 2 * self.C, self.H, self.W)
+        out = wrapper._prepare_input(x, self._times(4), normalized_data=False)
+
+        expected = torch.cat([(x[:, : self.C] - means) / stds, (x[:, self.C :] - means) / stds], dim=1)
+        self.assertTrue(compare_tensors("normalization_with_history", out, expected, verbose=True))
+
     def test_encode_process_matches_forward_preprocessing(self):
         # the dummy's encode_process mirrors its forward, so with an identity
         # denormalization the staged path must reproduce forward exactly

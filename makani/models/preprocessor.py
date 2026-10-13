@@ -414,22 +414,25 @@ class Preprocessor2D(nn.Module):
         # x-dimension
         xdim = x.dim()
 
-        # Batch alignment between input and cached unpredicted features.
-        # If these diverge, the `cat` below would fail with a cryptic message —
-        # fail up-front with context about the likely cause. torch._check keeps
-        # this a runtime assertion under torch.compile instead of a graph break.
-        torch._check(
-            x.shape[0] == xc.shape[0],
-            lambda: (
-                f"_append_channels: batch mismatch between input ({x.shape[0]}) and "
-                f"cached unpredicted features ({xc.shape[0]}). "
-                f"Did you cache xz/yz at a different batch size than the current forward?"
-            ),
-        )
-
         # expand history
         x = self.expand_history(x, self.n_history + 1)
-        xc = self.expand_history(xc, self.n_history + 1)
+
+        # the cached features, if any; the noise below is appended either way
+        appended = []
+        if xc is not None:
+            # Batch alignment between input and cached unpredicted features.
+            # If these diverge, the `cat` below would fail with a cryptic message —
+            # fail up-front with context about the likely cause. torch._check keeps
+            # this a runtime assertion under torch.compile instead of a graph break.
+            torch._check(
+                x.shape[0] == xc.shape[0],
+                lambda: (
+                    f"_append_channels: batch mismatch between input ({x.shape[0]}) and "
+                    f"cached unpredicted features ({xc.shape[0]}). "
+                    f"Did you cache xz/yz at a different batch size than the current forward?"
+                ),
+            )
+            appended.append(self.expand_history(xc, self.n_history + 1))
 
         # this routine also adds noise every time a channel gets appended
         if hasattr(self, "input_noise"):
@@ -447,7 +450,7 @@ class Preprocessor2D(nn.Module):
                 ),
             )
             if self.input_noise_mode == "concatenate":
-                xc = torch.cat([xc, n], dim=2)
+                appended.append(n)
             elif self.input_noise_mode == "perturb":
                 # fully out-of-place: build a zero noise field and add to all channels
                 noise_full = torch.zeros_like(x)
@@ -455,7 +458,7 @@ class Preprocessor2D(nn.Module):
                 x = x + noise_full
 
         # concatenate
-        xo = torch.cat([x, xc], dim=2)
+        xo = torch.cat([x] + appended, dim=2)
 
         # flatten if requested
         if xdim == 4:
@@ -933,8 +936,8 @@ class Preprocessor2D(nn.Module):
 
         Also injects the input noise when configured, since noise is applied at
         the same point in the pipeline. The train or eval cache is selected by
-        the module's training mode; if the relevant cache is empty the input is
-        returned unchanged.
+        the module's training mode; if the relevant cache is empty, only the
+        noise is applied, and without noise the input is returned unchanged.
 
         Parameters
         ----------
@@ -951,20 +954,15 @@ class Preprocessor2D(nn.Module):
             Tensor with the unpredicted feature channels appended.
         """
         if self.training:
-            if not target:
-                if self.unpredicted_inp_train is not None:
-                    inp = self._append_channels(inp, self.unpredicted_inp_train)
-            else:
-                if self.unpredicted_tar_train is not None:
-                    inp = self._append_channels(inp, self.unpredicted_tar_train)
+            cache = self.unpredicted_tar_train if target else self.unpredicted_inp_train
         else:
-            if not target:
-                if self.unpredicted_inp_eval is not None:
-                    inp = self._append_channels(inp, self.unpredicted_inp_eval)
-            else:
-                if self.unpredicted_tar_eval is not None:
-                    inp = self._append_channels(inp, self.unpredicted_tar_eval)
-        return inp
+            cache = self.unpredicted_tar_eval if target else self.unpredicted_inp_eval
+
+        # noise is injected here as well, so an empty cache only means nothing to do without it
+        if (cache is None) and not hasattr(self, "input_noise"):
+            return inp
+
+        return self._append_channels(inp, cache)
 
     def get_static_features(self):
         r"""

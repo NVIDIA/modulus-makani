@@ -42,6 +42,7 @@ from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 
 # distributed stuff
 from makani.utils import comm
+from makani.utils.dataloaders.data_helpers import parse_data_normalization_mode
 
 # es helper
 from makani.utils.dataloaders.data_helpers import get_data_normalization
@@ -85,14 +86,9 @@ class DaliDataloader(object):
         in_channels = self.in_channels
         out_channels = self.out_channels
 
-        num_outputs = 2
-        layout = ["FCHW", "FCHW"]
-        if self.add_zenith:
-            num_outputs += 2
-            layout += ["FCHW", "FCHW"]
-        if self.return_timestamp:
-            num_outputs += 2
-            layout += ["F"]
+        # one layout per output of the source, in the order it returns them
+        layout = self.extsource.output_layout()
+        num_outputs = len(layout)
 
         with pipeline:
             # get input and target
@@ -159,7 +155,7 @@ class DaliDataloader(object):
 
         return pipeline
 
-    def __init__(self, params, location, train, seed=333, dali_device="gpu"):
+    def __init__(self, params, location, train, seed=333, dali_device="gpu", return_timestamp=False):
         # set up workers and devices
         self.num_data_workers = params.num_data_workers
         # The parallel external_source path requires py_num_workers >= 1 and uses
@@ -207,7 +203,8 @@ class DaliDataloader(object):
         self.out_channels = params.out_channels
         self.subsampling_factor = params.get("subsampling_factor", 1)
         self.add_zenith = params.get("add_zenith", False)
-        self.return_timestamp = params.get("return_timestamp", False)
+        # set by the caller like for the other loaders; the trainers have no use for timestamps
+        self.return_timestamp = return_timestamp
         if hasattr(params, "lat") and hasattr(params, "lon"):
             self.lat_lon = (params.lat, params.lon)
         else:
@@ -220,19 +217,10 @@ class DaliDataloader(object):
             self.n_samples = params.get("n_eval_samples", None)
             self.n_samples_per_epoch = params.get("n_eval_samples_per_epoch", None)
 
-        # by default we normalize over space
-        self.norm_channels = "FHW"
-        self.norm_batch = False
-        if hasattr(params, "normalization_mode"):
-            split = params.data_normalization_mode.split("-")
-            self.norm_mode = split[0]
-            if len(split) > 1:
-                self.norm_channels = split[1]
-                if "B" in self.norm_channels:
-                    self.norm_batch = True
-                    self.norm_channels.replace("B", "")
-        else:
-            self.norm_mode = "offline"
+        # by default we normalize offline, over space
+        self.norm_mode, self.norm_channels, self.norm_batch = parse_data_normalization_mode(
+            params.get("data_normalization_mode", None)
+        )
 
         # set sharding
         self.num_shards = params.data_num_shards
@@ -361,10 +349,7 @@ class DaliDataloader(object):
 
         # tear down a previously built pipeline first, so that its python worker pool is
         # released before the new one spawns its own workers
-        if self.pipeline is not None:
-            self.iterator = None
-            self.pipeline._shutdown()
-            self.pipeline = None
+        self.close()
 
         # build() is auto-called by DALIGenericIterator on first run since DALI 1.46 (#5754).
         # start_py_workers() is still explicit to keep worker startup ordered before any CUDA
@@ -387,6 +372,21 @@ class DaliDataloader(object):
             last_batch_policy=LastBatchPolicy.DROP,
             prepare_first_batch=True,
         )
+
+    def close(self):
+        """
+        Shut the DALI pipeline down: stop its python workers and release its native threads
+        and device buffers. The loader cannot be iterated afterwards.
+
+        Without an explicit close, the pipeline lives until the garbage collector happens to
+        destroy it, and its native threads keep running into whatever the process does next.
+        """
+
+        # the iterator holds a reference to the pipeline, so it has to go first
+        self.iterator = None
+        if self.pipeline is not None:
+            self.pipeline._shutdown()
+            self.pipeline = None
 
     def state_dict(self) -> Dict[str, Any]:
         """
