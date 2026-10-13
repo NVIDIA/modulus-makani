@@ -82,12 +82,6 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
     # get data normalization
     bias, scale = get_data_normalization(params)
 
-    # sanity check
-    if not params.get("multifiles", False):
-        _have_dali = importlib.util.find_spec("nvidia.dali") is not None
-        if not _have_dali:
-            raise ImportError("Setting multifiles to False requires nvidia-dali, but module was not found.")
-
     if params.get("multifiles", False):
         from makani.utils.dataloaders.data_loader_multifiles import MultifilesDataset as MultifilesDataset2D
         from torch.utils.data.distributed import DistributedSampler
@@ -217,6 +211,10 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
         sampler = None
 
     else:
+        # only this branch needs DALI; the synthetic one above does not
+        if importlib.util.find_spec("nvidia.dali") is None:
+            raise ImportError("Setting multifiles to False requires nvidia-dali, but module was not found.")
+
         from makani.utils.dataloaders.dali_dataloader import DaliDataloader
 
         # dali loader

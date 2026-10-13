@@ -25,6 +25,7 @@ from typing import Optional
 from parameterized import parameterized, parameterized_class
 
 import unittest
+from unittest import mock
 import torch
 import numpy as np
 import h5py as h5
@@ -1233,6 +1234,44 @@ class TestDummyLoader(unittest.TestCase):
         self.assertTrue((in_scale == 1).all())
         self.assertTrue((out_bias == 0).all())
         self.assertTrue((out_scale == 1).all())
+
+
+def _without_dali(name, *args, **kwargs):
+    """``importlib.util.find_spec`` as on a system without DALI."""
+    if name == "nvidia.dali":
+        return None
+    return _find_spec(name, *args, **kwargs)
+
+
+_find_spec = importlib.util.find_spec
+
+
+class TestGetDataloaderWithoutDali(unittest.TestCase):
+    """Only the DALI path needs DALI; the synthetic loader used to be refused without it."""
+
+    def _params(self):
+        params = get_default_parameters()
+        params.multifiles = False
+        params.dhours = 6
+        params.batch_size = 2
+        params.n_train_samples = 4
+        return params
+
+    def test_synthetic_loader_does_not_need_dali(self):
+        from makani.utils.dataloaders.data_loader_dummy import DummyLoader
+
+        params = self._params()
+        params.enable_synthetic_data = True
+        with mock.patch("importlib.util.find_spec", side_effect=_without_dali):
+            loader, _, _ = get_dataloader(params, "/nonexistent", device=torch.device("cpu"), mode="train")
+        self.assertIsInstance(loader, DummyLoader)
+
+    def test_dali_loader_still_reports_missing_dali(self):
+        params = self._params()
+        params.enable_synthetic_data = False
+        with mock.patch("importlib.util.find_spec", side_effect=_without_dali):
+            with self.assertRaisesRegex(ImportError, "nvidia-dali"):
+                get_dataloader(params, "/nonexistent", device=torch.device("cpu"), mode="train")
 
 
 class TestMultifilesDataset(unittest.TestCase):
