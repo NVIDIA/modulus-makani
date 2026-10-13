@@ -26,6 +26,7 @@ from makani.utils.YParams import ParamsBase, ensure_resampled_shapes
 from makani.utils.driver import Driver
 from makani.third_party.climt.zenith_angle_v2 import cos_zenith_angle
 from makani.utils.dataloaders.data_helpers import get_data_normalization
+from makani.utils.dataloaders.batch import INPUT_DYNAMIC_FEATURES, ZENITH
 from makani.models import model_registry
 import datetime
 import logging
@@ -243,26 +244,14 @@ class ModelWrapper(torch.nn.Module):
         return
 
     def _zenith_features(self, x, time):
-        """Build the cached cosine-zenith channel for ``x`` at valid time(s) ``time``.
+        """Build the cosine-zenith feature for ``x`` at valid time(s) ``time``.
 
-        Returns a tensor of shape ``(B, nhist, H, W)`` where ``B == x.shape[0]``
-        and ``nhist == n_history + 1``. That is the layout
-        :meth:`Preprocessor2D._append_channels` requires: it calls
-        ``expand_history`` on the cached tensor, which reshapes ``(B, nhist, H, W)``
-        into ``(B, nhist, 1, H, W)`` before concatenating along the channel axis.
+        Returns a tensor of shape ``(B, nhist, 1, H, W)``, a dynamic feature as
+        the preprocessor takes it, where ``B == x.shape[0]`` and
+        ``nhist == n_history + 1``.
 
         See :meth:`forward` for the ``time`` contract this enforces.
         """
-        # Only the zenith path depends on the input rank: history has to live in the
-        # flattened channel axis for (B, nhist, H, W) to line up with it. The rest of
-        # the pipeline broadcasts over other ranks, so this stays scoped here rather
-        # than becoming a blanket check in _prepare_input.
-        if x.ndim != 4:
-            raise ValueError(
-                f"add_zenith: expected a 4D (B, (n_history+1)*C, H, W) input, got {x.ndim}D. "
-                f"History is carried in the flattened channel axis, not a separate dim."
-            )
-
         nhist = self.model.preprocessor.n_history + 1
         batch_size = x.shape[0]
 
@@ -287,30 +276,26 @@ class ModelWrapper(torch.nn.Module):
                 f"history window across the whole batch."
             )
 
-        return z
+        return z.unsqueeze(2)
 
     def _prepare_input(self, x, time, normalized_data):
-        """Normalize the input and cache the time-dependent unpredicted features.
+        """Normalize the input and cache its dynamic features.
 
-        ``x`` is normally ``(B, (n_history + 1) * C, H, W)``; that layout is
-        required when ``add_zenith`` is set, but not otherwise. See :meth:`forward`
-        for the batching contract on ``time``.
+        ``x`` is ``(B, (n_history + 1) * C, H, W)``, history in the flattened
+        channel axis, oldest first, or ``(B, n_history + 1, C, H, W)``. Returns
+        the input with the time axis explicit, as the step wrappers take it. See
+        :meth:`forward` for the batching contract on ``time``.
         """
-        if not normalized_data:
-            # the statistics are per channel, (1, C, 1, 1), while the history steps are
-            # stacked along the channel dimension, so normalize each step separately
-            preprocessor = self.model.preprocessor
-            n_steps = self.params.get("n_history", 0) + 1
-            if x.dim() == 4:
-                x = preprocessor.expand_history(x, n_steps)
-                x = (x - self.in_bias.unsqueeze(1)) / self.in_scale.unsqueeze(1)
-                x = preprocessor.flatten_history(x)
-            else:
-                x = (x - self.in_bias.unsqueeze(1)) / self.in_scale.unsqueeze(1)
+        preprocessor = self.model.preprocessor
+        if x.dim() == 4:
+            x = preprocessor.expand_history(x, preprocessor.n_history + 1)
 
-        if self.add_zenith:
-            z = self._zenith_features(x, time)
-            self.model.preprocessor.cache_unpredicted_features(None, None, xz=z, yz=None)
+        if not normalized_data:
+            # the statistics are per channel, (1, C, 1, 1); broadcast them over the time steps
+            x = (x - self.in_bias.unsqueeze(1)) / self.in_scale.unsqueeze(1)
+
+        features = {ZENITH: self._zenith_features(x, time)} if self.add_zenith else {}
+        preprocessor.cache_dynamic_features({INPUT_DYNAMIC_FEATURES: features})
 
         return x
 
@@ -342,8 +327,9 @@ class ModelWrapper(torch.nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Input state, shape ``(B, (n_history + 1) * C, H, W)``. History is
-            carried in the flattened channel axis, oldest first.
+            Input state, shape ``(B, (n_history + 1) * C, H, W)`` with the
+            history in the flattened channel axis, oldest first, or
+            ``(B, n_history + 1, C, H, W)``.
         time : datetime or array of datetimes
             Valid time(s) for ``x``; see the contract below.
         normalized_data : bool, optional
@@ -365,7 +351,7 @@ class ModelWrapper(torch.nn.Module):
         Any batch size ``B`` is supported. Two pieces of internal state are
         sized from ``B`` on every call:
 
-        * The cached cosine-zenith channel, built to ``(B, n_history + 1, H, W)``.
+        * The cached cosine-zenith feature, built to ``(B, n_history + 1, 1, H, W)``.
         * The stochastic noise state, resized by the step wrapper. Note this is
           independent of ``params.batch_size``, which is a *training* setting and
           is typically 1 in a packaged model.
@@ -391,7 +377,9 @@ class ModelWrapper(torch.nn.Module):
         stateful noise modules.
         """
         x = self._prepare_input(x, time, normalized_data)
-        out = self.model(x, replace_state=replace_state)
+
+        # one step, (B, 1, C_out, H, W)
+        out = self.model(x, replace_state=replace_state).squeeze(1)
 
         if not normalized_data:
             out = out * self.out_scale + self.out_bias

@@ -52,9 +52,12 @@ class SingleStepWrapper(nn.Module):
 
     Wraps the network so callers can hand it raw data and get a prediction back
     in physical units, without having to replicate the preprocessing pipeline at
-    every call site. One ``forward`` performs: state update, appending
-    unpredicted and static features, history normalization, the model forward,
-    bias correction, and denormalization of the output.
+    every call site. One ``forward`` performs: state update, appending the
+    dynamic features, history normalization, packing the input for the network,
+    the model forward, bias correction, and denormalization of the output.
+
+    Input and output keep the time axis explicit; only the network itself sees
+    the time steps folded into its channels.
 
     Parameters
     ----------
@@ -74,13 +77,13 @@ class SingleStepWrapper(nn.Module):
         self.model = model_handle()
 
     def _preprocess(self, inp, update_state=True, replace_state=True):
-        """Run the shared input pipeline for one step.
+        """Run the shared input pipeline for one step, up to the packed network input.
 
         The stochastic state is sized to THIS call's batch. The noise module is
         constructed with ``params.batch_size`` -- a training setting, and 1 for a
         packaged model -- but inference legitimately drives it with other
         batches, e.g. an ensemble pushing B*E members through as a single
-        batched forward. Without this, ``append_unpredicted_features`` rejects
+        batched forward. Without this, ``append_dynamic_features`` rejects
         the call with "batch mismatch between input_noise state (1) and input".
         ``_ensure_state`` reallocates only when the batch actually changes, so
         the steady-state cost is zero; the flip side is that changing the batch
@@ -90,15 +93,7 @@ class SingleStepWrapper(nn.Module):
         if update_state:
             self.preprocessor.update_internal_state(replace_state=replace_state, batch_size=inp.shape[0])
 
-        # append unpredicted features
-        inpa = self.preprocessor.append_unpredicted_features(inp)
-
-        # now normalize
-        self.preprocessor.history_compute_stats(inpa)
-        inpan = self.preprocessor.history_normalize(inpa, target=False)
-
-        # now add static features if requested
-        return self.preprocessor.add_static_features(inpan)
+        return _prepare_step(self.preprocessor, inp)
 
     def forward(self, inp, update_state=True, replace_state=True):
         r"""
@@ -107,7 +102,7 @@ class SingleStepWrapper(nn.Module):
         Parameters
         ----------
         inp : torch.Tensor
-            Input of shape ``(B, (n_history + 1) * C, H, W)`` in physical units.
+            Input of shape ``(B, n_history + 1, C, H, W)`` in physical units.
         update_state : bool, optional
             Advance the stochastic noise state before the forward pass, by
             default ``True``.
@@ -119,21 +114,12 @@ class SingleStepWrapper(nn.Module):
         Returns
         -------
         torch.Tensor
-            Prediction of shape ``(B, C_out, H, W)``, denormalized back to
+            Prediction of shape ``(B, 1, C_out, H, W)``, denormalized back to
             physical units.
         """
         inpans = self._preprocess(inp, update_state=update_state, replace_state=replace_state)
 
-        # forward pass
-        yn = self.model(inpans)
-
-        # perform bias correction if requested
-        yn = self.preprocessor.correct_bias(yn)
-
-        # undo normalization
-        y = self.preprocessor.history_denormalize(yn, target=True)
-
-        return y
+        return _finish_step(self.preprocessor, self.model(inpans))
 
     def encode_process(self, inp, update_state=True, replace_state=True):
         r"""Prepare one input and return backbone features before decoding.
@@ -145,7 +131,7 @@ class SingleStepWrapper(nn.Module):
         Parameters
         ----------
         inp : torch.Tensor
-            Input of shape ``(B, (n_history + 1) * C, H, W)`` in physical units.
+            Input of shape ``(B, n_history + 1, C, H, W)`` in physical units.
         update_state : bool, optional
             Advance the stochastic noise state first, by default ``True``.
         replace_state : bool, optional
@@ -170,13 +156,45 @@ class SingleStepWrapper(nn.Module):
         return self.model.encode_process(inpans)
 
 
+def _prepare_step(preprocessor, inp):
+    """Input pipeline of one step: dynamic features, history normalization, packing.
+
+    Takes ``(B, n_history + 1, C, H, W)`` and returns the flat channel stack
+    the network takes.
+    """
+    torch._check(
+        inp.dim() == 5,
+        lambda: f"expected an input with an explicit time axis, (B, n_history + 1, C, H, W), got shape {tuple(inp.shape)}",
+    )
+
+    inpa = preprocessor.append_dynamic_features(inp)
+
+    preprocessor.history_compute_stats(inpa)
+    inpan = preprocessor.history_normalize(inpa, target=False)
+
+    return preprocessor.pack_model_input(inpan)
+
+
+def _finish_step(preprocessor, predn):
+    """Output pipeline of one step: bias correction, time axis, denormalization.
+
+    The network predicts one step as a flat channel stack, ``(B, C_out, H, W)``;
+    it gets its time axis back here, ``(B, 1, C_out, H, W)``. Denormalize right
+    away, before the statistics move on with the next step.
+    """
+    predn = preprocessor.correct_bias(predn).unsqueeze(1)
+
+    return preprocessor.history_denormalize(predn, target=True)
+
+
 class MultiStepWrapper(nn.Module):
     r"""
     Bind a model to its preprocessor for an autoregressive rollout.
 
     Runs the wrapped model for ``n_future + 1`` steps, feeding each prediction
     back in as the next input and sliding the history window forward. Returns
-    all steps stacked, which is what multi-step training losses need.
+    all steps stacked along the time axis, which is what multi-step training
+    losses need.
 
     Two options control cost and stability:
 
@@ -236,15 +254,7 @@ class MultiStepWrapper(nn.Module):
             if self.push_forward_mode:
                 inpt = inpt.detach()
 
-            # add unpredicted features
-            inpa = self.preprocessor.append_unpredicted_features(inpt)
-
-            # do history normalization
-            self.preprocessor.history_compute_stats(inpa)
-            inpan = self.preprocessor.history_normalize(inpa, target=False)
-
-            # add static features
-            inpans = self.preprocessor.add_static_features(inpan)
+            inpans = _prepare_step(self.preprocessor, inpt)
 
             # prediction
             # Only the pure model forward is checkpointed; the stateful preprocessor calls
@@ -258,13 +268,8 @@ class MultiStepWrapper(nn.Module):
             else:
                 predn = self.model(inpans)
 
-            # perform bias correction if requested
-            predn = self.preprocessor.correct_bias(predn)
-
-            # append the denormalized result to output list
-            # important to do that here, otherwise normalization stats
-            # will have been updated later:
-            pred = self.preprocessor.history_denormalize(predn, target=True)
+            # denormalize here, while the statistics still belong to this step
+            pred = _finish_step(self.preprocessor, predn)
 
             # append output
             result.append(pred)
@@ -278,10 +283,8 @@ class MultiStepWrapper(nn.Module):
             # append history
             inpt = self.preprocessor.append_history(inpt, pred, step)
 
-        # concat the tensors along channel dim to be compatible with flattened target
-        result = torch.cat(result, dim=1)
-
-        return result
+        # (B, n_future + 1, C_out, H, W), aligned with the target
+        return torch.cat(result, dim=1)
 
     def _forward_eval(self, inp, update_state=True, replace_state=True):
         # update internal state; size the noise state to this call's batch so that
@@ -291,28 +294,9 @@ class MultiStepWrapper(nn.Module):
         if update_state:
             self.preprocessor.update_internal_state(replace_state=replace_state, batch_size=inp.shape[0])
 
-        # first append unpredicted features
-        inpa = self.preprocessor.append_unpredicted_features(inp)
+        inpans = _prepare_step(self.preprocessor, inp)
 
-        # do history normalization
-        self.preprocessor.history_compute_stats(inpa)
-        inpan = self.preprocessor.history_normalize(inpa, target=False)
-
-        # add static features
-        inpans = self.preprocessor.add_static_features(inpan)
-
-        # important, remove normalization here,
-        # because otherwise normalization stats are already outdated
-        yn = self.model(inpans)
-
-        # perform bias correction if requested
-        yn = self.preprocessor.correct_bias(yn)
-
-        # important, remove normalization here,
-        # because otherwise normalization stats are already outdated
-        y = self.preprocessor.history_denormalize(yn, target=True)
-
-        return y
+        return _finish_step(self.preprocessor, self.model(inpans))
 
     def forward(self, inp, update_state=True, replace_state=True):
         r"""
@@ -320,13 +304,14 @@ class MultiStepWrapper(nn.Module):
 
         Dispatches to the training or evaluation path based on the module's
         training mode; the training path additionally honors push-forward mode
-        and rollout checkpointing, which do not apply under ``no_grad``.
+        and rollout checkpointing, which do not apply under ``no_grad``. The
+        evaluation path predicts one step; the caller drives the rollout.
 
         Parameters
         ----------
         inp : torch.Tensor
-            Initial input of shape ``(B, (n_history + 1) * C, H, W)`` in
-            physical units.
+            Initial input of shape ``(B, n_history + 1, C, H, W)`` in physical
+            units.
         update_state : bool, optional
             Advance the stochastic noise state before the rollout, by default
             ``True``.
@@ -337,8 +322,8 @@ class MultiStepWrapper(nn.Module):
         Returns
         -------
         torch.Tensor
-            Predictions for all ``n_future + 1`` steps, concatenated along the
-            channel dimension as ``(B, (n_future + 1) * C_out, H, W)``.
+            Predictions of shape ``(B, n_future + 1, C_out, H, W)`` in training
+            mode and ``(B, 1, C_out, H, W)`` in evaluation mode.
         """
         # decide which routine to call
         if self.training:

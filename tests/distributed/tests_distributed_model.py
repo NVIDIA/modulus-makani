@@ -256,7 +256,7 @@ class TestDistributedModel(unittest.TestCase):
         inp_full.requires_grad = True
 
         # forward pass and save
-        out_full = model(inp_full).clone()
+        out_full = model(inp_full.unsqueeze(1)).flatten(1, 2).clone()
         loss_full = torch.sum(out_full)
 
         # perform backward pass
@@ -311,7 +311,7 @@ class TestDistributedModel(unittest.TestCase):
         # split input
         inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
         inp_local.requires_grad = True
-        out_local = model_dist(inp_local)
+        out_local = model_dist(inp_local.unsqueeze(1)).flatten(1, 2)
         loss_dist = reduce_from_parallel_region(torch.sum(out_local), "model")
         loss_dist.backward()
         igrad_local = inp_local.grad.clone()
@@ -424,7 +424,7 @@ class TestDistributedModel(unittest.TestCase):
 
         # perform a single forward:
         model_dist.zero_grad(set_to_none=True)
-        out_single_local = model_dist(inp_local)
+        out_single_local = model_dist(inp_local.unsqueeze(1)).flatten(1, 2)
         loss = loss_obj(out_single_local, tar_local)
         # backward pass
         loss.backward()
@@ -444,7 +444,7 @@ class TestDistributedModel(unittest.TestCase):
 
         # step 1
         with model_dist.no_sync():
-            out_double_local = model_dist(inp_local_tmp)
+            out_double_local = model_dist(inp_local_tmp.unsqueeze(1)).flatten(1, 2)
             loss = loss_obj(out_double_local, tar_local_tmp) / 2.0
         loss.backward()
 
@@ -453,7 +453,7 @@ class TestDistributedModel(unittest.TestCase):
         tar_local_tmp = tar_local_split[1].detach().clone()
 
         # step 2
-        out = model_dist(inp_local_tmp)
+        out = model_dist(inp_local_tmp.unsqueeze(1)).flatten(1, 2)
         loss = loss_obj(out, tar_local_tmp) / 2.0
         loss.backward()
         out_double_local = torch.cat([out_double_local, out], dim=0)

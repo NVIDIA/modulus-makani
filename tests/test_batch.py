@@ -31,7 +31,7 @@ from makani.utils.dataloaders.batch import (
     make_batch,
     batch_to_device,
     to_legacy_tuple,
-    legacy_batch_to_device,
+    map_dynamic_features,
 )
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -167,11 +167,29 @@ class TestToLegacyTuple(unittest.TestCase):
         with self.assertRaises(ValueError):
             to_legacy_tuple(batch)
 
-    def test_legacy_batch_to_device_drops_the_timestamps(self):
+
+class TestMapDynamicFeatures(unittest.TestCase):
+
+    def test_maps_both_sides_and_nothing_else(self):
+        # the ensemble trainers fold the members into the batch for the features only
         batch = _batch()
-        items = legacy_batch_to_device(batch, torch.device("meta"))
-        self.assertEqual(len(items), 4)
-        self.assertTrue(all(item.device.type == "meta" for item in items))
+        mapped = map_dynamic_features(batch, lambda feature: feature.repeat_interleave(3, dim=0))
+
+        self.assertEqual(mapped[INPUT_DYNAMIC_FEATURES][ZENITH].shape[0], 3 * _B)
+        self.assertEqual(mapped[TARGET_DYNAMIC_FEATURES][ZENITH].shape[0], 3 * _B)
+        self.assertIs(mapped[INPUT], batch[INPUT])
+        self.assertIs(mapped[TARGET], batch[TARGET])
+
+        # the batch passed in is left as it is
+        self.assertEqual(batch[INPUT_DYNAMIC_FEATURES][ZENITH].shape[0], _B)
+
+    def test_batch_without_target(self):
+        batch = _batch(with_target=False)
+        mapped = map_dynamic_features(batch, lambda feature: 2.0 * feature)
+        self.assertNotIn(TARGET_DYNAMIC_FEATURES, mapped)
+        self.assertTrue(
+            torch.equal(mapped[INPUT_DYNAMIC_FEATURES][ZENITH], 2.0 * batch[INPUT_DYNAMIC_FEATURES][ZENITH])
+        )
 
 
 if __name__ == "__main__":

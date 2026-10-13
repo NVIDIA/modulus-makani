@@ -33,7 +33,7 @@ from makani.utils.functions import expand_ensemble
 from makani.utils.driver import Driver
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
-from makani.utils.dataloaders.batch import legacy_batch_to_device
+from makani.utils.dataloaders.batch import batch_to_device, map_dynamic_features, INPUT, TARGET
 from makani.utils.YParams import YParams
 
 # model registry
@@ -204,12 +204,11 @@ class StochasticTrainer(Driver):
         # get sample and map to gpu
         iterator = iter(self.train_dataloader)
         data = next(iterator)
-        gdata = legacy_batch_to_device(data, self.device)
-        # extract unpredicted features
-        inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-        # flatten
-        inp = self.preprocessor.flatten_history(inp)
-        tar = self.preprocessor.flatten_history(tar)
+        batch = batch_to_device(data, self.device)
+        self.preprocessor.cache_dynamic_features(batch)
+        # the interpolant takes the time steps folded into the channels
+        inp = self.preprocessor.flatten_history(batch[INPUT])
+        tar = self.preprocessor.flatten_history(batch[TARGET])
         # get shapes
         inp_shape = inp.shape
         tar_shape = tar.shape
@@ -504,14 +503,12 @@ class StochasticTrainer(Driver):
             self.iters += 1
 
             # map to device
-            gdata = legacy_batch_to_device(data, self.device)
+            batch = batch_to_device(data, self.device)
+            self.preprocessor.cache_dynamic_features(batch)
 
-            # do preprocessing
-            inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-
-            # flatten the history
-            inp = self.preprocessor.flatten_history(inp)
-            tar = self.preprocessor.flatten_history(tar)
+            # the interpolant takes the time steps folded into the channels
+            inp = self.preprocessor.flatten_history(batch[INPUT])
+            tar = self.preprocessor.flatten_history(batch[TARGET])
 
             # assuming float32
             total_data_bytes += inp.nbytes + tar.nbytes
@@ -659,43 +656,43 @@ class StochasticTrainer(Driver):
                 for data in progress_bar:
                     eval_steps += 1
 
-                    # map to gpu; materialize to list so we can expand zenith features
-                    gdata = list(legacy_batch_to_device(data, self.device))
+                    # map to gpu
+                    batch = batch_to_device(data, self.device)
 
                     # When local_ensemble_size > 1, fold the ensemble dim into the batch
-                    # dim for a single forward per rollout step. xz / yz (zenith features)
-                    # must be expanded to (B*E, ...) so the preprocessor's cache lines up
-                    # with the folded-batch input; tar stays at the original batch — the
-                    # loss expects (B, E, ...) pred vs (B, ...) target.
+                    # dim for a single forward per rollout step. The dynamic features must
+                    # be expanded to (B*E, ...) so the preprocessor's cache lines up with
+                    # the folded-batch input; tar stays at the original batch — the loss
+                    # expects (B, E, ...) pred vs (B, ...) target.
                     E = self.params.local_ensemble_size
-                    if len(gdata) == 4:
-                        gdata[2] = expand_ensemble(gdata[2], E)
-                        gdata[3] = expand_ensemble(gdata[3], E)
+                    batch = map_dynamic_features(batch, lambda feature: expand_ensemble(feature, E))
 
-                    # preprocess
-                    inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-                    inp = self.preprocessor.flatten_history(inp)
+                    self.preprocessor.cache_dynamic_features(batch)
+                    inp, tar = batch[INPUT], batch[TARGET]
 
                     B = inp.shape[0]
 
                     # expand the input batch to (B*E, ...) for the folded-batch forward
                     inp = expand_ensemble(inp, E)
 
-                    # split list of targets (stays at batch B)
-                    tarlist = torch.split(tar, 1, dim=1)
+                    # the interpolant, the losses and the metrics take the time steps
+                    # folded into the channels
+                    flatten = self.preprocessor.flatten_history
 
-                    for idt, targ in enumerate(tarlist):
-                        # flatten history of the target
-                        targ = self.preprocessor.flatten_history(targ)
+                    for idt in range(tar.shape[1]):
+                        targ = flatten(tar[:, idt : idt + 1])
 
                         with self.autocast():
                             # single forward on the folded batch; StochasticInterpolant.forward
                             # handles the batch-resize of both the preprocessor's input_noise
                             # and its own noise_module internally.
-                            pred_flat = self.model_eval(inp, n_steps=self.params.stochastic_interpolation_steps)
+                            pred_flat = self.model_eval(
+                                flatten(inp), n_steps=self.params.stochastic_interpolation_steps
+                            )
 
-                            # advance the input history / unpredicted features once per step
-                            inp = self.preprocessor.append_history(inp, pred_flat, idt, update_state=True)
+                            # advance the input history / dynamic features once per step; the
+                            # interpolant predicts a single step
+                            inp = self.preprocessor.append_history(inp, pred_flat.unsqueeze(1), idt, update_state=True)
 
                             # reshape back to (B, E, ...) for the loss and downstream buffers
                             pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])

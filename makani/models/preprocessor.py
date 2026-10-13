@@ -24,6 +24,7 @@ from makani.utils.grids import GridQuadrature, grid_to_quadrature_rule
 from makani.mpu.mappings import copy_to_parallel_region
 
 from makani.models.preprocessor_helpers import get_bias_correction, get_static_features
+from makani.utils.dataloaders.batch import INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES, ZENITH
 
 
 @torch.compiler.disable
@@ -44,25 +45,29 @@ class Preprocessor2D(nn.Module):
     Input/output plumbing that surrounds the model in a rollout.
 
     Sits between the dataloader and the network and owns everything that is not
-    the model itself: history handling, static and unpredicted features, noise
+    the model itself: history handling, dynamic and static features, noise
     injection, bias correction, and the normalization of the history window.
-    Keeping this in one module is what lets the network see a single flat
-    channel stack while the training loop still reasons in terms of time steps
-    and variable groups.
+
+    Everything here works on tensors with an explicit time axis,
+    ``(B, T, C, H, W)``. The time steps are folded into the channels in exactly
+    one place, :meth:`pack_model_input`, right before the network, which still
+    takes a single flat channel stack. Folding and unfolding in between is what
+    the history handling used to get wrong.
 
     The main responsibilities are:
 
-    * **History.** Inputs may carry ``n_history + 1`` time steps. These are
-      flattened into the channel dimension for the model
-      (:meth:`flatten_history`) and expanded back when needed
-      (:meth:`expand_history`); :meth:`append_history` slides the window forward
-      by one step during autoregressive rollout.
-    * **Unpredicted features.** Quantities the model consumes but does not
-      predict, such as the solar zenith angle, are cached per step and appended
-      to the input. They must be carried over from the target to the input at
-      each rollout step, since the model cannot generate them itself.
+    * **History.** Inputs carry ``n_history + 1`` time steps;
+      :meth:`append_history` slides the window forward by one step during an
+      autoregressive rollout.
+    * **Dynamic features.** Quantities the model consumes but does not
+      predict, such as the solar zenith angle. Which ones the model takes is
+      fixed by the configuration (:attr:`dynamic_features`); their values come
+      with every batch (:meth:`cache_dynamic_features`) and are appended to the
+      input (:meth:`append_dynamic_features`). They are carried over from the
+      target to the input at each rollout step, since the model cannot generate
+      them itself.
     * **Static features.** Time-invariant fields such as orography and the
-      land-sea mask, appended to every input.
+      land-sea mask, appended to every packed input.
     * **Noise.** Optional stochastic perturbation of the input, either
       concatenated as extra channels or added to selected channels, for
       ensemble forecasting.
@@ -122,11 +127,12 @@ class Preprocessor2D(nn.Module):
         self.history_diff_var = None
         self.history_eps = 1e-6
 
-        # unpredicted input channels:
-        self.unpredicted_inp_train = None
-        self.unpredicted_tar_train = None
-        self.unpredicted_inp_eval = None
-        self.unpredicted_tar_eval = None
+        # the dynamic features the model takes, in the order their channels are appended
+        self.dynamic_features = [ZENITH] if params.get("add_zenith", False) else []
+
+        # their values for the current batch, per mode, so that evaluation does not clobber
+        # an in-flight training step: {mode: {"input" | "target": {name: (B, T, C_f, H, W)}}}
+        self._dynamic_cache = {mode: {"input": {}, "target": {}} for mode in ("train", "eval")}
 
         # get bias correction
         bias = get_bias_correction(params)
@@ -235,8 +241,8 @@ class Preprocessor2D(nn.Module):
         r"""
         Fold the time dimension into the channel dimension.
 
-        The network takes a single channel stack, so a history window has to be
-        flattened before it is passed in.
+        Only for the boundary to code that still takes a flat channel stack, the
+        network and the losses; everything in between keeps the time axis.
 
         Parameters
         ----------
@@ -294,177 +300,160 @@ class Preprocessor2D(nn.Module):
             x = torch.reshape(x, (b_, nhist, ct_ // nhist, h_, w_))
         return x
 
-    def add_static_features(self, x):
+    def _check_time_axis(self, x, caller):
+        torch._check(
+            x.dim() == 5,
+            lambda: f"{caller}: expected a tensor with an explicit time axis, (B, T, C, H, W), got shape {tuple(x.shape)}",
+        )
+
+    def pack_model_input(self, x):
         r"""
-        Append the time-invariant feature channels to the input.
+        Pack the input into the single channel stack the network takes.
+
+        The one place where the time axis is folded into the channels: the time
+        steps are stacked oldest first, and the static features, which have no
+        time axis, are appended after them.
 
         Parameters
         ----------
         x : torch.Tensor
-            Tensor of shape ``(B, C, H, W)``.
+            Input of shape ``(B, T, C, H, W)``, with the dynamic features
+            already appended.
 
         Returns
         -------
         torch.Tensor
-            Tensor of shape ``(B, C + n_static, H, W)``, or ``x`` unchanged if
-            no static features are configured.
+            Tensor of shape ``(B, T * C + n_static, H, W)``.
         """
+        self._check_time_axis(x, "pack_model_input")
+
+        x = self.flatten_history(x)
+
         if self.do_add_static_features:
-            # we need to replicate the grid for each batch:
+            # the same fields for every sample
             static = torch.tile(self.static_features, dims=(x.shape[0], 1, 1, 1))
             x = torch.cat([x, static], dim=1)
 
         return x
 
-    def remove_static_features(self, x):
+    def append_history(self, x, pred, step, update_state=True):
         r"""
-        Strip the static feature channels appended by :meth:`add_static_features`.
+        Slide the history window forward by one autoregressive step.
+
+        Drops the oldest time step from ``x`` and appends the new prediction
+        ``pred``, producing the input for the next step of the rollout.
+
+        This also advances the cached dynamic features: quantities such as the
+        solar zenith angle are known in advance but not predicted by the model,
+        so the target's value for this step has to move into the input window,
+        or the next step would be conditioned on stale values. Whether the train
+        or eval cache is updated follows the module's training mode.
 
         Parameters
         ----------
         x : torch.Tensor
-            Tensor of shape ``(B, C + n_static, H, W)``, with the static
-            features occupying the trailing channels.
+            Current input window, shape ``(B, n_history + 1, C, H, W)``.
+        pred : torch.Tensor
+            Newly predicted step, shape ``(B, 1, C, H, W)``.
+        step : int
+            Index of the current rollout step, which selects the target step of
+            the dynamic features. Steps beyond the cached range leave them
+            untouched.
+        update_state : bool, optional
+            If ``False``, only shift the history and leave the dynamic features
+            as they are. By default ``True``.
 
         Returns
         -------
         torch.Tensor
-            Tensor of shape ``(B, C, H, W)``, or ``x`` unchanged if no static
-            features are configured.
+            The next input window, same shape as ``x``.
         """
-        # only remove if something was added in the first place
-        if self.do_add_static_features:
-            nfeat = self.static_features.shape[1]
-            x = x[:, : x.shape[1] - nfeat, :, :]
-        return x
+        self._check_time_axis(x, "append_history")
+        self._check_time_axis(pred, "append_history")
 
-    def append_history(self, x1, x2, step, update_state=True):
+        if update_state:
+            cache = self._dynamic_cache[self._mode()]
+            for name in self.dynamic_features:
+                target = cache["target"].get(name, None)
+                if (target is None) or (step >= target.shape[1]):
+                    continue
+                window = cache["input"][name]
+                window.copy_(torch.cat([window[:, 1:], target[:, step : step + 1]], dim=1))
+
+        return torch.cat([x[:, 1:], pred], dim=1)
+
+    def append_dynamic_features(self, x):
         r"""
-        Slide the history window forward by one autoregressive step.
+        Append the dynamic features of the current batch, and the input noise.
 
-        Drops the oldest time step from ``x1`` and appends the new prediction
-        ``x2``, producing the input for the next step of the rollout.
-
-        This also advances the cached unpredicted features: quantities such as
-        the solar zenith angle are known in advance but not predicted by the
-        model, so the target's copy for this step has to be moved into the input
-        buffer or the next step would be conditioned on stale values. Whether
-        the train or eval buffers are updated follows the module's training
-        mode.
+        The channels are appended in a fixed order along the channel axis:
+        ``[x | dynamic features, in the order of dynamic_features | noise]``.
+        In ``perturb`` mode the noise is added to the selected channels instead
+        of appended. Which cache is read follows the module's training mode.
 
         Parameters
         ----------
-        x1 : torch.Tensor
-            Current input history, shape ``(B, (n_history + 1) * C, H, W)``.
-        x2 : torch.Tensor
-            Newly predicted step, shape ``(B, C, H, W)``.
-        step : int
-            Index of the current rollout step, used to select the corresponding
-            unpredicted features. Steps beyond the cached range leave the
-            unpredicted features untouched.
-        update_state : bool, optional
-            If ``False``, skip advancing the unpredicted feature buffers and
-            only shift the history. By default ``True``.
+        x : torch.Tensor
+            Input of shape ``(B, n_history + 1, C, H, W)``.
 
         Returns
         -------
         torch.Tensor
-            Updated history of the same shape as ``x1``. With
-            ``n_history == 0`` this is just ``x2``.
+            Input with the appended channels, ``(B, n_history + 1, C', H, W)``.
+
+        Raises
+        ------
+        RuntimeError
+            If a dynamic feature the model takes was not cached for this batch.
         """
+        self._check_time_axis(x, "append_dynamic_features")
 
-        # update the unpredicted input
-        if update_state:
-            if self.training:
-                if (self.unpredicted_tar_train is not None) and (step < self.unpredicted_tar_train.shape[1]):
-                    utar = self.unpredicted_tar_train[:, step : (step + 1), :, :, :]
-                    if self.n_history == 0:
-                        self.unpredicted_inp_train.copy_(utar)
-                    else:
-                        self.unpredicted_inp_train.copy_(
-                            torch.cat([self.unpredicted_inp_train[:, 1:, :, :, :], utar], dim=1)
-                        )
-            else:
-                if (self.unpredicted_tar_eval is not None) and (step < self.unpredicted_tar_eval.shape[1]):
-                    utar = self.unpredicted_tar_eval[:, step : (step + 1), :, :, :]
-                    if self.n_history == 0:
-                        self.unpredicted_inp_eval.copy_(utar)
-                    else:
-                        self.unpredicted_inp_eval.copy_(
-                            torch.cat([self.unpredicted_inp_eval[:, 1:, :, :, :], utar], dim=1)
-                        )
-
-        if self.n_history > 0:
-            # this is more complicated
-            x1 = self.expand_history(x1, nhist=self.n_history + 1)
-            x2 = self.expand_history(x2, nhist=1)
-
-            # append
-            res = torch.cat([x1[:, 1:, :, :, :], x2], dim=1)
-
-            # flatten again
-            res = self.flatten_history(res)
-        else:
-            res = x2
-
-        return res
-
-    def _append_channels(self, x, xc):
-
-        # x-dimension
-        xdim = x.dim()
-
-        # expand history
-        x = self.expand_history(x, self.n_history + 1)
-
-        # the cached features, if any; the noise below is appended either way
+        cache = self._dynamic_cache[self._mode()]["input"]
         appended = []
-        if xc is not None:
-            # Batch alignment between input and cached unpredicted features.
-            # If these diverge, the `cat` below would fail with a cryptic message —
-            # fail up-front with context about the likely cause. torch._check keeps
-            # this a runtime assertion under torch.compile instead of a graph break.
+        for name in self.dynamic_features:
+            if name not in cache:
+                raise RuntimeError(
+                    f"append_dynamic_features: the model takes the dynamic feature '{name}', but none is "
+                    f"cached for this batch. Call cache_dynamic_features with the batch first."
+                )
+            feature = cache[name]
+            # if these diverge, the cat below would fail with a cryptic message. torch._check
+            # keeps this a runtime assertion under torch.compile instead of a graph break.
             torch._check(
-                x.shape[0] == xc.shape[0],
+                (feature.shape[0] == x.shape[0]) and (feature.shape[1] == x.shape[1]),
                 lambda: (
-                    f"_append_channels: batch mismatch between input ({x.shape[0]}) and "
-                    f"cached unpredicted features ({xc.shape[0]}). "
-                    f"Did you cache xz/yz at a different batch size than the current forward?"
+                    f"append_dynamic_features: '{name}' has batch and time {tuple(feature.shape[:2])}, "
+                    f"the input {tuple(x.shape[:2])}. Was it cached at a different batch size?"
                 ),
             )
-            appended.append(self.expand_history(xc, self.n_history + 1))
+            appended.append(feature)
 
-        # this routine also adds noise every time a channel gets appended
         if hasattr(self, "input_noise"):
             # run the noise module eagerly: it is complex-valued (SHT) and cannot be inductor-
             # compiled; the method-level disable on its forward is not honored through the
             # nn.Module call, so break at the call site. See _run_eager.
-            n = _run_eager(self.input_noise)
+            noise = _run_eager(self.input_noise)
             torch._check(
-                n.shape[0] == x.shape[0],
+                noise.shape[0] == x.shape[0],
                 lambda: (
-                    f"_append_channels: batch mismatch between input_noise state "
-                    f"({n.shape[0]}) and input ({x.shape[0]}). "
+                    f"append_dynamic_features: batch mismatch between input_noise state "
+                    f"({noise.shape[0]}) and input ({x.shape[0]}). "
                     f"Did you call update_internal_state(batch_size=...) at a different "
                     f"batch than the current forward pass?"
                 ),
             )
             if self.input_noise_mode == "concatenate":
-                appended.append(n)
+                appended.append(noise)
             elif self.input_noise_mode == "perturb":
                 # fully out-of-place: build a zero noise field and add to all channels
                 noise_full = torch.zeros_like(x)
-                noise_full[:, :, self.perturb_channels] = n
+                noise_full[:, :, self.perturb_channels] = noise
                 x = x + noise_full
 
-        # concatenate
-        xo = torch.cat([x] + appended, dim=2)
+        if not appended:
+            return x
 
-        # flatten if requested
-        if xdim == 4:
-            xo = self.flatten_history(xo)
-
-        return xo
+        return torch.cat([x] + appended, dim=2)
 
     def history_compute_stats(self, x):
         r"""
@@ -491,67 +480,45 @@ class Preprocessor2D(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            History window of shape ``(B, (n_history + 1) * C, H, W)`` or
-            ``(B, T, C, H, W)``.
+            History window of shape ``(B, n_history + 1, C, H, W)``.
 
         Returns
         -------
         None
             Results are stored on the module as ``history_mean`` /
-            ``history_std`` (or ``history_diff_mean`` / ``history_diff_var``
-            in ``"timediff"`` mode).
+            ``history_std``, of shape ``(B, 1, C, 1, 1)`` so that they broadcast
+            over the time and grid dimensions (or ``history_diff_mean`` /
+            ``history_diff_var`` in ``"timediff"`` mode).
         """
-        if self.history_normalization_mode == "none":
-            self.history_mean = torch.zeros((1, 1, 1, 1), dtype=torch.float32, device=x.device)
-            self.history_std = torch.ones((1, 1, 1, 1), dtype=torch.float32, device=x.device)
-        elif self.history_normalization_mode == "timediff":
-            # reshaping
-            xdim = x.dim()
-            if xdim == 4:
-                b_, c_, h_, w_ = x.shape
-                xr = torch.reshape(x, (b_, (self.n_history + 1), c_ // (self.n_history + 1), h_, w_))
-            else:
-                xshape = x.shape
-                xr = x
+        self._check_time_axis(x, "history_compute_stats")
 
+        if self.history_normalization_mode == "none":
+            self.history_mean = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32, device=x.device)
+            self.history_std = torch.ones((1, 1, 1, 1, 1), dtype=torch.float32, device=x.device)
+        elif self.history_normalization_mode == "timediff":
             # time difference mean:
-            self.history_diff_mean = torch.mean(self.quadrature(xr[:, 1:, ...] - xr[:, 0:-1, ...]), dim=(1, 2))
+            self.history_diff_mean = torch.mean(self.quadrature(x[:, 1:, ...] - x[:, 0:-1, ...]), dim=(1, 2))
 
             # time difference std
             self.history_diff_var = torch.mean(
-                self.quadrature(torch.square((xr[:, 1:, ...] - xr[:, 0:-1, ...]) - self.history_diff_mean)), dim=(1, 2)
+                self.quadrature(torch.square((x[:, 1:, ...] - x[:, 0:-1, ...]) - self.history_diff_mean)), dim=(1, 2)
             )
 
             # time difference stds
             self.history_diff_mean = copy_to_parallel_region(self.history_diff_mean, "spatial")
             self.history_diff_var = copy_to_parallel_region(self.history_diff_var, "spatial")
         else:
-            xdim = x.dim()
-            if xdim == 4:
-                b_, c_, h_, w_ = x.shape
-                xr = torch.reshape(x, (b_, (self.n_history + 1), c_ // (self.n_history + 1), h_, w_))
-            else:
-                xshape = x.shape
-                xr = x
-
-            # mean
-            # quadrature reduces (H, W) → (B, T, C); weighted sum over T with keepdim → (B, 1, C)
-            self.history_mean = torch.sum(self.quadrature(xr * self.history_normalization_weights), dim=1, keepdim=True)
-            # reshape to (B, 1, C, 1, 1) so it broadcasts with xr (B, T, C, H, W)
+            # quadrature reduces (H, W) -> (B, T, C); the weighted sum over T -> (B, 1, C)
+            self.history_mean = torch.sum(self.quadrature(x * self.history_normalization_weights), dim=1, keepdim=True)
             b_, _, c_ = self.history_mean.shape
             self.history_mean = self.history_mean.reshape(b_, 1, c_, 1, 1)
 
-            # compute std: (B, T, C, H, W) - (B, 1, C, 1, 1) broadcasts correctly
             self.history_std = torch.sum(
-                self.quadrature(torch.square(xr - self.history_mean) * self.history_normalization_weights),
+                self.quadrature(torch.square(x - self.history_mean) * self.history_normalization_weights),
                 dim=1,
                 keepdim=True,
             )
             self.history_std = torch.sqrt(self.history_std.reshape(b_, 1, c_, 1, 1))
-
-            # squeeze T dim → (B, C, 1, 1); spatial singletons broadcast in history_normalize
-            self.history_mean = self.history_mean.reshape(b_, c_, 1, 1)
-            self.history_std = self.history_std.reshape(b_, c_, 1, 1)
 
             # copy to parallel region
             self.history_mean = copy_to_parallel_region(self.history_mean, "spatial")
@@ -596,13 +563,11 @@ class Preprocessor2D(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Tensor of shape ``(B, C, H, W)`` or ``(B, T, C, H, W)``. The
-            original layout is restored on return.
+            Tensor of shape ``(B, T, C, H, W)``.
         target : bool, optional
-            If ``True``, treat ``x`` as a single-step target and use only the
-            leading channels of the statistics. If ``False`` (the default),
-            treat it as a full history window and tile the statistics over the
-            ``n_history + 1`` steps.
+            If ``True``, ``x`` holds only the predicted channels, which lead
+            the input channels the statistics were computed on, so only those
+            statistics are used. By default ``False``.
 
         Returns
         -------
@@ -617,27 +582,12 @@ class Preprocessor2D(nn.Module):
         if self.history_normalization_mode in ["none", "timediff"]:
             return x
 
+        self._check_time_axis(x, "history_normalize")
         self._check_history_stats(x, caller="history_normalize")
 
-        xdim = x.dim()
-        if xdim == 5:
-            xshape = x.shape
-            x = self.flatten_history(x)
+        mean, std = self._history_stats(x, target)
 
-        # normalize
-        if target:
-            # strip off the unpredicted channels
-            xn = (x - self.history_mean[:, : x.shape[1], :, :]) / self.history_std[:, : x.shape[1], :, :]
-        else:
-            # tile to include history
-            hm = torch.tile(self.history_mean, (1, self.n_history + 1, 1, 1))
-            hs = torch.tile(self.history_std, (1, self.n_history + 1, 1, 1))
-            xn = (x - hm) / hs
-
-        if xdim == 5:
-            xn = torch.reshape(xn, xshape)
-
-        return xn
+        return (x - mean) / std
 
     def history_denormalize(self, xn, target=False):
         r"""
@@ -648,11 +598,10 @@ class Preprocessor2D(nn.Module):
         Parameters
         ----------
         xn : torch.Tensor
-            Normalized tensor of shape ``(B, C, H, W)`` or ``(B, T, C, H, W)``.
+            Normalized tensor of shape ``(B, T, C, H, W)``.
         target : bool, optional
-            If ``True``, treat ``xn`` as a single-step target and use only the
-            leading channels of the statistics; otherwise tile them over the
-            history window. By default ``False``.
+            If ``True``, ``xn`` holds only the predicted channels, see
+            :meth:`history_normalize`. By default ``False``.
 
         Returns
         -------
@@ -667,86 +616,87 @@ class Preprocessor2D(nn.Module):
         if self.history_normalization_mode in ["none", "timediff"]:
             return xn
 
+        self._check_time_axis(xn, "history_denormalize")
         self._check_history_stats(xn, caller="history_denormalize")
 
-        xndim = xn.dim()
-        if xndim == 5:
-            xnshape = xn.shape
-            xn = self.flatten_history(xn)
+        mean, std = self._history_stats(xn, target)
 
-        # de-normalize
+        return xn * std + mean
+
+    def _history_stats(self, x, target):
+        # (B, 1, C, 1, 1), broadcast over time and grid
         if target:
-            # strip off the unpredicted channels
-            x = xn * self.history_std[:, : xn.shape[1], :, :] + self.history_mean[:, : xn.shape[1], :, :]
-        else:
-            # tile to include history
-            hm = torch.tile(self.history_mean, (1, self.n_history + 1, 1, 1))
-            hs = torch.tile(self.history_std, (1, self.n_history + 1, 1, 1))
-            x = xn * hs + hm
+            num_channels = x.shape[2]
+            return self.history_mean[:, :, :num_channels], self.history_std[:, :, :num_channels]
+        return self.history_mean, self.history_std
 
-        if xndim == 5:
-            x = torch.reshape(x, xnshape)
+    def _mode(self):
+        return "train" if self.training else "eval"
 
-        return x
-
-    def _ensure_cached(self, name: str, tensor):
-        """
-        Centralized rebind for the cached unpredicted-feature attributes.
-
-        - tensor is None: the cached attribute is cleared to None.
-        - current is None or has a different shape: store a fresh clone.
-        - shapes match: in-place ``copy_`` to reuse the existing memory.
-
-        These are plain attributes (not registered buffers): they are per-step scratch
-        populated from dataloader output on-device, and should not appear in ``state_dict``.
-        """
-        current = getattr(self, name)
-        if tensor is None:
-            setattr(self, name, None)
-            return
-        if (current is not None) and (current.shape == tensor.shape):
-            current.copy_(tensor)
-        else:
-            setattr(self, name, tensor.clone())
-
-    def cache_unpredicted_features(self, x, y, xz=None, yz=None):
+    def cache_dynamic_features(self, batch):
         r"""
-        Cache the unpredicted input and target features for this sample.
+        Cache the dynamic features of a batch.
 
-        Stores the auxiliary channels the model consumes but does not predict,
-        so that :meth:`append_history` and :meth:`append_unpredicted_features`
-        can draw on them during rollout. Separate train and eval caches are
-        kept, selected by the module's training mode, so that evaluation does
-        not clobber the state of an in-flight training step.
+        Stores the features the model consumes but does not predict, so that
+        :meth:`append_dynamic_features` and :meth:`append_history` can draw on
+        them during the rollout. Separate train and eval caches are kept,
+        selected by the module's training mode, so that evaluation does not
+        clobber the state of an in-flight training step.
+
+        The batch has to carry exactly the features the model takes,
+        :attr:`dynamic_features`: a missing one would leave the model without
+        an input it was built for, and an extra one would be silently ignored.
 
         Parameters
         ----------
-        x : torch.Tensor
-            Model input. Passed through unchanged.
-        y : torch.Tensor
-            Model target. Passed through unchanged.
-        xz : torch.Tensor, optional
-            Unpredicted input features, shape ``(B, T, C_z, H, W)``. ``None``
-            clears the cache.
-        yz : torch.Tensor, optional
-            Unpredicted target features, shape ``(B, steps, C_z, H, W)``.
-            ``None`` clears the cache.
+        batch : dict
+            A batch as the loaders emit it, see :mod:`makani.utils.dataloaders.batch`;
+            only the dynamic features are read. Without target features, as in
+            inference, the target cache is cleared.
 
-        Returns
-        -------
-        x : torch.Tensor
-            The input, unchanged.
-        y : torch.Tensor
-            The target, unchanged.
+        Raises
+        ------
+        ValueError
+            If the features of the batch are not the ones the model takes, or
+            a feature has no time axis.
         """
-        if self.training:
-            self._ensure_cached("unpredicted_inp_train", xz)
-            self._ensure_cached("unpredicted_tar_train", yz)
-        else:
-            self._ensure_cached("unpredicted_inp_eval", xz)
-            self._ensure_cached("unpredicted_tar_eval", yz)
+        cache = self._dynamic_cache[self._mode()]
 
-        return x, y
+        self._store_features(cache["input"], batch.get(INPUT_DYNAMIC_FEATURES, {}), "input")
+
+        target = batch.get(TARGET_DYNAMIC_FEATURES, None)
+        if target is None:
+            cache["target"].clear()
+        else:
+            self._store_features(cache["target"], target, "target")
+
+    def _store_features(self, cache, features, side):
+        expected = set(self.dynamic_features)
+        if set(features) != expected:
+            raise ValueError(
+                f"cache_dynamic_features: the model takes the {side} dynamic features {sorted(expected)}, "
+                f"the batch carries {sorted(features)}"
+            )
+
+        for name, feature in features.items():
+            if feature.dim() != 5:
+                raise ValueError(
+                    f"cache_dynamic_features: {side} feature '{name}' needs a time axis, (B, T, C, H, W), "
+                    f"got shape {tuple(feature.shape)}"
+                )
+            if (side == "input") and (feature.shape[1] != self.n_history + 1):
+                raise ValueError(
+                    f"cache_dynamic_features: input feature '{name}' has {feature.shape[1]} time steps, "
+                    f"the input window n_history + 1 = {self.n_history + 1}"
+                )
+
+            # plain tensors rather than registered buffers: per-step scratch from the dataloader,
+            # which must not end up in the state dict. Reuse the memory when the shape allows.
+            current = cache.get(name, None)
+            if (current is not None) and (current.shape == feature.shape):
+                current.copy_(feature)
+            else:
+                cache[name] = feature.clone()
 
     def get_base_seed(self, default=333):
         r"""
@@ -930,40 +880,6 @@ class Preprocessor2D(nn.Module):
             self.input_noise.update(replace_state=replace_state, batch_size=batch_size)
         return
 
-    def append_unpredicted_features(self, inp, target=False):
-        r"""
-        Append the cached unpredicted features to a tensor.
-
-        Also injects the input noise when configured, since noise is applied at
-        the same point in the pipeline. The train or eval cache is selected by
-        the module's training mode; if the relevant cache is empty, only the
-        noise is applied, and without noise the input is returned unchanged.
-
-        Parameters
-        ----------
-        inp : torch.Tensor
-            Tensor of shape ``(B, C, H, W)`` or ``(B, T, C, H, W)``. The
-            original layout is restored on return.
-        target : bool, optional
-            Append the target-side unpredicted features rather than the
-            input-side ones, by default ``False``.
-
-        Returns
-        -------
-        torch.Tensor
-            Tensor with the unpredicted feature channels appended.
-        """
-        if self.training:
-            cache = self.unpredicted_tar_train if target else self.unpredicted_inp_train
-        else:
-            cache = self.unpredicted_tar_eval if target else self.unpredicted_inp_eval
-
-        # noise is injected here as well, so an empty cache only means nothing to do without it
-        if (cache is None) and not hasattr(self, "input_noise"):
-            return inp
-
-        return self._append_channels(inp, cache)
-
     def get_static_features(self):
         r"""
         Return a copy of the static feature tensor.
@@ -979,39 +895,46 @@ class Preprocessor2D(nn.Module):
         else:
             return None
 
-    def get_unpredicted_features(self):
+    def get_dynamic_features(self):
         r"""
-        Return copies of the cached unpredicted input and target features.
+        Return copies of the cached dynamic features.
 
         Which cache is read follows the module's training mode.
 
         Returns
         -------
-        inpu : torch.Tensor or None
-            Cached unpredicted input features, or ``None`` if unset.
-        taru : torch.Tensor or None
-            Cached unpredicted target features, or ``None`` if unset.
+        inp : dict
+            Input features by name, each ``(B, n_history + 1, C_f, H, W)``.
+        tar : dict
+            Target features by name, empty if the batch had no target.
         """
-        if self.training:
-            if self.unpredicted_inp_train is not None:
-                inpu = self.unpredicted_inp_train.clone()
-            else:
-                inpu = None
-            if self.unpredicted_tar_train is not None:
-                taru = self.unpredicted_tar_train.clone()
-            else:
-                taru = None
-        else:
-            if self.unpredicted_inp_eval is not None:
-                inpu = self.unpredicted_inp_eval.clone()
-            else:
-                inpu = None
-            if self.unpredicted_tar_eval is not None:
-                taru = self.unpredicted_tar_eval.clone()
-            else:
-                taru = None
+        cache = self._dynamic_cache[self._mode()]
+        inp = {name: feature.clone() for name, feature in cache["input"].items()}
+        tar = {name: feature.clone() for name, feature in cache["target"].items()}
 
-        return inpu, taru
+        return inp, tar
+
+    def stack_dynamic_features(self, features):
+        r"""
+        Stack dynamic features along the channel axis, in the order the model takes them.
+
+        For models that pack their input themselves rather than through
+        :meth:`append_dynamic_features`.
+
+        Parameters
+        ----------
+        features : dict
+            Features by name, as :meth:`get_dynamic_features` returns them.
+
+        Returns
+        -------
+        torch.Tensor or None
+            ``(B, T, sum C_f, H, W)``, or ``None`` if the model takes no dynamic features.
+        """
+        if not self.dynamic_features:
+            return None
+
+        return torch.cat([features[name] for name in self.dynamic_features], dim=2)
 
     def correct_bias(self, inp: torch.Tensor):
         r"""

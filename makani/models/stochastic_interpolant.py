@@ -391,10 +391,10 @@ class StochasticInterpolantWrapper(nn.Module):
         ishape = list(inp.shape)
         samples_fact = 2 if self.antithetic_sampling else 1
 
-        # extract unpredicted and static, expand and flatten
+        # extract the dynamic and static features, expand and flatten
         with torch.no_grad():
-            # get unpredicted
-            inpu, _ = self.preprocessor.get_unpredicted_features()
+            # get the dynamic features, in shape [B, T, C, H, W]
+            inpu = self.preprocessor.stack_dynamic_features(self.preprocessor.get_dynamic_features()[0])
 
             if inpu is not None:
                 # rewmove time dim to get shape [B, C, H, W]
@@ -447,8 +447,8 @@ class StochasticInterpolantWrapper(nn.Module):
         torch._check(len(inp.shape) == 4, lambda: f"expected a 4D input, got {len(inp.shape)}D")
 
         with torch.no_grad():
-            # get unpredicted in shape [B, T, C, H, W]
-            inpu, _ = self.preprocessor.get_unpredicted_features()
+            # get the dynamic features in shape [B, T, C, H, W]
+            inpu = self.preprocessor.stack_dynamic_features(self.preprocessor.get_dynamic_features()[0])
 
             if inpu is not None:
                 # rewmove time dim to get shape [B, C, H, W]

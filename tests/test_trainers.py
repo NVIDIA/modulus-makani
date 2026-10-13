@@ -196,6 +196,17 @@ class TestTrainer(unittest.TestCase):
             (AutoencoderTrainer, False, False, "cuda"),
         ]
 
+    @staticmethod
+    def _forward(trainer, inp):
+        """The trained model on a flat input, with a flat output for the comparisons.
+
+        The step wrappers take and return the time axis explicitly; the stochastic
+        interpolant takes the time steps folded into the channels.
+        """
+        if isinstance(trainer, StochasticTrainer):
+            return trainer.model(inp)
+        return trainer.model(inp.unsqueeze(1)).flatten(1, 2)
+
     @parameterized.expand(test_parameters, skip_on_empty=True)
     def test_trainer(self, trainer_handle, test_train, test_eval, devstring, verbose=False):
 
@@ -238,7 +249,7 @@ class TestTrainer(unittest.TestCase):
         inp.requires_grad = True
 
         # forward pass and remember the output
-        out_ref = self.trainer.model(inp)
+        out_ref = self._forward(self.trainer, inp)
         with self.subTest(desc="output shape"):
             self.assertEqual(out_ref.shape, out_shape)
 
@@ -254,21 +265,21 @@ class TestTrainer(unittest.TestCase):
         # test that the models produce the same results
         if test_eval:
             self.trainer_restored._set_eval()
-            out = self.trainer_restored.model(inp)
-            out_ref = self.trainer.model(inp)
+            out = self._forward(self.trainer_restored, inp)
+            out_ref = self._forward(self.trainer, inp)
             with self.subTest(desc="test output vs reference"):
                 self.assertTrue(compare_tensors("test output vs reference", out, out_ref, verbose=verbose))
 
         # redo this but in train mode
         if test_train:
             self.trainer._set_train()
-            out = self.trainer.model(inp)
+            out = self._forward(self.trainer, inp)
             with self.subTest(desc="train output vs reference roundtrip 1"):
                 self.assertTrue(compare_tensors("train output vs reference roundtrip 1", out, out_ref, verbose=verbose))
             out_ref = out
 
             self.trainer_restored._set_train()
-            out = self.trainer_restored.model(inp)
+            out = self._forward(self.trainer_restored, inp)
             with self.subTest(desc="train output vs reference roundtrip 2"):
                 self.assertTrue(compare_tensors("train output vs reference roundtrip 2", out, out_ref, verbose=verbose))
 

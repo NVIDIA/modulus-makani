@@ -49,7 +49,7 @@ import torch
 from torch.utils.data import default_collate
 
 from makani.utils.dataloader import get_dataloader
-from makani.utils.dataloaders.batch import to_legacy_tuple
+from makani.utils.dataloaders.batch import to_legacy_tuple, INPUT, TARGET
 from makani.models.noise import DummyNoiseS2
 from makani.models.stepper import MultiStepWrapper
 
@@ -252,13 +252,15 @@ def _capture_stepper(paths, result):
         wrapper.train()
 
         # what the trainers do with a batch
-        inp, tar = wrapper.preprocessor.cache_unpredicted_features(*_as_items(batch))
-        inp = wrapper.preprocessor.flatten_history(inp)
-        tar = wrapper.preprocessor.flatten_history(tar)
+        wrapper.preprocessor.cache_dynamic_features(batch)
         with torch.no_grad():
-            out = wrapper(inp)
+            out = wrapper(batch[INPUT])
 
-        _store(result, f"stepper/{case_name(n_history, add_zenith)}", (*probe.inputs, out, tar))
+        # recorded with the time steps folded into the channels, as the losses take them
+        flatten = wrapper.preprocessor.flatten_history
+        _store(
+            result, f"stepper/{case_name(n_history, add_zenith)}", (*probe.inputs, flatten(out), flatten(batch[TARGET]))
+        )
 
 
 def compute_reference():

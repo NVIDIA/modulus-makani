@@ -120,19 +120,18 @@ class _ModelPackageTestBase(unittest.TestCase):
 
 class TestZenithFeatureShapes(_ModelPackageTestBase):
     """
-    The cached zenith tensor must be (B, n_history+1, H, W).
+    The zenith feature must be (B, n_history+1, 1, H, W).
 
-    That is what Preprocessor2D._append_channels consumes: it runs expand_history
-    on the cached tensor, reshaping (B, nhist, H, W) -> (B, nhist, 1, H, W) before
-    concatenating on the channel axis. Getting either of the two leading axes
-    wrong trips the batch check or the history-divisibility check.
+    That is a dynamic feature as the preprocessor takes it: batch, time and
+    channel leading, the grid trailing. Getting either of the two leading axes
+    wrong trips the batch or the time-window check when it is cached.
     """
 
     def _check(self, n_history, batch, n_times):
         wrapper = self._make_wrapper(n_history=n_history)
         x = torch.randn(batch, (n_history + 1) * self.C, self.H, self.W)
         z = wrapper._zenith_features(x, self._times(n_times))
-        self.assertEqual(tuple(z.shape), (batch, n_history + 1, self.H, self.W))
+        self.assertEqual(tuple(z.shape), (batch, n_history + 1, 1, self.H, self.W))
 
     def test_single_sample_no_history(self):
         self._check(n_history=0, batch=1, n_times=1)
@@ -175,7 +174,7 @@ class TestZenithFeatureShapes(_ModelPackageTestBase):
             self.assertTrue(
                 compare_tensors(
                     f"member_major_b{b}",
-                    z[b],
+                    z[b, :, 0],
                     torch.as_tensor(expected.astype(np.float32)),
                     verbose=True,
                 )
@@ -199,19 +198,22 @@ class TestZenithFeatureShapes(_ModelPackageTestBase):
         self.assertIn("add_zenith", msg)
         self.assertIn("Pass either 4 times", msg)
 
-    def test_non_4d_input_raises_with_zenith(self):
-        wrapper = self._make_wrapper(n_history=0, add_zenith=True)
-        x = torch.randn(2, 1, self.C, self.H, self.W)
-        with self.assertRaises(ValueError):
-            wrapper._prepare_input(x, self._times(2), normalized_data=True)
+    def test_input_with_time_axis_is_accepted(self):
+        # the history may come flattened into the channels or on its own axis, with
+        # or without the zenith angle; the step wrapper gets it with the time axis
+        for add_zenith in (True, False):
+            with self.subTest(add_zenith=add_zenith):
+                wrapper = self._make_wrapper(n_history=1, add_zenith=add_zenith)
+                x = torch.randn(2, 2, self.C, self.H, self.W)
+                out = wrapper._prepare_input(x, self._times(4), normalized_data=True)
+                self.assertTrue(compare_tensors("time axis kept", out, x, verbose=True))
 
-    def test_non_4d_input_allowed_without_zenith(self):
-        # the rank requirement belongs to the zenith path only; without it the rest
-        # of the pipeline broadcasts fine and must not be newly restricted
-        wrapper = self._make_wrapper(n_history=0, add_zenith=False)
-        x = torch.randn(2, 1, self.C, self.H, self.W)
-        out = wrapper._prepare_input(x, self._times(2), normalized_data=True)
-        self.assertEqual(tuple(out.shape), tuple(x.shape))
+    def test_flat_input_gets_its_time_axis(self):
+        wrapper = self._make_wrapper(n_history=1)
+        x = torch.randn(2, 2 * self.C, self.H, self.W)
+        out = wrapper._prepare_input(x, self._times(4), normalized_data=True)
+        self.assertEqual(tuple(out.shape), (2, 2, self.C, self.H, self.W))
+        self.assertTrue(compare_tensors("unfolded", out[:, 1], x[:, self.C :], verbose=True))
 
 
 class TestModelPackageForward(_ModelPackageTestBase):
@@ -262,7 +264,7 @@ class TestModelPackageForward(_ModelPackageTestBase):
         x = torch.randn(2, 2 * self.C, self.H, self.W)
         out = wrapper._prepare_input(x, self._times(4), normalized_data=False)
 
-        expected = torch.cat([(x[:, : self.C] - means) / stds, (x[:, self.C :] - means) / stds], dim=1)
+        expected = torch.stack([(x[:, : self.C] - means) / stds, (x[:, self.C :] - means) / stds], dim=1)
         self.assertTrue(compare_tensors("normalization_with_history", out, expected, verbose=True))
 
     def test_encode_process_matches_forward_preprocessing(self):
@@ -388,11 +390,12 @@ class _ScaleModel(nn.Module):
     """
     Dummy model that scales the most-recent timestep slice by a learnable factor.
 
-    The wrapper feeds (B, (n_history+1)*C, H, W) and expects (B, C, H, W) back, so
-    we slice the trailing C channels (the latest timestep in the flattened-history
-    layout) and multiply by ``scale``. With scale=2 the rollout produces the
-    geometric sequence  pred_k = 2^(k+1) * (last C of initial input), which makes
-    every assertion in this file an exact equality check.
+    The wrapper packs (B, n_history+1, C, H, W) into (B, (n_history+1)*C, H, W)
+    for the network and expects (B, C, H, W) back, so we slice the trailing C
+    channels (the latest timestep, oldest first) and multiply by ``scale``. With
+    scale=2 the rollout produces the geometric sequence
+    pred_k = 2^(k+1) * (latest step of the initial input), which makes every
+    assertion in this file an exact equality check.
     """
 
     def __init__(self, n_out_chans: int, scale: float = 2.0):
@@ -432,11 +435,15 @@ class TestStepper(unittest.TestCase):
     # SingleStepWrapper
     # ------------------------------------------------------------------
 
+    def _inp(self, n_steps=1, batch=None, ones=False):
+        shape = (batch or self.B, n_steps, self.C, self.H, self.W)
+        return torch.ones(*shape) if ones else torch.randn(*shape)
+
     def test_single_step_no_history(self):
         params = self._make_params(n_history=0)
         wrapper = SingleStepWrapper(params, self._make_handle())
         wrapper.train()
-        inp = torch.randn(self.B, self.C, self.H, self.W)
+        inp = self._inp()
         out = wrapper(inp)
         self.assertEqual(out.shape, inp.shape)
         self.assertTrue(compare_tensors("single_step_no_history", out, 2.0 * inp, verbose=False))
@@ -446,12 +453,19 @@ class TestStepper(unittest.TestCase):
         params = self._make_params(n_history=n_history)
         wrapper = SingleStepWrapper(params, self._make_handle())
         wrapper.train()
-        # flattened-history input layout: (n_history+1)*C channels, oldest first
-        inp = torch.randn(self.B, (n_history + 1) * self.C, self.H, self.W)
+        inp = self._inp(n_history + 1)
         out = wrapper(inp)
-        self.assertEqual(out.shape, (self.B, self.C, self.H, self.W))
-        # only the most-recent timestep slice is consumed by the dummy model
-        self.assertTrue(compare_tensors("single_step_with_history", out, 2.0 * inp[:, -self.C :], verbose=False))
+        self.assertEqual(out.shape, (self.B, 1, self.C, self.H, self.W))
+        # only the most-recent timestep is consumed by the dummy model
+        self.assertTrue(compare_tensors("single_step_with_history", out, 2.0 * inp[:, -1:], verbose=False))
+
+    def test_steppers_need_the_time_axis(self):
+        # a flat input would be packed with the wrong layout, so it is refused
+        for wrapper_cls in (SingleStepWrapper, MultiStepWrapper):
+            with self.subTest(wrapper=wrapper_cls.__name__):
+                wrapper = wrapper_cls(self._make_params(n_history=1), self._make_handle())
+                with self.assertRaises(RuntimeError):
+                    wrapper(torch.randn(self.B, 2 * self.C, self.H, self.W))
 
     def test_single_step_encode_process_uses_forward_preprocessing(self):
         # encode_process must agree with forward on everything up to the decoder.
@@ -462,12 +476,13 @@ class TestStepper(unittest.TestCase):
             params,
             lambda: _StagedScaleModel(n_out_chans=self.C, scale=2.0),
         )
-        inp = torch.randn(self.B, self.C, self.H, self.W)
+        inp = self._inp()
 
+        # the backbone's latent features are flat, the prediction has its time axis
         features = wrapper.encode_process(inp)
-        expected = wrapper(inp)
+        expected = wrapper(inp).squeeze(1)
 
-        self.assertEqual(features.shape, inp.shape)
+        self.assertEqual(features.shape, (self.B, self.C, self.H, self.W))
         self.assertTrue(compare_tensors("single_step_encode_process", features, expected, verbose=True))
 
     def test_single_step_encode_process_batched(self):
@@ -479,23 +494,23 @@ class TestStepper(unittest.TestCase):
             lambda: _StagedScaleModel(n_out_chans=self.C, scale=2.0),
         )
         batch = 4
-        inp = torch.randn(batch, self.C, self.H, self.W)
+        inp = self._inp(batch=batch)
 
         features = wrapper.encode_process(inp)
 
         self.assertEqual(features.shape, (batch, self.C, self.H, self.W))
-        self.assertTrue(compare_tensors("single_step_encode_process_batched", features, 2.0 * inp, verbose=True))
+        self.assertTrue(compare_tensors("single_step_encode_process_batched", features, 2.0 * inp[:, 0], verbose=True))
 
     def test_single_step_forward_batched(self):
         # the same must hold for the ordinary forward path
         params = self._make_params(n_history=0)
         wrapper = SingleStepWrapper(params, self._make_handle())
         batch = 4
-        inp = torch.randn(batch, self.C, self.H, self.W)
+        inp = self._inp(batch=batch)
 
         out = wrapper(inp)
 
-        self.assertEqual(out.shape, (batch, self.C, self.H, self.W))
+        self.assertEqual(out.shape, (batch, 1, self.C, self.H, self.W))
         self.assertTrue(compare_tensors("single_step_forward_batched", out, 2.0 * inp, verbose=True))
 
     def test_single_step_encode_process_unsupported_backbone(self):
@@ -503,7 +518,7 @@ class TestStepper(unittest.TestCase):
         # than an AttributeError from deep inside the call
         params = self._make_params(n_history=0)
         wrapper = SingleStepWrapper(params, self._make_handle())
-        inp = torch.randn(self.B, self.C, self.H, self.W)
+        inp = self._inp()
 
         with self.assertRaises(NotImplementedError):
             wrapper.encode_process(inp)
@@ -519,19 +534,18 @@ class TestStepper(unittest.TestCase):
         wrapper = MultiStepWrapper(params, self._make_handle())
         wrapper.train()
 
-        in_chans = (n_history + 1) * self.C
-        inp = torch.randn(self.B, in_chans, self.H, self.W)
+        inp = self._inp(n_history + 1)
         out = wrapper(inp)
 
-        # rollout output: (B, (n_future+1)*C, H, W) — predictions concatenated along channel dim
-        self.assertEqual(out.shape, (self.B, (n_future + 1) * self.C, self.H, self.W))
+        # rollout output: (B, n_future+1, C, H, W), one step per rollout step
+        self.assertEqual(out.shape, (self.B, n_future + 1, self.C, self.H, self.W))
 
-        # k-th block must equal 2^(k+1) * (last-C slice of inp): each step scales
-        # the previous prediction by 2, and append_history places that prediction
-        # at the most-recent position for the next call
-        last = inp[:, -self.C :]
+        # step k must equal 2^(k+1) * (latest step of inp): each step scales the
+        # previous prediction by 2, and append_history places that prediction at
+        # the most-recent position for the next call
+        last = inp[:, -1]
         for k in range(n_future + 1):
-            block = out[:, k * self.C : (k + 1) * self.C]
+            block = out[:, k]
             self.assertTrue(
                 compare_tensors(
                     f"multistep_train_step_{k}_h{n_history}",
@@ -550,24 +564,24 @@ class TestStepper(unittest.TestCase):
         params = self._make_params(n_history=0, n_future=n_future)
         wrapper = MultiStepWrapper(params, self._make_handle())
         wrapper.eval()
-        inp = torch.randn(self.B, self.C, self.H, self.W)
+        inp = self._inp()
         out = wrapper(inp)
         # _forward_eval returns one step regardless of n_future
-        self.assertEqual(out.shape, (self.B, self.C, self.H, self.W))
+        self.assertEqual(out.shape, (self.B, 1, self.C, self.H, self.W))
         self.assertTrue(compare_tensors("multistep_eval", out, 2.0 * inp, verbose=False))
 
     def test_train_eval_dispatch(self):
         params = self._make_params(n_history=0, n_future=2)
         wrapper = MultiStepWrapper(params, self._make_handle())
-        inp = torch.randn(self.B, self.C, self.H, self.W)
+        inp = self._inp()
 
         wrapper.train()
         out_train = wrapper(inp)
-        self.assertEqual(out_train.shape[1], (params.n_future + 1) * self.C)
+        self.assertEqual(out_train.shape[1], params.n_future + 1)
 
         wrapper.eval()
         out_eval = wrapper(inp)
-        self.assertEqual(out_eval.shape[1], self.C)
+        self.assertEqual(out_eval.shape[1], 1)
 
     # ------------------------------------------------------------------
     # push_forward: same numerics, but a strictly truncated gradient through
@@ -577,7 +591,7 @@ class TestStepper(unittest.TestCase):
 
     def test_push_forward_matches_no_push(self):
         n_future = 2
-        inp = torch.randn(self.B, self.C, self.H, self.W)
+        inp = self._inp()
 
         wrapper_off = MultiStepWrapper(self._make_params(n_future=n_future, push_forward=False), self._make_handle())
         wrapper_on = MultiStepWrapper(self._make_params(n_future=n_future, push_forward=True), self._make_handle())
@@ -592,7 +606,7 @@ class TestStepper(unittest.TestCase):
         # use ones() so the gradient takes a known closed form and we can
         # check exact values rather than just an inequality
         n_future = 2
-        inp = torch.ones(self.B, self.C, self.H, self.W)
+        inp = self._inp(ones=True)
 
         wrapper_off = MultiStepWrapper(self._make_params(n_future=n_future, push_forward=False), self._make_handle())
         wrapper_on = MultiStepWrapper(self._make_params(n_future=n_future, push_forward=True), self._make_handle())
@@ -805,8 +819,8 @@ class TestResampledShapeFallback(unittest.TestCase):
         self.assertEqual(params.img_shape_x_resampled, params.img_shape_x)
         self.assertEqual(params.img_shape_y_resampled, params.img_shape_y)
 
-        inp = torch.randn(1, params.N_in_channels, params.img_shape_x, params.img_shape_y)
-        out = model(inp)
+        inp = torch.randn(1, 1, params.N_in_channels, params.img_shape_x, params.img_shape_y)
+        out = model(inp).flatten(1, 2)
         self.assertEqual(out.shape, (1, params.N_out_channels, params.img_shape_x, params.img_shape_y))
         self.assertTrue(torch.isfinite(out).all())
 

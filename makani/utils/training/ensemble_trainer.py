@@ -37,7 +37,7 @@ from makani.utils.driver import Driver
 from makani.utils.training import Trainer
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
-from makani.utils.dataloaders.batch import legacy_batch_to_device
+from makani.utils.dataloaders.batch import batch_to_device, map_dynamic_features, INPUT, TARGET
 from makani.utils.YParams import YParams
 
 # model registry
@@ -219,12 +219,9 @@ class EnsembleTrainer(Trainer):
         # get sample and map to gpu
         iterator = iter(self.train_dataloader)
         data = next(iterator)
-        gdata = legacy_batch_to_device(data, self.device)
-        # extract unpredicted features
-        inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-        # flatten
-        inp = self.preprocessor.flatten_history(inp)
-        tar = self.preprocessor.flatten_history(tar)
+        batch = batch_to_device(data, self.device)
+        self.preprocessor.cache_dynamic_features(batch)
+        inp, tar = batch[INPUT], batch[TARGET]
         # get shapes
         inp_shape = inp.shape
         tar_shape = tar.shape
@@ -502,20 +499,22 @@ class EnsembleTrainer(Trainer):
         E = self.params.local_ensemble_size
         B = inp.shape[0]
 
-        # (B, C, H, W) -> (B*E, C, H, W) with ensemble dim folded into batch
+        # (B, T, C, H, W) -> (B*E, T, C, H, W) with ensemble dim folded into batch
         # (E==1 short-circuits inside expand_ensemble, no allocation)
-        inp_flat = expand_ensemble(inp, E)
+        inp_folded = expand_ensemble(inp, E)
 
         # pre-adjust the preprocessor's noise state to the folded batch; the model is then
         # called with update_state=False so it consumes this fresh state directly.
-        self.preprocessor.update_internal_state(replace_state=True, batch_size=inp_flat.shape[0])
+        self.preprocessor.update_internal_state(replace_state=True, batch_size=inp_folded.shape[0])
 
-        pred_flat = self.model_train(inp_flat, update_state=False)
+        pred_folded = self.model_train(inp_folded, update_state=False)
 
-        # unflatten
+        # the losses take the time steps folded into the channels, and the ensemble as dim 1
+        flatten = self.preprocessor.flatten_history
+        pred_flat = flatten(pred_folded)
         pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
 
-        loss = self.loss_obj(pred, tar, inp=inp)
+        loss = self.loss_obj(pred, flatten(tar), inp=flatten(inp))
 
         return pred, loss
 
@@ -545,26 +544,20 @@ class EnsembleTrainer(Trainer):
             torch.cuda.nvtx.range_push(f"train step {train_steps}")
             self.step_timer.begin_step()
 
-            # map to device; materialize to list so we can expand zenith features
-            gdata = list(legacy_batch_to_device(data, self.device))
+            # map to device
+            batch = batch_to_device(data, self.device)
 
             # When training with local_ensemble_size > 1 we fold the ensemble dim into the
-            # batch dim for a single forward pass. The cached unpredicted features (xz, yz)
-            # must therefore also carry an ensemble-expanded batch so shapes line up inside
-            # the preprocessor. x is expanded inside _ensemble_step (to preserve `inp.shape[0]`
-            # semantics below); y stays at its original batch since the loss expects (B, E, ...)
+            # batch dim for a single forward pass. The dynamic features must therefore also
+            # carry an ensemble-expanded batch so shapes line up inside the preprocessor.
+            # x is expanded inside _ensemble_step (to preserve `inp.shape[0]` semantics
+            # below); y stays at its original batch since the loss expects (B, E, ...)
             # pred vs (B, ...) target.
             E = self.params.local_ensemble_size
-            if len(gdata) == 4:
-                gdata[2] = expand_ensemble(gdata[2], E)
-                gdata[3] = expand_ensemble(gdata[3], E)
+            batch = map_dynamic_features(batch, lambda feature: expand_ensemble(feature, E))
 
-            # do preprocessing
-            inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-
-            # flatten the history
-            inp = self.preprocessor.flatten_history(inp)
-            tar = self.preprocessor.flatten_history(tar)
+            self.preprocessor.cache_dynamic_features(batch)
+            inp, tar = batch[INPUT], batch[TARGET]
 
             # assuming float32
             total_data_bytes += inp.nbytes + tar.nbytes
@@ -715,54 +708,52 @@ class EnsembleTrainer(Trainer):
                         torch.cuda.nvtx.range_push(f"eval step {eval_steps}")
                     self.step_timer.begin_step()
 
-                    # map to gpu; materialize to list so we can expand zenith features
-                    gdata = list(legacy_batch_to_device(data, self.device))
+                    # map to gpu
+                    batch = batch_to_device(data, self.device)
 
                     # When local_ensemble_size > 1, fold the ensemble dim into the batch dim
-                    # for a single forward pass per rollout step. The zenith features (xz, yz)
-                    # must be expanded so they line up with the folded-batch input; the target
-                    # (y) stays at the original batch — the loss expects (B, E, ...) pred against
+                    # for a single forward pass per rollout step. The dynamic features must be
+                    # expanded so they line up with the folded-batch input; the target stays
+                    # at the original batch — the loss expects (B, E, ...) pred against
                     # (B, ...) target.
                     E = self.params.local_ensemble_size
-                    if len(gdata) == 4:
-                        gdata[2] = expand_ensemble(gdata[2], E)
-                        gdata[3] = expand_ensemble(gdata[3], E)
+                    batch = map_dynamic_features(batch, lambda feature: expand_ensemble(feature, E))
 
-                    # preprocess
-                    inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-                    inp = self.preprocessor.flatten_history(inp)
+                    self.preprocessor.cache_dynamic_features(batch)
+                    inp, tar = batch[INPUT], batch[TARGET]
 
                     B = inp.shape[0]
 
                     # expand the input batch to (B*E, ...) for the folded-batch forward
                     inp = expand_ensemble(inp, E)
 
-                    # split list of targets (stays at batch B)
-                    tarlist = torch.split(tar, 1, dim=1)
+                    # the losses and metrics take the channels of a single step
+                    flatten = self.preprocessor.flatten_history
 
                     # draw a fresh stationary noise state at the folded batch for this episode
                     self.preprocessor.update_internal_state(replace_state=True, batch_size=inp.shape[0])
 
                     # loop over lead times
-                    for idt, targ in enumerate(tarlist):
+                    num_lead_times = tar.shape[1]
+                    for idt in range(num_lead_times):
 
-                        # flatten history of the target
-                        targ = self.preprocessor.flatten_history(targ)
+                        targ = flatten(tar[:, idt : idt + 1])
 
                         with self.autocast():
                             # single forward on the folded batch: at idt==0 the noise state was
                             # just drawn fresh, so skip the stepper's internal update; for
                             # subsequent steps run the standard AR update.
-                            pred_flat = self.model_eval(
+                            pred_folded = self.model_eval(
                                 inp,
                                 update_state=(idt != 0),
                                 replace_state=False,
                             )
 
-                            # advance the input history / unpredicted features once per step
-                            inp = self.preprocessor.append_history(inp, pred_flat, idt, update_state=True)
+                            # advance the input history / dynamic features once per step
+                            inp = self.preprocessor.append_history(inp, pred_folded, idt, update_state=True)
 
                             # reshape back to (B, E, ...) for the loss
+                            pred_flat = flatten(pred_folded)
                             pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
 
                             loss = self.loss_obj(pred, targ, None)
@@ -779,7 +770,7 @@ class EnsembleTrainer(Trainer):
                             pred_gather = self.metrics._gather_input(pred_gather)
                             targ_gather = self.metrics._gather_input(targ_gather)
 
-                            self._visualize_step(pred_gather, targ_gather, eval_steps, idt, len(tarlist))
+                            self._visualize_step(pred_gather, targ_gather, eval_steps, idt, num_lead_times)
 
                         # update metrics
                         self.metrics.update(pred, targ, loss, idt)

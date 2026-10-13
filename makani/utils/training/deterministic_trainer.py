@@ -35,7 +35,7 @@ from makani.utils import LossHandler, MetricsHandler
 from makani.utils.driver import Driver
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
-from makani.utils.dataloaders.batch import legacy_batch_to_device
+from makani.utils.dataloaders.batch import batch_to_device, INPUT, TARGET
 from makani.utils.YParams import YParams
 
 # model registry
@@ -221,12 +221,9 @@ class Trainer(Driver):
         # get sample and map to gpu
         iterator = iter(self.train_dataloader)
         data = next(iterator)
-        gdata = legacy_batch_to_device(data, self.device)
-        # extract unpredicted features
-        inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-        # flatten
-        inp = self.preprocessor.flatten_history(inp)
-        tar = self.preprocessor.flatten_history(tar)
+        batch = batch_to_device(data, self.device)
+        self.preprocessor.cache_dynamic_features(batch)
+        inp, tar = batch[INPUT], batch[TARGET]
         # get shapes
         inp_shape = inp.shape
         tar_shape = tar.shape
@@ -337,6 +334,11 @@ class Trainer(Driver):
             self.model_eval = self.model
 
         return
+
+    def _loss(self, pred, tar, inp):
+        # the losses take the time steps folded into the channels
+        flatten = self.preprocessor.flatten_history
+        return self.loss_obj(flatten(pred), flatten(tar), inp=flatten(inp))
 
     def _set_train(self):
         self.model.train()
@@ -532,14 +534,9 @@ class Trainer(Driver):
             self.step_timer.begin_step()
 
             # map to device
-            gdata = legacy_batch_to_device(data, self.device)
-
-            # do preprocessing
-            inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-
-            # flatten the history
-            inp = self.preprocessor.flatten_history(inp)
-            tar = self.preprocessor.flatten_history(tar)
+            batch = batch_to_device(data, self.device)
+            self.preprocessor.cache_dynamic_features(batch)
+            inp, tar = batch[INPUT], batch[TARGET]
 
             # assuming float32
             total_data_bytes += inp.nbytes + tar.nbytes
@@ -554,12 +551,12 @@ class Trainer(Driver):
                 if do_update:
                     # regular forward pass including DDP
                     pred = self.model_train(inp)
-                    loss = self.loss_obj(pred, tar, inp=inp)
+                    loss = self._loss(pred, tar, inp)
                 else:
                     # disable sync step
                     with self.model_train.no_sync():
                         pred = self.model_train(inp)
-                        loss = self.loss_obj(pred, tar, inp=inp)
+                        loss = self._loss(pred, tar, inp)
                 loss = loss * loss_scaling_fact
 
             # stop on a non-finite loss before it reaches the weights, on all ranks together
@@ -691,25 +688,21 @@ class Trainer(Driver):
                     self.step_timer.begin_step()
 
                     # map to gpu
-                    gdata = legacy_batch_to_device(data, self.device)
+                    batch = batch_to_device(data, self.device)
+                    self.preprocessor.cache_dynamic_features(batch)
+                    inp, tar = batch[INPUT], batch[TARGET]
 
-                    # preprocess
-                    inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-                    inp = self.preprocessor.flatten_history(inp)
-
-                    # split list of targets
-                    tarlist = torch.split(tar, 1, dim=1)
-
-                    # do autoregression
+                    # do autoregression, one target step at a time
                     inpt = inp
-                    for idt, targ in enumerate(tarlist):
-
-                        # flatten history of the target
-                        targ = self.preprocessor.flatten_history(targ)
+                    for idt in range(tar.shape[1]):
 
                         # FW pass
                         with self.autocast():
-                            pred = self.model_eval(inpt)
+                            pred_step = self.model_eval(inpt)
+
+                            # the losses and metrics take the channels of a single step
+                            pred = self.preprocessor.flatten_history(pred_step)
+                            targ = self.preprocessor.flatten_history(tar[:, idt : idt + 1])
                             loss = self.loss_obj(pred, targ)
 
                             # TODO: move all of this into the visualization handler
@@ -731,7 +724,7 @@ class Trainer(Driver):
                         self.metrics.update(pred, targ, loss, idt)
 
                         # append history
-                        inpt = self.preprocessor.append_history(inpt, pred, idt)
+                        inpt = self.preprocessor.append_history(inpt, pred_step, idt)
 
                     self.step_timer.end_step()
                     if torch.cuda.is_available():
