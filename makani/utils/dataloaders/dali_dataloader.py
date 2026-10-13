@@ -47,9 +47,23 @@ from makani.utils.dataloaders.data_helpers import parse_data_normalization_mode
 # es helper
 from makani.utils.dataloaders.data_helpers import get_data_normalization
 from makani.utils.dataloaders.data_shapes import DataShapes
-from makani.utils.dataloaders.batch import make_batch
+from makani.utils.dataloaders.batch import (
+    make_batch,
+    INPUT,
+    TARGET,
+    INPUT_DYNAMIC_FEATURES,
+    TARGET_DYNAMIC_FEATURES,
+    INPUT_TIMESTAMP,
+    TARGET_TIMESTAMP,
+    ZENITH,
+)
 from makani.utils.dataloaders.sample_source import SampleSource
 from makani.utils.grids import GridConverter
+
+# DALI names its outputs with flat strings: the batch keys where the batch is flat, and
+# "<side>/<feature>" for the dynamic features, which the batch nests
+_INPUT_ZENITH = f"{INPUT_DYNAMIC_FEATURES}/{ZENITH}"
+_TARGET_ZENITH = f"{TARGET_DYNAMIC_FEATURES}/{ZENITH}"
 
 
 # bump whenever the layout of the dict returned by DaliDataloader.state_dict changes
@@ -355,11 +369,11 @@ class DaliDataloader(object):
         self.pipeline = self.get_pipeline(checkpoint=checkpoint)
         self.pipeline.start_py_workers()
 
-        # create iterator
-        outnames = ["inp", "tar"]
+        # create iterator; the names follow the order of the pipeline outputs
+        outnames = [INPUT, TARGET]
         if self.add_zenith:
-            outnames += ["izen", "tzen"]
-        outnames += ["itime", "ttime"]
+            outnames += [_INPUT_ZENITH, _TARGET_ZENITH]
+        outnames += [INPUT_TIMESTAMP, TARGET_TIMESTAMP]
 
         self.iterator = DALIGenericIterator(
             [self.pipeline],
@@ -503,16 +517,16 @@ class DaliDataloader(object):
 
             # the grid is converted after DALI, which has no op for it
             with torch.no_grad():
-                inp = self.grid_converter(outputs["inp"])
-                tar = self.grid_converter(outputs["tar"])
-                inp_zenith = self.grid_converter(outputs["izen"]) if self.add_zenith else None
-                tar_zenith = self.grid_converter(outputs["tzen"]) if self.add_zenith else None
+                inp = self.grid_converter(outputs[INPUT])
+                tar = self.grid_converter(outputs[TARGET])
+                inp_zenith = self.grid_converter(outputs[_INPUT_ZENITH]) if self.add_zenith else None
+                tar_zenith = self.grid_converter(outputs[_TARGET_ZENITH]) if self.add_zenith else None
 
             yield make_batch(
                 inp=inp,
-                inp_timestamp=outputs["itime"],
+                inp_timestamp=outputs[INPUT_TIMESTAMP],
                 tar=tar,
-                tar_timestamp=outputs["ttime"],
+                tar_timestamp=outputs[TARGET_TIMESTAMP],
                 inp_zenith=inp_zenith,
                 tar_zenith=tar_zenith,
             )
