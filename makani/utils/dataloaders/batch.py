@@ -36,6 +36,12 @@ key                         content                                     shape
 batch, time and channel dimensions always lead, the grid always trails, and
 the grid itself is described by the loader's ``DataShapes``, not by the shape.
 
+``grid`` is always this rank's part of the grid, after cropping, spatial
+sharding and subsampling: ``(H_local, W_local)``, or the local points of a mesh
+including the halo. Every tensor of a batch covers the same part, the zenith
+angle included. Where that part sits in the global grid is described by
+``DataShapes`` as well.
+
 Every key is present, except that a loader built without targets, as for
 inference, omits the three target keys. The dynamic features are a dict even
 when empty. ``static_features`` (``(C_static, *grid)``) is reserved: the static
