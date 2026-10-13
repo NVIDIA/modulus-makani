@@ -484,6 +484,13 @@ class TestParseDataNormalizationMode(unittest.TestCase):
         # the B used to be left in the axis names, which DALI does not know
         self.assertEqual(parse_data_normalization_mode("offline-FHWB"), ("offline", "FHW", True))
 
+    def test_unknown_mode_is_rejected(self):
+        # anything but offline would otherwise be treated as online normalization
+        for mode in ["offine", "offine-FHW", ""]:
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError):
+                    parse_data_normalization_mode(mode)
+
 
 if __name__ == "__main__":
     unittest.main()

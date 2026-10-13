@@ -254,12 +254,20 @@ def parse_data_normalization_mode(mode=None):
     norm_channels : str
         The axis names without ``B``, ``"FHW"`` by default.
     norm_batch : bool
+
+    Raises
+    ------
+    ValueError
+        If ``<mode>`` is neither ``offline`` nor ``online``. The loader treats every mode other
+        than ``offline`` as online, so a typo would otherwise silently drop the saved statistics.
     """
     if mode is None:
         return "offline", "FHW", False
 
     split = mode.split("-")
     norm_mode = split[0]
+    if norm_mode not in ("offline", "online"):
+        raise ValueError(f"Unsupported data_normalization_mode {mode!r}, expected offline or online")
     norm_channels = "FHW"
     norm_batch = False
     if len(split) > 1:
