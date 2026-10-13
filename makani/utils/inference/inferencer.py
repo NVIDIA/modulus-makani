@@ -29,6 +29,7 @@ from makani.utils import LossHandler, MetricsHandler
 from makani.utils.functions import expand_ensemble
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_loader_multifiles import MultifilesDataset
+from makani.utils.dataloaders.batch import batch_to_device, INPUT, INPUT_DYNAMIC_FEATURES, INPUT_TIMESTAMP, ZENITH
 from makani.utils.dataloaders.data_helpers import get_date_from_timestamp, get_data_normalization, get_climatology
 from makani.utils.YParams import YParams
 
@@ -138,7 +139,6 @@ class Inferencer(Driver):
                 model_grid_type=params.get("model_grid_type", "equiangular"),
                 crop_size=(params.get("crop_size_x", None), params.get("crop_size_y", None)),
                 crop_anchor=(params.get("crop_anchor_x", 0), params.get("crop_anchor_y", 0)),
-                return_timestamp=False,
                 relative_timestamp=True,
                 return_target=False,
                 dataset_name="fields",
@@ -178,7 +178,6 @@ class Inferencer(Driver):
                 scale=scale,  # we need to set that to make sure the climatology is properly scaled
                 crop_size=(params.get("crop_size_x", None), params.get("crop_size_y", None)),
                 crop_anchor=(params.get("crop_anchor_x", 0), params.get("crop_anchor_y", 0)),
-                return_timestamp=False,
                 relative_timestamp=True,
                 return_target=False,
                 dataset_name="fields",
@@ -623,13 +622,17 @@ class Inferencer(Driver):
                         torch.cuda.nvtx.range_push(f"inference step {idt}, rollout step {idte}")
                     self.step_timer.begin_step()
 
-                    # move input to GPU
-                    gtoken = list(map(lambda x: x.to(self.device), token))
+                    # move input to GPU; the loader runs without targets, so every step is
+                    # read as an input: the initial condition first, then the verification
+                    gbatch = batch_to_device(token, self.device)
+                    gfield = gbatch[INPUT]
+                    gzenith = gbatch[INPUT_DYNAMIC_FEATURES].get(ZENITH, None)
+                    gtime = gbatch[INPUT_TIMESTAMP]
 
                     # get mask
                     if self.mask_dataset is not None:
                         # we need target mask
-                        (masks,) = next(mask_iterator)
+                        masks = next(mask_iterator)[INPUT]
                         # send to device and remove time dim
                         masks = masks.to(self.device).squeeze(1)
 
@@ -642,7 +645,7 @@ class Inferencer(Driver):
                     # get climatology
                     if self.climatology_dataset is not None:
                         # we need the target clims
-                        (clims,) = next(climatology_iterator)
+                        clims = next(climatology_iterator)[INPUT]
                         # send to device and remove time dim
                         clims = clims.to(self.device).squeeze(1)
                     else:
@@ -653,11 +656,7 @@ class Inferencer(Driver):
                         # The ensemble dim is folded into the batch dim for the whole rollout
                         # (shape (B*E, ...) going into the model). Noise state is reset once
                         # here and then evolves via AR updates during the rollout.
-                        if self.params.add_zenith:
-                            inp_raw, inpz_raw, tinp = gtoken
-                        else:
-                            inp_raw, tinp = gtoken
-                            inpz_raw = None
+                        inp_raw, inpz_raw, tinp = gfield, gzenith, gtime
 
                         dates = date_fn(tinp.flatten().detach().cpu()).tolist()
                         datestring = ", ".join([d.strftime("%Y-%m-%dT%H:%M:%S") for d in dates])
@@ -679,11 +678,7 @@ class Inferencer(Driver):
 
                     else:
                         # rollout step
-                        if self.params.add_zenith:
-                            tar, tarz_raw, ttar = gtoken
-                        else:
-                            tar, ttar = gtoken
-                            tarz_raw = None
+                        tar, tarz_raw, ttar = gfield, gzenith, gtime
                         targ = self.preprocessor.flatten_history(tar)
 
                         # expand target-side zenith to the folded batch for caching

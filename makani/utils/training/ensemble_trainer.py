@@ -37,6 +37,7 @@ from makani.utils.driver import Driver
 from makani.utils.training import Trainer
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
+from makani.utils.dataloaders.batch import legacy_batch_to_device
 from makani.utils.YParams import YParams
 
 # model registry
@@ -218,7 +219,7 @@ class EnsembleTrainer(Trainer):
         # get sample and map to gpu
         iterator = iter(self.train_dataloader)
         data = next(iterator)
-        gdata = map(lambda x: x.to(self.device), data)
+        gdata = legacy_batch_to_device(data, self.device)
         # extract unpredicted features
         inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
         # flatten
@@ -545,7 +546,7 @@ class EnsembleTrainer(Trainer):
             self.step_timer.begin_step()
 
             # map to device; materialize to list so we can expand zenith features
-            gdata = [x.to(self.device) for x in data]
+            gdata = list(legacy_batch_to_device(data, self.device))
 
             # When training with local_ensemble_size > 1 we fold the ensemble dim into the
             # batch dim for a single forward pass. The cached unpredicted features (xz, yz)
@@ -715,7 +716,7 @@ class EnsembleTrainer(Trainer):
                     self.step_timer.begin_step()
 
                     # map to gpu; materialize to list so we can expand zenith features
-                    gdata = [x.to(self.device) for x in data]
+                    gdata = list(legacy_batch_to_device(data, self.device))
 
                     # When local_ensemble_size > 1, fold the ensemble dim into the batch dim
                     # for a single forward pass per rollout step. The zenith features (xz, yz)

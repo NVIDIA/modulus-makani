@@ -31,6 +31,15 @@ import h5py as h5
 import zarr
 
 from makani.utils.dataloader import get_dataloader
+from makani.utils.dataloaders.batch import (
+    INPUT,
+    TARGET,
+    INPUT_DYNAMIC_FEATURES,
+    TARGET_DYNAMIC_FEATURES,
+    INPUT_TIMESTAMP,
+    TARGET_TIMESTAMP,
+    ZENITH,
+)
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from .testutils import (
@@ -43,6 +52,9 @@ from .testutils import (
     compare_arrays,
 )
 from .testutils import H5_PATH, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W, CHANNEL_NAMES
+
+_TRAINING_KEYS = {INPUT, TARGET, INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES, INPUT_TIMESTAMP, TARGET_TIMESTAMP}
+_INFERENCE_KEYS = {INPUT, INPUT_DYNAMIC_FEATURES, INPUT_TIMESTAMP}
 
 _multifiles_params = [True]
 _have_dali = importlib.util.find_spec("nvidia.dali") is not None
@@ -168,6 +180,12 @@ class DataLoaderBase:
             self.addCleanup(loader.close)
         return loader, dataset, sampler
 
+    def _assert_plain_batch(self, batch):
+        """A batch with a target and nothing optional, such as the zenith angle."""
+        self.assertEqual(set(batch), _TRAINING_KEYS)
+        self.assertEqual(batch[INPUT_DYNAMIC_FEATURES], {})
+        self.assertEqual(batch[TARGET_DYNAMIC_FEATURES], {})
+
     def _get_sample(self, path, idx):
         raise NotImplementedError
 
@@ -208,8 +226,8 @@ class DataLoaderBase:
         # do tests
         num_valid_steps = self.params.num_valid // self.params.batch_size
         for idt, token in enumerate(valid_loader):
-            self.assertEqual(len(token), 2)
-            inp, tar = token
+            self._assert_plain_batch(token)
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
             self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
@@ -229,7 +247,7 @@ class DataLoaderBase:
         # do tests
         for idt, token in enumerate(valid_loader):
             # get loader samples
-            inp, tar = token
+            inp, tar = token[INPUT], token[TARGET]
 
             # get test samples
             off = self.params.batch_size * idt
@@ -285,7 +303,7 @@ class DataLoaderBase:
             stds_b = stds.astype(np.float32)
 
             for idt, token in enumerate(valid_loader):
-                inp, tar = token
+                inp, tar = token[INPUT], token[TARGET]
 
                 off = params.batch_size * idt
                 inp_raw = np.stack(
@@ -333,8 +351,8 @@ class DataLoaderBase:
         )
 
         for idt, (token, token_flip) in enumerate(zip(valid_loader, valid_loader_flip)):
-            inp, tar = token
-            inp_flip, tar_flip = token_flip
+            inp, tar = token[INPUT], token[TARGET]
+            inp_flip, tar_flip = token_flip[INPUT], token_flip[TARGET]
 
             self.assertFalse(compare_tensors("inp vs flipped inp", inp, inp_flip))
             inp_flip_flip = torch.flip(inp_flip, dims=(2,))
@@ -359,8 +377,8 @@ class DataLoaderBase:
 
         # do tests
         for idt, token in enumerate(valid_loader):
-            self.assertEqual(len(token), 2)
-            inp, tar = token
+            self._assert_plain_batch(token)
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(
                 tuple(inp.shape),
@@ -386,8 +404,8 @@ class DataLoaderBase:
 
         # do tests
         for idt, token in enumerate(train_loader):
-            self.assertEqual(len(token), 2)
-            inp, tar = token
+            self._assert_plain_batch(token)
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
             self.assertEqual(
@@ -413,8 +431,8 @@ class DataLoaderBase:
 
         # do tests
         for idt, token in enumerate(valid_loader):
-            self.assertEqual(len(token), 2)
-            inp, tar = token
+            self._assert_plain_batch(token)
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
             self.assertEqual(
@@ -447,7 +465,7 @@ class DataLoaderBase:
         num_steps = 3
         for idt, token in enumerate(valid_loader):
             # get loader samples
-            inp, tar = token
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, range_x, range_y))
             self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, range_x, range_y))
@@ -501,7 +519,7 @@ class DataLoaderBase:
         num_steps = 3
         for idt, token in enumerate(valid_loader):
             # get loader samples
-            inp, tar = token
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(
                 tuple(inp.shape),
@@ -580,7 +598,7 @@ class DataLoaderBase:
 
         fingerprints = []
         for token in loader:
-            inp = token[0]
+            inp = token[INPUT]
             for b in range(inp.shape[0]):
                 fingerprints.append(inp[b].cpu().numpy().tobytes())
 
@@ -649,7 +667,7 @@ class DataLoaderBase:
 
         fps = []
         for token in loader:
-            inp = token[0]
+            inp = token[INPUT]
             for b in range(inp.shape[0]):
                 fps.append(inp[b].cpu().numpy().tobytes())
 
@@ -701,7 +719,7 @@ class DataLoaderBase:
         def _collect_epoch():
             fps = []
             for token in loader:
-                inp = token[0]
+                inp = token[INPUT]
                 for b in range(inp.shape[0]):
                     fps.append(inp[b].cpu().numpy().tobytes())
             return fps
@@ -752,13 +770,13 @@ class DataLoaderBase:
             dali_device=self.dali_device,
         )
 
-        before = next(iter(loader))[0]
+        before = next(iter(loader))[INPUT]
 
         # round-trip the state through the loader, which tears the pipeline down and
         # builds a new one with a fresh worker pool
         self.assertTrue(loader.load_state_dict(loader.state_dict()))
 
-        after = next(iter(loader))[0]
+        after = next(iter(loader))[INPUT]
 
         self.assertEqual(tuple(after.shape), tuple(before.shape))
 
@@ -792,7 +810,7 @@ class DataLoaderBase:
         def _collect(iterator, num_steps):
             fps = []
             for _ in range(num_steps):
-                inp = next(iterator)[0]
+                inp = next(iterator)[INPUT]
                 for b in range(inp.shape[0]):
                     fps.append(inp[b].cpu().numpy().tobytes())
             return fps
@@ -906,14 +924,19 @@ class TestHDF5DataLoader(DataLoaderBase, unittest.TestCase):
         self._test_dali_checkpoint_mid_epoch_resume()
 
     @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
-    def test_dali_training_loader_ignores_return_timestamp_param(self):
-        # timestamps would land where the trainers expect the zenith angle
+    def test_dali_batch_carries_named_timestamps(self):
+        # timestamps used to be positional, and a training loader that returned them put
+        # them where the trainers expect the zenith angle
         self.params.multifiles = False
-        self.params.return_timestamp = True
+        self.params.n_future = 1
         train_loader, _, _ = self._get_dataloader(
             self.params, self.params.train_data_path, mode="train", device=self.device, dali_device=self.dali_device
         )
-        self.assertEqual(len(next(iter(train_loader))), 2)
+        batch = next(iter(train_loader))
+        self._assert_plain_batch(batch)
+        self.assertEqual(tuple(batch[INPUT_TIMESTAMP].shape), (self.params.batch_size, 1))
+        self.assertEqual(tuple(batch[TARGET_TIMESTAMP].shape), (self.params.batch_size, 2))
+        self.assertEqual(batch[INPUT_TIMESTAMP].dtype, torch.float64)
 
     @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
     def test_dali_close_releases_the_pipeline(self):
@@ -1152,7 +1175,8 @@ class TestDummyLoader(unittest.TestCase):
         self.assertEqual(len(loader), 4)
         batches = list(loader)
         self.assertEqual(len(batches), 4)
-        for inp, tar in batches:
+        for batch in batches:
+            inp, tar = batch[INPUT], batch[TARGET]
             self.assertEqual(tuple(inp.shape), (self.batch_size, 1, len(self.in_channels), *self.img_shape))
             self.assertEqual(tuple(tar.shape), (self.batch_size, 1, len(self.out_channels), *self.img_shape))
             self.assertEqual(inp.dtype, torch.float32)
@@ -1160,40 +1184,44 @@ class TestDummyLoader(unittest.TestCase):
 
     def test_history_and_future_dimensions(self):
         loader = self._make_loader(n_history=2, n_future=3)
-        inp, tar = next(iter(loader))
+        batch = next(iter(loader))
+        inp, tar = batch[INPUT], batch[TARGET]
         self.assertEqual(inp.shape[1], 3)  # n_history + 1
         self.assertEqual(tar.shape[1], 4)  # n_future  + 1
 
-    def test_add_zenith_appends_zenith_tensors(self):
+    def test_add_zenith_adds_zenith_features(self):
         loader = self._make_loader(add_zenith=True)
         batch = next(iter(loader))
-        self.assertEqual(len(batch), 4)  # inp, tar, inp_zen, tar_zen
-        _, _, inp_zen, _ = batch
+        self.assertEqual(set(batch[INPUT_DYNAMIC_FEATURES]), {ZENITH})
+        self.assertEqual(set(batch[TARGET_DYNAMIC_FEATURES]), {ZENITH})
+        inp_zen = batch[INPUT_DYNAMIC_FEATURES][ZENITH]
         self.assertEqual(tuple(inp_zen.shape), (self.batch_size, 1, 1, *self.img_shape))
 
     def test_target_zenith_spans_the_target_window(self):
         # the target zenith used to be the input zenith tensor, n_history+1 steps long
         loader = self._make_loader(add_zenith=True, n_history=1, n_future=2)
-        _, _, inp_zen, tar_zen = next(iter(loader))
+        batch = next(iter(loader))
+        inp_zen = batch[INPUT_DYNAMIC_FEATURES][ZENITH]
+        tar_zen = batch[TARGET_DYNAMIC_FEATURES][ZENITH]
         self.assertEqual(tuple(inp_zen.shape), (self.batch_size, 2, 1, *self.img_shape))
         self.assertEqual(tuple(tar_zen.shape), (self.batch_size, 3, 1, *self.img_shape))
 
-    def test_return_timestamp_appends_time_tensors(self):
-        loader = self._make_loader(return_timestamp=True)
+    def test_batch_carries_timestamps(self):
+        loader = self._make_loader()
         batch = next(iter(loader))
-        self.assertEqual(len(batch), 4)  # inp, tar, inp_time, tar_time
-        _, _, inp_time, _ = batch
+        self.assertEqual(set(batch), _TRAINING_KEYS)
+        inp_time = batch[INPUT_TIMESTAMP]
         self.assertEqual(tuple(inp_time.shape), (self.batch_size, 1))
         self.assertEqual(inp_time.dtype, torch.float64)
 
     def test_return_target_false_yields_input_only(self):
         loader = self._make_loader(return_target=False)
         batch = next(iter(loader))
-        self.assertEqual(len(batch), 1)  # inp only
+        self.assertEqual(set(batch), _INFERENCE_KEYS)
 
     def test_subsampling_factor_reduces_spatial_shape(self):
         loader = self._make_loader(subsampling_factor=2)
-        inp, _ = next(iter(loader))
+        inp = next(iter(loader))[INPUT]
         self.assertEqual(tuple(inp.shape[-2:]), (self.img_shape[0] // 2, self.img_shape[1] // 2))
 
     def test_normalization_helpers_return_neutral_stats(self):
@@ -1272,7 +1300,8 @@ class TestMultifilesDataset(unittest.TestCase):
         """
         dataset = self._make(location=self.distinct_path, in_channels=[0, 1], out_channels=[3, 4], n_future=0)
 
-        inp, tar = dataset[0]
+        sample = dataset[0]
+        inp, tar = sample[INPUT], sample[TARGET]
 
         # channel c holds c + 1
         for name, values, constant in (
@@ -1290,7 +1319,8 @@ class TestMultifilesDataset(unittest.TestCase):
         # on the target side as well
         dataset = self._make(location=self.distinct_path, in_channels=[1, 0], out_channels=[4, 2])
 
-        inp, tar = dataset[0]
+        sample = dataset[0]
+        inp, tar = sample[INPUT], sample[TARGET]
 
         for name, values, constant in (
             ("inp c0", inp[:, 0], 2.0),
@@ -1309,9 +1339,9 @@ class TestMultifilesDataset(unittest.TestCase):
         Slicing adjacent ones instead gives times that drift from the data as
         soon as dt > 1, which reaches the model through the zenith angle.
         """
-        dataset = self._make(dt=2, n_history=1, return_timestamp=True, add_zenith=False)
+        dataset = self._make(dt=2, n_history=1, add_zenith=False)
 
-        _, _, inp_time, _ = dataset[0]
+        inp_time = dataset[0][INPUT_TIMESTAMP]
 
         dhours = dataset.dhours
         self.assertEqual(float(inp_time[1] - inp_time[0]), 2 * dhours * 3600.0)
@@ -1319,17 +1349,17 @@ class TestMultifilesDataset(unittest.TestCase):
     def test_timestamps_match_the_samples_they_came_from(self):
         # the stronger statement: the returned times are the dataset's own
         # times at the indices the data was read from
-        dataset = self._make(dt=3, n_history=1, return_timestamp=True, add_zenith=False)
+        dataset = self._make(dt=3, n_history=1, add_zenith=False)
 
-        _, _, inp_time, _ = dataset[5]
+        inp_time = dataset[5][INPUT_TIMESTAMP]
 
         expected = np.asarray([dataset.timestamps[5], dataset.timestamps[5 + 3]])
         self.assertTrue(compare_arrays("input timestamps", inp_time.numpy(), expected))
 
     def test_target_times_stride_by_dt(self):
-        dataset = self._make(dt=2, n_future=1, return_timestamp=True, add_zenith=False)
+        dataset = self._make(dt=2, n_future=1, add_zenith=False)
 
-        _, _, _, tar_time = dataset[0]
+        tar_time = dataset[0][TARGET_TIMESTAMP]
 
         self.assertEqual(float(tar_time[1] - tar_time[0]), 2 * dataset.dhours * 3600.0)
 
@@ -1344,9 +1374,10 @@ class TestMultifilesDataset(unittest.TestCase):
         revived = pickle.loads(pickle.dumps(dataset))
         after = revived[3]
 
-        for position, (original, restored) in enumerate(zip(before, after)):
-            with self.subTest(output=position):
-                self.assertTrue(compare_tensors(f"unpickled output {position}", restored, original))
+        self.assertEqual(set(after), set(before))
+        for key in (INPUT, TARGET, INPUT_TIMESTAMP, TARGET_TIMESTAMP):
+            with self.subTest(output=key):
+                self.assertTrue(compare_tensors(f"unpickled {key}", after[key], before[key]))
 
     def test_reports_the_grid_the_files_carry(self):
         # the fixture writes its coordinates, so they should be what comes back
@@ -1404,7 +1435,7 @@ class TestMultifilesWb2(unittest.TestCase):
     def test_reads_the_same_values_as_the_store(self):
         dataset = self._make()
 
-        inp, _ = dataset[2]
+        inp = dataset[2][INPUT]
         expected = get_wb2_zarr_sample(self.train_path, 2)
 
         self.assertTrue(compare_arrays("wb2 through multifiles", inp[0].numpy(), expected, rtol=1e-5, atol=1e-6))

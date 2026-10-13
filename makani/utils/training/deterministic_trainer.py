@@ -35,6 +35,7 @@ from makani.utils import LossHandler, MetricsHandler
 from makani.utils.driver import Driver
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
+from makani.utils.dataloaders.batch import legacy_batch_to_device
 from makani.utils.YParams import YParams
 
 # model registry
@@ -220,7 +221,7 @@ class Trainer(Driver):
         # get sample and map to gpu
         iterator = iter(self.train_dataloader)
         data = next(iterator)
-        gdata = map(lambda x: x.to(self.device), data)
+        gdata = legacy_batch_to_device(data, self.device)
         # extract unpredicted features
         inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
         # flatten
@@ -531,7 +532,7 @@ class Trainer(Driver):
             self.step_timer.begin_step()
 
             # map to device
-            gdata = map(lambda x: x.to(self.device), data)
+            gdata = legacy_batch_to_device(data, self.device)
 
             # do preprocessing
             inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
@@ -690,7 +691,7 @@ class Trainer(Driver):
                     self.step_timer.begin_step()
 
                     # map to gpu
-                    gdata = map(lambda x: x.to(self.device), data)
+                    gdata = legacy_batch_to_device(data, self.device)
 
                     # preprocess
                     inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)

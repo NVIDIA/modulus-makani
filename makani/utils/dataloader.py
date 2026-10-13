@@ -108,7 +108,6 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
             crop_anchor=(params.get("crop_anchor_x", 0), params.get("crop_anchor_y", 0)),
             subsampling_factor=params.get("subsampling_factor", 1),
             grid_type=params.data_grid_type,
-            return_timestamp=(True if (mode == "inference") else False),
             return_target=(False if (mode == "inference") else True),
             dataset_name=params.get("h5_path", "fields"),
             timestamp_name=params.get("timestamp_name", "timestamp"),
@@ -198,7 +197,6 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
             crop_anchor=(params.get("crop_anchor_x", 0), params.get("crop_anchor_y", 0)),
             subsampling_factor=params.get("subsampling_factor", 1),
             grid_type=params.data_grid_type,
-            return_timestamp=(True if (mode == "inference") else False),
             return_target=(False if (mode == "inference") else True),
             io_grid=params.get("io_grid", [1, 1, 1]),
             io_rank=params.get("io_rank", [0, 0, 0]),
@@ -224,13 +222,7 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
         # dali loader
         if dali_device is None:
             dali_device = "gpu" if torch.cuda.is_available() else "cpu"
-        dataloader = DaliDataloader(
-            params,
-            files_pattern,
-            (mode == "train"),
-            dali_device=dali_device,
-            return_timestamp=(True if (mode == "inference") else False),
-        )
+        dataloader = DaliDataloader(params, files_pattern, (mode == "train"), dali_device=dali_device)
 
         data_shapes = dataloader.data_shapes
 

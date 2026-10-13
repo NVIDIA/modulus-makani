@@ -47,6 +47,7 @@ from makani.utils.dataloaders.data_helpers import parse_data_normalization_mode
 # es helper
 from makani.utils.dataloaders.data_helpers import get_data_normalization
 from makani.utils.dataloaders.data_shapes import DataShapes
+from makani.utils.dataloaders.batch import make_batch
 from makani.utils.dataloaders.sample_source import SampleSource
 from makani.utils.grids import GridConverter
 
@@ -110,9 +111,8 @@ class DaliDataloader(object):
                 tzen = data[3]
                 off += 2
 
-            if self.return_timestamp:
-                itime = data[0 + off]
-                ttime = data[1 + off]
+            itime = data[0 + off]
+            ttime = data[1 + off]
 
             # upload to GPU
             if self.dali_device == "gpu":
@@ -148,14 +148,13 @@ class DaliDataloader(object):
             if self.add_zenith:
                 pout = pout + (izen, tzen)
 
-            if self.return_timestamp:
-                pout = pout + (itime, ttime)
+            pout = pout + (itime, ttime)
 
             pipeline.set_outputs(*pout)
 
         return pipeline
 
-    def __init__(self, params, location, train, seed=333, dali_device="gpu", return_timestamp=False):
+    def __init__(self, params, location, train, seed=333, dali_device="gpu"):
         # set up workers and devices
         self.num_data_workers = params.num_data_workers
         # The parallel external_source path requires py_num_workers >= 1 and uses
@@ -203,8 +202,6 @@ class DaliDataloader(object):
         self.out_channels = params.out_channels
         self.subsampling_factor = params.get("subsampling_factor", 1)
         self.add_zenith = params.get("add_zenith", False)
-        # set by the caller like for the other loaders; the trainers have no use for timestamps
-        self.return_timestamp = return_timestamp
         if hasattr(params, "lat") and hasattr(params, "lon"):
             self.lat_lon = (params.lat, params.lon)
         else:
@@ -261,7 +258,8 @@ class DaliDataloader(object):
             device_id=self.device_index,
             truncate_old=True,
             zenith_angle=self.add_zenith,
-            return_timestamp=self.return_timestamp,
+            # every batch carries its timestamps
+            return_timestamp=True,
             lat_lon=self.lat_lon,
             dataset_name=self.dataset_name,
             timestamp_name=params.get("timestamp_name", "timestamp"),
@@ -361,8 +359,7 @@ class DaliDataloader(object):
         outnames = ["inp", "tar"]
         if self.add_zenith:
             outnames += ["izen", "tzen"]
-        if self.return_timestamp:
-            outnames += ["itime", "ttime"]
+        outnames += ["itime", "ttime"]
 
         self.iterator = DALIGenericIterator(
             [self.pipeline],
@@ -501,26 +498,21 @@ class DaliDataloader(object):
         return self.num_steps_per_epoch
 
     def __iter__(self):
-        # self.iterator.reset()
         for token in self.iterator:
-            inp = token[0]["inp"]
-            tar = token[0]["tar"]
+            outputs = token[0]
 
-            # construct result
-            result = (inp, tar)
-
-            if self.add_zenith:
-                izen = token[0]["izen"]
-                tzen = token[0]["tzen"]
-                result = result + (izen, tzen)
-
-            # convert grid
+            # the grid is converted after DALI, which has no op for it
             with torch.no_grad():
-                result = tuple(map(lambda x: self.grid_converter(x), result))
+                inp = self.grid_converter(outputs["inp"])
+                tar = self.grid_converter(outputs["tar"])
+                inp_zenith = self.grid_converter(outputs["izen"]) if self.add_zenith else None
+                tar_zenith = self.grid_converter(outputs["tzen"]) if self.add_zenith else None
 
-            if self.return_timestamp:
-                itime = token[0]["itime"]
-                ttime = token[0]["ttime"]
-                result = result + (itime, ttime)
-
-            yield result
+            yield make_batch(
+                inp=inp,
+                inp_timestamp=outputs["itime"],
+                tar=tar,
+                tar_timestamp=outputs["ttime"],
+                inp_zenith=inp_zenith,
+                tar_zenith=tar_zenith,
+            )

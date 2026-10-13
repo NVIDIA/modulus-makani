@@ -48,6 +48,7 @@ from makani.utils.dataloaders.data_helpers import (
 # storage backends
 from makani.utils.dataloaders.backends import get_backend
 from makani.utils.dataloaders.data_shapes import DataShapes
+from makani.utils.dataloaders.batch import make_batch
 
 # for grid conversion
 from makani.utils.grid_types import DEFAULT_GRID_TYPE
@@ -68,7 +69,6 @@ class MultifilesDataset(Dataset):
         model_grid_type: Optional[str] = "equiangular",
         bias: Optional[np.array] = None,
         scale: Optional[np.array] = None,
-        return_timestamp: Optional[bool] = False,
         relative_timestamp: Optional[bool] = False,
         return_target: Optional[bool] = True,
         dataset_name: Optional[str] = "fields",
@@ -99,7 +99,6 @@ class MultifilesDataset(Dataset):
         self.n_in_channels = len(self.in_channels)
         self.n_out_channels = len(self.out_channels)
         self.add_zenith = add_zenith
-        self.return_timestamp = return_timestamp
         self.relative_timestamp = relative_timestamp
         self.return_target = return_target
         self.dataset_name = dataset_name
@@ -205,7 +204,7 @@ class MultifilesDataset(Dataset):
         self.n_samples_file = metadata.samples_per_file
 
         # the backend reports times as datetimes (or timedeltas), which is what
-        # the by-time lookups compare against; the sample tuple carries the same
+        # the by-time lookups compare against; a sample carries the same
         # times as float seconds, which is what a tensor can hold
         self.datestamps = metadata.timestamps
         self.timestamps = get_seconds_from_times(self.datestamps)
@@ -358,44 +357,32 @@ class MultifilesDataset(Dataset):
         return self.n_samples_total - self.dt * (self.n_history + self.n_future + toff)
 
     def get_sample_at_index(self, global_idx, return_target=True):
+        """The sample starting at ``global_idx``, as a dict, see :mod:`makani.utils.dataloaders.batch`."""
 
-        # load the input
+        def as_field(arr):
+            return self.grid_converter(torch.as_tensor(arr, dtype=torch.float32))
+
+        def as_time(arr):
+            return torch.as_tensor(arr, dtype=torch.float64)
+
         inp = self._get_data(global_idx, 0, self.n_history + 1, target=False)
+        inp_time = self._compute_timestamps(global_idx, 0, self.n_history + 1)
+        inp_zen = self._compute_zenith_angle(inp_time) if self.add_zenith else None
 
-        # load the target
+        tar = tar_time = tar_zen = None
         if return_target:
             tar = self._get_data(global_idx, self.n_history + 1, self.n_history + self.n_future + 2, target=True)
+            tar_time = self._compute_timestamps(global_idx, self.n_history + 1, self.n_history + self.n_future + 2)
+            tar_zen = self._compute_zenith_angle(tar_time) if self.add_zenith else None
 
-        # compute time stamps
-        if self.add_zenith or self.return_timestamp:
-            inp_time = self._compute_timestamps(global_idx, 0, self.n_history + 1)
-
-            if return_target:
-                tar_time = self._compute_timestamps(global_idx, self.n_history + 1, self.n_history + self.n_future + 2)
-
-        # construct result tuple
-        result = (inp,)
-        if return_target:
-            result += (tar,)
-
-        if self.add_zenith:
-            zen_inp = self._compute_zenith_angle(inp_time)
-            result += (zen_inp,)
-            if return_target:
-                zen_tar = self._compute_zenith_angle(tar_time)
-                result += (zen_tar,)
-
-        # convert to tensor and convert grid
-        result = tuple(torch.as_tensor(arr, dtype=torch.float32) for arr in result)
-        result = tuple(map(lambda x: self.grid_converter(x), result))
-
-        # append timestamp if requested
-        if self.return_timestamp:
-            result += (torch.as_tensor(inp_time, dtype=torch.float64),)
-            if return_target:
-                result += (torch.as_tensor(tar_time, dtype=torch.float64),)
-
-        return result
+        return make_batch(
+            inp=as_field(inp),
+            inp_timestamp=as_time(inp_time),
+            tar=None if tar is None else as_field(tar),
+            tar_timestamp=None if tar_time is None else as_time(tar_time),
+            inp_zenith=None if inp_zen is None else as_field(inp_zen),
+            tar_zenith=None if tar_zen is None else as_field(tar_zen),
+        )
 
     # this is just for the torch dataloader
     def __getitem__(self, global_idx):
