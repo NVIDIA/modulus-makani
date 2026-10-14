@@ -176,7 +176,7 @@ class TestZenithFeatureShapes(_ModelPackageTestBase):
                     f"member_major_b{b}",
                     z[b, :, 0],
                     torch.as_tensor(expected.astype(np.float32)),
-                    verbose=True,
+                    verbose=False,
                 )
             )
 
@@ -206,14 +206,14 @@ class TestZenithFeatureShapes(_ModelPackageTestBase):
                 wrapper = self._make_wrapper(n_history=1, add_zenith=add_zenith)
                 x = torch.randn(2, 2, self.C, self.H, self.W)
                 out = wrapper._prepare_input(x, self._times(4), normalized_data=True)
-                self.assertTrue(compare_tensors("time axis kept", out, x, verbose=True))
+                self.assertTrue(compare_tensors("time axis kept", out, x, verbose=False))
 
     def test_flat_input_gets_its_time_axis(self):
         wrapper = self._make_wrapper(n_history=1)
         x = torch.randn(2, 2 * self.C, self.H, self.W)
         out = wrapper._prepare_input(x, self._times(4), normalized_data=True)
         self.assertEqual(tuple(out.shape), (2, 2, self.C, self.H, self.W))
-        self.assertTrue(compare_tensors("unfolded", out[:, 1], x[:, self.C :], verbose=True))
+        self.assertTrue(compare_tensors("unfolded", out[:, 1], x[:, self.C :], verbose=False))
 
 
 class TestModelPackageForward(_ModelPackageTestBase):
@@ -224,7 +224,7 @@ class TestModelPackageForward(_ModelPackageTestBase):
         out = wrapper(x, self._times(n_times), **kwargs)
         self.assertEqual(tuple(out.shape), (batch, self.C, self.H, self.W))
         # identity normalization + leading-channel dummy => exactly 2 * leading slice
-        self.assertTrue(compare_tensors("model_package_forward", out, 2.0 * x[:, : self.C], verbose=True))
+        self.assertTrue(compare_tensors("model_package_forward", out, 2.0 * x[:, : self.C], verbose=False))
 
     def test_forward_batch_one(self):
         self._run(self._make_wrapper(), batch=1, n_history=0, n_times=1)
@@ -251,7 +251,7 @@ class TestModelPackageForward(_ModelPackageTestBase):
         wrapper = self._make_wrapper()
         x = torch.randn(2, self.C, self.H, self.W)
         out = wrapper(x, self._times(2), normalized_data=False)
-        self.assertTrue(compare_tensors("denorm_roundtrip", out, 2.0 * x, verbose=True))
+        self.assertTrue(compare_tensors("denorm_roundtrip", out, 2.0 * x, verbose=False))
 
     def test_normalization_with_history(self):
         # the statistics are per channel and have to be applied to every history step
@@ -265,7 +265,7 @@ class TestModelPackageForward(_ModelPackageTestBase):
         out = wrapper._prepare_input(x, self._times(4), normalized_data=False)
 
         expected = torch.stack([(x[:, : self.C] - means) / stds, (x[:, self.C :] - means) / stds], dim=1)
-        self.assertTrue(compare_tensors("normalization_with_history", out, expected, verbose=True))
+        self.assertTrue(compare_tensors("normalization_with_history", out, expected, verbose=False))
 
     def test_encode_process_matches_forward_preprocessing(self):
         # the dummy's encode_process mirrors its forward, so with an identity
@@ -277,7 +277,7 @@ class TestModelPackageForward(_ModelPackageTestBase):
         features = wrapper.encode_process(x, times)
         expected = wrapper(x, times)
 
-        self.assertTrue(compare_tensors("model_package_encode_process", features, expected, verbose=True))
+        self.assertTrue(compare_tensors("model_package_encode_process", features, expected, verbose=False))
 
 
 class TestNoiseBatchGuard(_ModelPackageTestBase):
@@ -483,7 +483,7 @@ class TestStepper(unittest.TestCase):
         expected = wrapper(inp).squeeze(1)
 
         self.assertEqual(features.shape, (self.B, self.C, self.H, self.W))
-        self.assertTrue(compare_tensors("single_step_encode_process", features, expected, verbose=True))
+        self.assertTrue(compare_tensors("single_step_encode_process", features, expected, verbose=False))
 
     def test_single_step_encode_process_batched(self):
         # the latent path must accept a batch larger than params.batch_size (1),
@@ -499,7 +499,7 @@ class TestStepper(unittest.TestCase):
         features = wrapper.encode_process(inp)
 
         self.assertEqual(features.shape, (batch, self.C, self.H, self.W))
-        self.assertTrue(compare_tensors("single_step_encode_process_batched", features, 2.0 * inp[:, 0], verbose=True))
+        self.assertTrue(compare_tensors("single_step_encode_process_batched", features, 2.0 * inp[:, 0], verbose=False))
 
     def test_single_step_forward_batched(self):
         # the same must hold for the ordinary forward path
@@ -511,7 +511,7 @@ class TestStepper(unittest.TestCase):
         out = wrapper(inp)
 
         self.assertEqual(out.shape, (batch, 1, self.C, self.H, self.W))
-        self.assertTrue(compare_tensors("single_step_forward_batched", out, 2.0 * inp, verbose=True))
+        self.assertTrue(compare_tensors("single_step_forward_batched", out, 2.0 * inp, verbose=False))
 
     def test_single_step_encode_process_unsupported_backbone(self):
         # a backbone without encode_process must fail with a clear error rather

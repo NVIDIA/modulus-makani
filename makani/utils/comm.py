@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
 
 import torch.distributed as dist
@@ -25,10 +26,51 @@ from physicsnemo.distributed.config import ProcessGroupNode, ProcessGroupConfig
 _DM = None
 _COMM_ROOTS = {}
 
+# nesting depth of serial(); while positive, the group queries report a single process
+_SERIAL_DEPTH = 0
+
+
+def _group_queries_active() -> bool:
+    return (_DM is not None) and (_SERIAL_DEPTH == 0)
+
+
+@contextlib.contextmanager
+def serial():
+    """
+    Make the group queries report a single process while the context is active.
+
+    Inside the context, ``get_size`` returns 1, ``get_rank`` and ``get_root``
+    return 0, ``get_group`` returns ``None``, ``is_distributed`` returns
+    ``False`` and ``get_comm_names`` returns no names -- what they return when
+    the comms are not initialized. The world queries (``get_world_size``,
+    ``get_world_rank``, ``get_local_rank``) are not affected, and the process
+    groups themselves stay alive.
+
+    This builds a serial model, loss or metric next to distributed ones in the
+    same process, e.g. as the reference in a distributed test. Models choose
+    their parallel layout when they are constructed, so only the construction
+    has to happen inside the context; the forward and backward passes of such a
+    model run serially outside of it as well. Code that queries the comms when it
+    is called, such as checkpoint saving, has to be called inside the context.
+
+    Contexts can be nested. ``init`` refuses to run inside one.
+    """
+    global _SERIAL_DEPTH
+    _SERIAL_DEPTH += 1
+    try:
+        yield
+    finally:
+        _SERIAL_DEPTH -= 1
+
+
+def is_serial() -> bool:
+    """Whether a :func:`serial` context is active."""
+    return _SERIAL_DEPTH > 0
+
 
 def get_size(name: str) -> int:
     global _DM
-    if (_DM is not None) and (_DM.world_size > 1):
+    if _group_queries_active() and (_DM.world_size > 1):
         return _DM.group_size(name)
     else:
         return 1
@@ -36,7 +78,7 @@ def get_size(name: str) -> int:
 
 def get_rank(name: str) -> int:
     global _DM
-    if (_DM is not None) and (_DM.world_size > 1):
+    if _group_queries_active() and (_DM.world_size > 1):
         return _DM.group_rank(name)
     else:
         return 0
@@ -44,7 +86,7 @@ def get_rank(name: str) -> int:
 
 def get_group(name: str):
     global _DM
-    if _DM is not None:
+    if _group_queries_active():
         return _DM.group(name)
     else:
         return None
@@ -53,7 +95,7 @@ def get_group(name: str):
 def get_root(name: str) -> int:
     global _DM
     global _COMM_ROOTS
-    if (name in _COMM_ROOTS) and (_DM.world_size > 1):
+    if _group_queries_active() and (name in _COMM_ROOTS) and (_DM.world_size > 1):
         return _COMM_ROOTS[name]
     else:
         return 0
@@ -86,7 +128,7 @@ def get_local_rank():
 
 def get_comm_names():
     global _DM
-    if _DM is not None:
+    if _group_queries_active():
         return [name for name in _DM.group_names if (not name.startswith("__orthogonal_to"))]
     else:
         return []
@@ -98,7 +140,7 @@ def get_model_comm_names():
 
 def is_distributed(name: str):
     global _DM
-    if _DM is not None:
+    if _group_queries_active():
         return name in _DM.group_names
     else:
         return False
@@ -156,6 +198,10 @@ def init(
     data_parallel_names=["ensemble", "batch"],
     verbose=False,
 ):
+
+    # the groups would be registered against the serial view of the queries
+    if is_serial():
+        raise RuntimeError("comm.init() cannot be called inside comm.serial()")
 
     # call basic init first
     DistributedManager.initialize()

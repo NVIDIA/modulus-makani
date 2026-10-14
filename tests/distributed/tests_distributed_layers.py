@@ -74,24 +74,43 @@ class TestDistributedLayers(unittest.TestCase):
             [181, 360, 91, 180, 1, 10, 1e-4],
             [128, 256, 256, 512, 32, 8, 1e-4],
             [91, 180, 181, 360, 1, 10, 1e-4],
+            # the three filters of SFNO with scale_factor=8 on a 36 x 72 grid: truncated modes,
+            # mixed grid types and an internal grid too small to split evenly
+            [36, 72, 4, 9, 4, 8, 1e-4, "equiangular", "legendre-gauss", 4, 5],
+            [4, 9, 4, 9, 4, 8, 1e-4, "legendre-gauss", "legendre-gauss", 4, 5],
+            [4, 9, 36, 72, 4, 8, 1e-4, "legendre-gauss", "equiangular", 4, 5],
         ],
         skip_on_empty=True,
     )
     def test_distributed_spectral_conv(
-        self, nlat_in, nlon_in, nlat_out, nlon_out, batch_size, num_chan, tol, verbose=False
+        self,
+        nlat_in,
+        nlon_in,
+        nlat_out,
+        nlon_out,
+        batch_size,
+        num_chan,
+        tol,
+        grid_in="equiangular",
+        grid_out="equiangular",
+        lmax=None,
+        mmax=None,
+        verbose=False,
     ):
         B, C, Hi, Wi, Ho, Wo = batch_size, num_chan, nlat_in, nlon_in, nlat_out, nlon_out
 
         from makani.models.common import SpectralConv
 
-        # set up handles
-        forward_transform_local = th.RealSHT(nlat=Hi, nlon=Wi).to(self.device)
+        # set up handles; without explicit modes the inverse takes those of the forward
+        forward_transform_local = th.RealSHT(nlat=Hi, nlon=Wi, lmax=lmax, mmax=mmax, grid=grid_in).to(self.device)
         inverse_transform_local = th.InverseRealSHT(
-            nlat=Ho, nlon=Wo, lmax=forward_transform_local.lmax, mmax=forward_transform_local.mmax
+            nlat=Ho, nlon=Wo, lmax=forward_transform_local.lmax, mmax=forward_transform_local.mmax, grid=grid_out
         ).to(self.device)
-        forward_transform_dist = thd.DistributedRealSHT(nlat=Hi, nlon=Wi).to(self.device)
+        forward_transform_dist = thd.DistributedRealSHT(nlat=Hi, nlon=Wi, lmax=lmax, mmax=mmax, grid=grid_in).to(
+            self.device
+        )
         inverse_transform_dist = thd.DistributedInverseRealSHT(
-            nlat=Ho, nlon=Wo, lmax=forward_transform_dist.lmax, mmax=forward_transform_dist.mmax
+            nlat=Ho, nlon=Wo, lmax=forward_transform_dist.lmax, mmax=forward_transform_dist.mmax, grid=grid_out
         ).to(self.device)
 
         set_seed(333)
@@ -144,15 +163,16 @@ class TestDistributedLayers(unittest.TestCase):
         #############################################################
         # FWD pass
         inp_full.requires_grad = True
-        out_full, _ = spect_conv_local(inp_full)
+        out_full, res_full = spect_conv_local(inp_full)
 
-        # create grad for backward
+        # create grads for backward; the residual is part of it, since the blocks use it as their skip
+        # connection, and when the grids differ it is resampled through the transforms
         with torch.no_grad():
-            # create full grad
             ograd_full = torch.randn_like(out_full)
+            rgrad_full = torch.randn_like(res_full)
 
         # BWD pass
-        out_full.backward(ograd_full)
+        torch.autograd.backward([out_full, res_full], [ograd_full, rgrad_full])
         igrad_full = inp_full.grad.clone()
         wgrad_full = spect_conv_local.weight.grad.clone()
         bgrad_full = spect_conv_local.bias.grad.clone()
@@ -163,12 +183,12 @@ class TestDistributedLayers(unittest.TestCase):
         # FWD pass
         inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
         inp_local.requires_grad = True
-        out_local, _ = spect_conv_dist(inp_local)
+        out_local, res_local = spect_conv_dist(inp_local)
 
         # BWD pass
         ograd_local = self._split_helper(ograd_full, hdim=-2, wdim=-1)
-        out_local, _ = spect_conv_dist(inp_local)
-        out_local.backward(ograd_local)
+        rgrad_local = self._split_helper(rgrad_full, hdim=-2, wdim=-1)
+        torch.autograd.backward([out_local, res_local], [ograd_local, rgrad_local])
         igrad_local = inp_local.grad.clone()
         wgrad_local = spect_conv_dist.module.weight.grad.clone()
         bgrad_local = spect_conv_dist.module.bias.grad.clone()
@@ -181,6 +201,14 @@ class TestDistributedLayers(unittest.TestCase):
             self.assertTrue(
                 reduce_success(
                     compare_tensors("output", out_gather_full, out_full, tol, tol, verbose=verbose), self.device
+                )
+            )
+
+        with self.subTest(desc="residual"):
+            res_gather_full = self._gather_helper(res_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("residual", res_gather_full, res_full, tol, tol, verbose=verbose), self.device
                 )
             )
 

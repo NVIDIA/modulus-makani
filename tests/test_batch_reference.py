@@ -48,7 +48,7 @@ class TestBatchReference(unittest.TestCase):
                 actual = self.current[key]
                 self.assertEqual(actual.dtype, expected.dtype, f"dtype of {key}")
                 self.assertTrue(
-                    compare_arrays(key, actual, expected, atol=_ATOL, rtol=0.0, verbose=True, shape_check=True),
+                    compare_arrays(key, actual, expected, atol=_ATOL, rtol=0.0, verbose=False, shape_check=True),
                     f"{key} differs from the reference",
                 )
 

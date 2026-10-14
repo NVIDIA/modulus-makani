@@ -111,7 +111,7 @@ class TestDistributedConservativeRemap(unittest.TestCase):
         ],
         skip_on_empty=True,
     )
-    def test_distributed_remap_from_raster(self, n_src_lat, n_src_lon, n_tgt_lat, n_tgt_lon, tol, verbose=True):
+    def test_distributed_remap_from_raster(self, n_src_lat, n_src_lon, n_tgt_lat, n_tgt_lon, tol, verbose=False):
         source_lat = np.linspace(90.0, -90.0, n_src_lat)
         source_lon = np.linspace(0.0, 360.0, n_src_lon, endpoint=False)
         target_lat = np.linspace(90.0, -90.0, n_tgt_lat)
@@ -164,7 +164,7 @@ class TestDistributedConservativeRemap(unittest.TestCase):
         ],
         skip_on_empty=True,
     )
-    def test_distributed_remap_from_mesh(self, n_cells, n_lat, n_lon, tol, verbose=True):
+    def test_distributed_remap_from_mesh(self, n_cells, n_lat, n_lon, tol, verbose=False):
         rng = np.random.default_rng(5678)
         cell_lat, cell_lon = _fibonacci_mesh(n_cells)
         cell_area = np.full(n_cells, 4.0 * np.pi / n_cells)

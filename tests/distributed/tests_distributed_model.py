@@ -16,12 +16,13 @@
 
 import sys
 import os
+import shutil
 import tempfile
 import unittest
 from parameterized import parameterized
 
 import torch
-import torch_harmonics.distributed as thd
+import torch.distributed as dist
 
 from makani.utils import comm
 from makani.utils import driver
@@ -35,48 +36,73 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from .distributed_helpers import (
     get_default_parameters,
     set_image_shape,
+    _init_grid,
     _split_helper,
     _gather_helper,
     reduce_success,
     sync_and_barrier,
+    teardown_comms,
 )
 from ..testutils import disable_tf32, set_seed, compare_tensors
 
 
+def _count_distributed_modules(model):
+    # the distributed layers of makani.mpu and torch_harmonics.distributed all carry the prefix
+    return sum(type(module).__name__.startswith("Distributed") for module in model.modules())
+
+
+def _scaled_atol(reference, tol):
+    # the rounding error of a sum scales with its summands, not with its result: an entry
+    # that cancels to a small value carries the error of the tensor's scale, so the
+    # absolute tolerance follows the largest entry; never below tol itself
+    return tol * max(1.0, reference.abs().max().item())
+
+
+def _layer_gradient_scale(gradients, key):
+    """
+    The reference a gradient's absolute tolerance scales with: the layer's largest gradient entry.
+
+    A bias gradient sums the same incoming gradients as the weight gradient of
+    its layer, so its rounding error follows that scale even when the sum
+    itself cancels -- as it does exactly for a bias followed by an instance
+    norm, which removes the per-channel mean and with it the bias.
+    """
+    reference = gradients[key]
+    if key.endswith(".bias.grad"):
+        weight_key = key[: -len(".bias.grad")] + ".weight.grad"
+        if weight_key in gradients:
+            return torch.stack([reference.abs().max(), gradients[weight_key].abs().max().to(reference.device)])
+    return reference
+
+
 class TestDistributedModel(unittest.TestCase):
+    """
+    Compares distributed models against the same model built serially.
+
+    The comms are set up once for the class. The serial reference is built
+    inside ``comm.serial()`` next to the distributed model, so both live in the
+    same process group and no test sets up or tears down the comms itself.
+    """
 
     @classmethod
     def setUpClass(cls):
-        from mpi4py import MPI
+        _init_grid(cls)
 
-        cls.mpi_comm = MPI.COMM_WORLD.Dup()
-        cls.mpi_comm_rank = cls.mpi_comm.Get_rank()
-        cls.mpi_comm_size = cls.mpi_comm.Get_size()
-
-        if torch.cuda.is_available():
-            if cls.mpi_comm_rank == 0:
-                print("Running test on GPU")
-            local_rank = cls.mpi_comm_rank % torch.cuda.device_count()
-            cls.device = torch.device(f"cuda:{local_rank}")
-            torch.cuda.set_device(cls.device)
-        else:
-            if cls.mpi_comm_rank == 0:
-                print("Running test on CPU")
-            cls.device = torch.device("cpu")
-        set_seed(333)
+        # shared scratch directory: rank 0 picks the path, every rank reads and writes there
+        tmpdir = [tempfile.mkdtemp(prefix="makani_model_test_", dir="/tmp") if cls.world_rank == 0 else None]
+        if dist.is_initialized():
+            dist.broadcast_object_list(tmpdir, src=0)
+        cls.tmpdir = tmpdir[0]
 
         sync_and_barrier()
-
-        return
 
     @classmethod
     def tearDownClass(cls):
+        # no rank may still be reading when rank 0 removes the directory
         sync_and_barrier()
-        # Free the duplicated communicator. mpi_comm is an mpi4py Intracomm
-        # (returned by MPI.COMM_WORLD.Dup()), whose disposal API is Free()
-        # — release the duplicated comm explicitly rather than relying on
-        # interpreter shutdown to clean it up.
-        cls.mpi_comm.Free()
+        if cls.world_rank == 0:
+            shutil.rmtree(cls.tmpdir, ignore_errors=True)
+        teardown_comms()
 
     def setUp(self):
 
@@ -93,45 +119,51 @@ class TestDistributedModel(unittest.TestCase):
         # also set the batch size for testing
         self.params.batch_size = 4
 
-    def _init_comms(self):
+        # start every test with matched ranks and a drained device
+        sync_and_barrier()
 
-        # set up distributed
-        self.grid_size_h = int(os.getenv("GRID_H", 1))
-        self.grid_size_w = int(os.getenv("GRID_W", 1))
-        self.grid_size_m = int(os.getenv("GRID_M", 1))
-        self.grid_size_e = int(os.getenv("GRID_E", 1))
-        self.world_size = self.grid_size_h * self.grid_size_w * self.grid_size_m * self.grid_size_e
+    def _checkpoint_path(self, name):
+        return os.path.join(self.tmpdir, f"{name}_{self.id().split('.')[-1]}.pt")
 
-        # init groups
-        comm.init(
-            model_parallel_sizes=[self.grid_size_h, self.grid_size_w, self.grid_size_m],
-            model_parallel_names=["h", "w", "matmul"],
-            data_parallel_sizes=[self.grid_size_e, -1],
-            data_parallel_names=["ensemble", "batch"],
-        )
-        self.world_rank = comm.get_world_rank()
+    def _build_serial_reference(self, multistep):
+        """Build the serial model and save its checkpoint, on every rank alike."""
+        # the checkpoint gathers over the model group when it is distributed, so
+        # saving the serial model is serial too, and only rank 0 writes
+        checkpoint_path = self._checkpoint_path("serial")
+        with comm.serial():
+            model = model_registry.get_model(self.params, multistep=multistep).to(self.device)
+            if self.world_rank == 0:
+                driver.Driver.save_checkpoint(checkpoint_path=checkpoint_path, model=model, checkpoint_mode="flexible")
+        sync_and_barrier()
+        return model, checkpoint_path
 
-        # store comm group parameters
-        self.wrank = comm.get_rank("w")
-        self.hrank = comm.get_rank("h")
-        self.erank = comm.get_rank("ensemble")
-        self.w_group = comm.get_group("w")
-        self.h_group = comm.get_group("h")
-        self.e_group = comm.get_group("ensemble")
-
-        # initializing sht process groups just to be sure
-        thd.init(self.h_group, self.w_group)
-
-        if self.world_rank == 0:
-            print(
-                f"Running distributed tests on grid H x W x E = {self.grid_size_h} x {self.grid_size_w} x {self.grid_size_e}"
+    def _build_distributed(self, multistep, checkpoint_path=None, hooks=False):
+        model = model_registry.get_model(self.params, multistep=multistep).to(self.device)
+        if hooks:
+            model = init_gradient_reduction_hooks(
+                model,
+                device=self.device,
+                reduction_buffer_count=1,
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+                static_graph=True,
+                verbose=False,
             )
-
-        return
-
-    def _destroy_comms(self):
-        comm.cleanup()
-        return
+        if checkpoint_path is not None:
+            driver.Driver.restore_from_checkpoint(
+                checkpoint_path=checkpoint_path,
+                model=model,
+                loss=None,
+                optimizer=None,
+                scheduler=None,
+                counters=None,
+                checkpoint_mode="flexible",
+                # every parameter has to come from the serial reference: a missing one would
+                # silently keep this rank's own random init
+                strict=True,
+            )
+        return model
 
     def _split_helper(self, tensor, hdim=None, wdim=None):
         tensor_local = _split_helper(tensor, dim=hdim, group=self.h_group)
@@ -147,8 +179,9 @@ class TestDistributedModel(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # "SNO",
-            # "FCN3",
+            "SFNO",
+            "SNO",
+            "FCN3",
         ],
         skip_on_empty=True,
     )
@@ -163,40 +196,11 @@ class TestDistributedModel(unittest.TestCase):
         # fix seed
         set_seed(333)
 
-        # create temporary dir
-        tmp_path = None
-        if self.mpi_comm_rank == 0:
-            tmpdir = tempfile.TemporaryDirectory(dir="/tmp")
-            tmp_path = tmpdir.name
-        tmp_path = self.mpi_comm.bcast(tmp_path, root=0)
+        model, checkpoint_path = self._build_serial_reference(multistep=False)
+        with comm.serial():
+            state_dict_full = checkpoint_helpers.gather_model_state_dict(model, grads=False)
 
-        model = model_registry.get_model(self.params, multistep=False).to(self.device)
-
-        # get state dict
-        state_dict_full = checkpoint_helpers.gather_model_state_dict(model, grads=False)
-
-        if self.mpi_comm_rank == 0:
-            driver.Driver.save_checkpoint(
-                checkpoint_path=os.path.join(tmp_path, "checkpoint.pt"), model=model, checkpoint_mode="flexible"
-            )
-        self.mpi_comm.Barrier()
-
-        # now init comms
-        self._init_comms()
-
-        model_dist = model_registry.get_model(self.params, multistep=False).to(self.device)
-
-        # load checkpoint
-        driver.Driver.restore_from_checkpoint(
-            checkpoint_path=os.path.join(tmp_path, "checkpoint.pt"),
-            model=model_dist,
-            loss=None,
-            optimizer=None,
-            scheduler=None,
-            counters=None,
-            checkpoint_mode="flexible",
-            strict=False,
-        )
+        model_dist = self._build_distributed(multistep=False, checkpoint_path=checkpoint_path)
 
         # compare parameters
         state_dict_gather_full = checkpoint_helpers.gather_model_state_dict(model_dist, grads=False)
@@ -210,14 +214,29 @@ class TestDistributedModel(unittest.TestCase):
                     )
                 )
 
-        self.mpi_comm.Barrier()
+    @parameterized.expand(["SFNO", "SNO", "FCN3"], skip_on_empty=True)
+    def test_serial_build_has_no_distributed_layers(self, nettype):
+        """
+        A model built inside comm.serial() is serial, while the comms are up.
 
-        # cleanup
-        self._destroy_comms()
+        The serial references of the other tests rely on this: a model has to
+        choose its parallel layout when it is constructed, not when it runs.
+        """
+        self.params.nettype = nettype
+
+        with comm.serial():
+            model = model_registry.get_model(self.params, multistep=False)
+        self.assertEqual(_count_distributed_modules(model), 0)
+
+        # without model parallelism the distributed build is serial as well, and there is nothing to contrast
+        if comm.get_size("model") > 1:
+            model_dist = model_registry.get_model(self.params, multistep=False)
+            self.assertGreater(_count_distributed_modules(model_dist), 0)
 
     @parameterized.expand(
         [
-            # ("SNO", 1e-4),
+            ("SFNO", 1e-4),
+            ("SNO", 1e-4),
             ("FCN3", 1e-4),
         ],
         skip_on_empty=True,
@@ -234,15 +253,8 @@ class TestDistributedModel(unittest.TestCase):
         # fix seed
         set_seed(333)
 
-        # create temporary dir
-        tmp_path = None
-        if self.mpi_comm_rank == 0:
-            tmpdir = tempfile.TemporaryDirectory(dir="/tmp")
-            tmp_path = tmpdir.name
-        tmp_path = self.mpi_comm.bcast(tmp_path, root=0)
-
         multistep = self.params.n_future > 0
-        model = model_registry.get_model(self.params, multistep=multistep).to(self.device)
+        model, checkpoint_path = self._build_serial_reference(multistep=multistep)
 
         inp_shape = (
             self.params.batch_size,
@@ -263,50 +275,15 @@ class TestDistributedModel(unittest.TestCase):
         loss_full.backward()
         igrad_full = inp_full.grad.clone()
 
-        # store output:
-        if self.mpi_comm_rank == 0:
-            torch.save(out_full, os.path.join(tmp_path, "out_full.pt"))
-            torch.save(igrad_full, os.path.join(tmp_path, "igrad_full.pt"))
-            driver.Driver.save_checkpoint(
-                checkpoint_path=os.path.join(tmp_path, "checkpoint.pt"), model=model, checkpoint_mode="flexible"
-            )
-        self.mpi_comm.Barrier()
-
         # get also grad output
-        state_dict_full = checkpoint_helpers.gather_model_state_dict(model, grads=True)
+        with comm.serial():
+            state_dict_full = checkpoint_helpers.gather_model_state_dict(model, grads=True)
 
         # delete local model
         del model
 
-        # now init comms
-        self._init_comms()
-
         # create model, this times distributed
-        model_dist = model_registry.get_model(self.params, multistep=multistep).to(self.device)
-
-        # save reduction hooks
-        model_dist = init_gradient_reduction_hooks(
-            model_dist,
-            device=self.device,
-            reduction_buffer_count=1,
-            broadcast_buffers=False,
-            find_unused_parameters=False,
-            gradient_as_bucket_view=True,
-            static_graph=True,
-            verbose=False,
-        )
-
-        # load checkpoint
-        driver.Driver.restore_from_checkpoint(
-            checkpoint_path=os.path.join(tmp_path, "checkpoint.pt"),
-            model=model_dist,
-            loss=None,
-            optimizer=None,
-            scheduler=None,
-            counters=None,
-            checkpoint_mode="flexible",
-            strict=False,
-        )
+        model_dist = self._build_distributed(multistep=multistep, checkpoint_path=checkpoint_path, hooks=True)
 
         # split input
         inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
@@ -327,7 +304,10 @@ class TestDistributedModel(unittest.TestCase):
             out_gather_full = self._gather_helper(out_local, hdim=-2, wdim=-1)
             self.assertTrue(
                 reduce_success(
-                    compare_tensors("output", out_gather_full, out_full, tol, tol, verbose=verbose), self.device
+                    compare_tensors(
+                        "output", out_gather_full, out_full, _scaled_atol(out_full, tol), tol, verbose=verbose
+                    ),
+                    self.device,
                 )
             )
 
@@ -345,7 +325,14 @@ class TestDistributedModel(unittest.TestCase):
             igrad_gather_full = self._gather_helper(igrad_local, hdim=-2, wdim=-1)
             self.assertTrue(
                 reduce_success(
-                    compare_tensors("input gradients", igrad_gather_full, igrad_full, tol, tol, verbose=verbose),
+                    compare_tensors(
+                        "input gradients",
+                        igrad_gather_full,
+                        igrad_full,
+                        _scaled_atol(igrad_full, tol),
+                        tol,
+                        verbose=verbose,
+                    ),
                     self.device,
                 )
             )
@@ -359,20 +346,22 @@ class TestDistributedModel(unittest.TestCase):
                     self.assertTrue(
                         reduce_success(
                             compare_tensors(
-                                f"weight gradient {key}", wgrad_gather_full, wgrad_full, tol, tol, verbose=verbose
+                                f"weight gradient {key}",
+                                wgrad_gather_full,
+                                wgrad_full,
+                                _scaled_atol(_layer_gradient_scale(state_dict_full, key), tol),
+                                tol,
+                                verbose=verbose,
                             ),
                             self.device,
                         )
                     )
 
-        # cleanup
-        self._destroy_comms()
-
     @parameterized.expand(
         [
-            # ("SFNO", 1e-6, 1e-6),
-            # ("SNO", 1e-6, 1e-6),
-            # ("FCN3", 1e-6, 1e-6),
+            ("SFNO", 1e-6, 1e-6),
+            ("SNO", 1e-6, 1e-6),
+            ("FCN3", 1e-6, 1e-6),
         ],
         skip_on_empty=True,
     )
@@ -388,23 +377,8 @@ class TestDistributedModel(unittest.TestCase):
         # fix seed
         set_seed(333)
 
-        # now init comms
-        self._init_comms()
-
         # create model, this times distributed
-        model_dist = model_registry.get_model(self.params, multistep=False).to(self.device)
-
-        # save reduction hooks
-        model_dist = init_gradient_reduction_hooks(
-            model_dist,
-            device=self.device,
-            reduction_buffer_count=1,
-            broadcast_buffers=False,
-            find_unused_parameters=False,
-            gradient_as_bucket_view=True,
-            static_graph=True,
-            verbose=False,
-        )
+        model_dist = self._build_distributed(multistep=False, hooks=True)
 
         # get loss object
         self.params.losses = [{"type": "l2", "channel_weights": "constant"}]
