@@ -35,6 +35,8 @@ distributed-bootstrap error in ``setUpClass``) that rank 0 doesn't reproduce.
 import os
 
 import pytest
+import torch
+import torch.distributed as dist
 
 
 def _get_world_rank():
@@ -164,3 +166,26 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if item.fspath.basename.startswith(("test_distributed_", "tests_distributed_")):
             item._nodeid = item.nodeid + suffix
+
+
+@pytest.fixture(autouse=True)
+def drained_device_and_matched_ranks():
+    """Start every test with matched ranks and a drained device, and end it with a drained device.
+
+    Modules own receive buffers that NCCL writes asynchronously, e.g. the halo of a
+    distributed DISCO convolution. When a test ends while such a write is still in
+    flight, the caching allocator hands the memory to the next test, and NCCL writes
+    into its tensors: a test then fails or passes depending on which tests ran before
+    it. torch-harmonics guards its distributed tests the same way.
+
+    The barrier relies on every rank running the same tests, which reduce_success
+    already requires. autouse fixtures apply to unittest.TestCase methods as well, and
+    run after setUpClass, i.e. after comm.init().
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+    yield
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()

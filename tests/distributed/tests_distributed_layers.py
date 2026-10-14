@@ -16,6 +16,7 @@
 
 import sys
 import os
+import math
 import unittest
 from parameterized import parameterized
 
@@ -249,6 +250,154 @@ class TestDistributedLayers(unittest.TestCase):
                         self.device,
                     )
                 )
+
+    # the DISCO convolutions of SNO with scale_factor=8 on a 36 x 72 grid: the encoder onto the internal
+    # 4 x 9 grid, the local convolution of the blocks there, whose support covers most of the sphere,
+    # and the convolution of the decoder on the output grid
+    @parameterized.expand(
+        [
+            [36, 72, 4, 9, "equiangular", "legendre-gauss", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
+            [4, 9, 4, 9, "legendre-gauss", "legendre-gauss", (3, 3), math.sqrt(2.0) * math.pi / 3.0, 4, 8, 1e-4],
+            [36, 72, 36, 72, "equiangular", "equiangular", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
+        ],
+        skip_on_empty=True,
+    )
+    def test_distributed_disco_conv(
+        self,
+        nlat_in,
+        nlon_in,
+        nlat_out,
+        nlon_out,
+        grid_in,
+        grid_out,
+        kernel_shape,
+        theta_cutoff,
+        batch_size,
+        num_chan,
+        tol,
+        verbose=False,
+    ):
+        B, C = batch_size, num_chan
+
+        conv_args = dict(
+            in_shape=(nlat_in, nlon_in),
+            out_shape=(nlat_out, nlon_out),
+            kernel_shape=kernel_shape,
+            basis_type="harmonic",
+            basis_norm_mode="mean",
+            grid_in=grid_in,
+            grid_out=grid_out,
+            bias=False,
+            theta_cutoff=theta_cutoff,
+        )
+
+        set_seed(333)
+        conv_local = th.DiscreteContinuousConvS2(C, C, **conv_args).to(self.device)
+        conv_dist = thd.DistributedDiscreteContinuousConvS2(C, C, **conv_args).to(self.device)
+        with torch.no_grad():
+            conv_dist.weight.copy_(conv_local.weight)
+
+        inp_full = torch.randn((B, C, nlat_in, nlon_in), dtype=torch.float32, device=self.device)
+
+        # local
+        inp_full.requires_grad = True
+        out_full = conv_local(inp_full)
+        with torch.no_grad():
+            ograd_full = torch.randn_like(out_full)
+        out_full.backward(ograd_full)
+        igrad_full = inp_full.grad.clone()
+        wgrad_full = conv_local.weight.grad.clone()
+
+        # distributed
+        inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
+        inp_local.requires_grad = True
+        out_local = conv_dist(inp_local)
+        ograd_local = self._split_helper(ograd_full, hdim=-2, wdim=-1)
+        out_local.backward(ograd_local)
+        igrad_local = inp_local.grad.clone()
+        # the weight is replicated over the spatial ranks, each holding the contribution of its part of the grid
+        wgrad_local = conv_dist.weight.grad.clone()
+        if comm.get_size("spatial") > 1:
+            dist.all_reduce(wgrad_local, group=comm.get_group("spatial"))
+
+        with self.subTest(desc="output"):
+            out_gather_full = self._gather_helper(out_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("output", out_gather_full, out_full, tol, tol, verbose=verbose), self.device
+                )
+            )
+
+        with self.subTest(desc="input gradients"):
+            igrad_gather_full = self._gather_helper(igrad_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("input gradients", igrad_gather_full, igrad_full, tol, tol, verbose=verbose),
+                    self.device,
+                )
+            )
+
+        with self.subTest(desc="weight gradients"):
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("weight gradients", wgrad_local, wgrad_full, tol, tol, verbose=verbose),
+                    self.device,
+                )
+            )
+
+    # the bilinear resampling in the decoder of SNO, from the internal 4 x 9 grid back onto 36 x 72, and the
+    # opposite direction
+    @parameterized.expand(
+        [
+            [4, 9, 36, 72, "legendre-gauss", "equiangular", 4, 8, 1e-5],
+            [36, 72, 4, 9, "equiangular", "legendre-gauss", 4, 8, 1e-5],
+        ],
+        skip_on_empty=True,
+    )
+    def test_distributed_resample(
+        self, nlat_in, nlon_in, nlat_out, nlon_out, grid_in, grid_out, batch_size, num_chan, tol, verbose=False
+    ):
+        B, C = batch_size, num_chan
+
+        resample_args = dict(grid_in=grid_in, grid_out=grid_out, mode="bilinear")
+        resample_local = th.ResampleS2(nlat_in, nlon_in, nlat_out, nlon_out, **resample_args).to(self.device)
+        resample_dist = thd.DistributedResampleS2(nlat_in, nlon_in, nlat_out, nlon_out, **resample_args).to(self.device)
+
+        set_seed(333)
+        inp_full = torch.randn((B, C, nlat_in, nlon_in), dtype=torch.float32, device=self.device)
+
+        # local
+        inp_full.requires_grad = True
+        out_full = resample_local(inp_full)
+        with torch.no_grad():
+            ograd_full = torch.randn_like(out_full)
+        out_full.backward(ograd_full)
+        igrad_full = inp_full.grad.clone()
+
+        # distributed
+        inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
+        inp_local.requires_grad = True
+        out_local = resample_dist(inp_local)
+        ograd_local = self._split_helper(ograd_full, hdim=-2, wdim=-1)
+        out_local.backward(ograd_local)
+        igrad_local = inp_local.grad.clone()
+
+        with self.subTest(desc="output"):
+            out_gather_full = self._gather_helper(out_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("output", out_gather_full, out_full, tol, tol, verbose=verbose), self.device
+                )
+            )
+
+        with self.subTest(desc="input gradients"):
+            igrad_gather_full = self._gather_helper(igrad_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("input gradients", igrad_gather_full, igrad_full, tol, tol, verbose=verbose),
+                    self.device,
+                )
+            )
 
     @parameterized.expand(
         [

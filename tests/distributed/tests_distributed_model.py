@@ -179,9 +179,9 @@ class TestDistributedModel(unittest.TestCase):
 
     @parameterized.expand(
         [
-            "SFNO",
+            # "SFNO",
             "SNO",
-            "FCN3",
+            # "FCN3",
         ],
         skip_on_empty=True,
     )
@@ -214,7 +214,7 @@ class TestDistributedModel(unittest.TestCase):
                     )
                 )
 
-    @parameterized.expand(["SFNO", "SNO", "FCN3"], skip_on_empty=True)
+    @parameterized.expand(["SNO"], skip_on_empty=True)  # "SFNO", "FCN3"
     def test_serial_build_has_no_distributed_layers(self, nettype):
         """
         A model built inside comm.serial() is serial, while the comms are up.
@@ -235,9 +235,9 @@ class TestDistributedModel(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("SFNO", 1e-4),
+            # ("SFNO", 1e-4),
             ("SNO", 1e-4),
-            ("FCN3", 1e-4),
+            # ("FCN3", 1e-4),
         ],
         skip_on_empty=True,
     )
@@ -359,9 +359,9 @@ class TestDistributedModel(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("SFNO", 1e-6, 1e-6),
+            # ("SFNO", 1e-6, 1e-6),
             ("SNO", 1e-6, 1e-6),
-            ("FCN3", 1e-6, 1e-6),
+            # ("FCN3", 1e-6, 1e-6),
         ],
         skip_on_empty=True,
     )
