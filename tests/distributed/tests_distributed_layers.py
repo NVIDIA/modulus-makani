@@ -69,17 +69,17 @@ class TestDistributedLayers(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # [180, 360, 256, 512, 32, 8, 1e-3],
-            # [181, 360, 181, 360, 1, 10, 1e-3],
-            # [180, 360, 128, 256, 32, 8, 1e-4],
-            # [181, 360, 91, 180, 1, 10, 1e-4],
-            # [128, 256, 256, 512, 32, 8, 1e-4],
-            # [91, 180, 181, 360, 1, 10, 1e-4],
+            [180, 360, 256, 512, 32, 8, 1e-3],
+            [181, 360, 181, 360, 1, 10, 1e-3],
+            [180, 360, 128, 256, 32, 8, 1e-4],
+            [181, 360, 91, 180, 1, 10, 1e-4],
+            [128, 256, 256, 512, 32, 8, 1e-4],
+            [91, 180, 181, 360, 1, 10, 1e-4],
             # the three filters of SFNO with scale_factor=8 on a 36 x 72 grid: truncated modes,
             # mixed grid types and an internal grid too small to split evenly
-            # [36, 72, 4, 9, 4, 8, 1e-4, "equiangular", "legendre-gauss", 4, 5],
-            # [4, 9, 4, 9, 4, 8, 1e-4, "legendre-gauss", "legendre-gauss", 4, 5],
-            # [4, 9, 36, 72, 4, 8, 1e-4, "legendre-gauss", "equiangular", 4, 5],
+            [36, 72, 4, 9, 4, 8, 1e-4, "equiangular", "legendre-gauss", 4, 5],
+            [4, 9, 4, 9, 4, 8, 1e-4, "legendre-gauss", "legendre-gauss", 4, 5],
+            [4, 9, 36, 72, 4, 8, 1e-4, "legendre-gauss", "equiangular", 4, 5],
         ],
         skip_on_empty=True,
     )
@@ -256,9 +256,9 @@ class TestDistributedLayers(unittest.TestCase):
     # and the convolution of the decoder on the output grid
     @parameterized.expand(
         [
-            # [36, 72, 4, 9, "equiangular", "legendre-gauss", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
-            # [4, 9, 4, 9, "legendre-gauss", "legendre-gauss", (3, 3), math.sqrt(2.0) * math.pi / 3.0, 4, 8, 1e-4],
-            # [36, 72, 36, 72, "equiangular", "equiangular", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
+            [36, 72, 4, 9, "equiangular", "legendre-gauss", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
+            [4, 9, 4, 9, "legendre-gauss", "legendre-gauss", (3, 3), math.sqrt(2.0) * math.pi / 3.0, 4, 8, 1e-4],
+            [36, 72, 36, 72, "equiangular", "equiangular", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
         ],
         skip_on_empty=True,
     )
@@ -345,12 +345,69 @@ class TestDistributedLayers(unittest.TestCase):
                 )
             )
 
+    def test_distributed_disco_conv_after_conv_without_halo(self, verbose=False):
+        """
+        SNO's encoder convolution followed by its decoder convolution, as in the model.
+
+        On a 2 x 2 grid the encoder (36 x 72 -> 4 x 9) needs no latitude halo. torch-harmonics 0.9.3 still sent
+        the whole local tensor as a halo, which nobody received; on NCCL the decoder's halo exchange picked it
+        up and got the first latitude row of the second polar rank wrong, from B * C_in >= 256 on.
+        """
+        B, C, tol = 8, 32, 1e-4
+
+        conv_args = dict(kernel_shape=(3, 3), basis_type="harmonic", basis_norm_mode="mean", bias=False)
+        encoder_args = dict(
+            in_shape=(36, 72),
+            out_shape=(4, 9),
+            grid_in="equiangular",
+            grid_out="legendre-gauss",
+            theta_cutoff=2.0 * math.pi / 35.0,
+            **conv_args,
+        )
+        decoder_args = dict(
+            in_shape=(36, 72),
+            out_shape=(36, 72),
+            grid_in="equiangular",
+            grid_out="equiangular",
+            theta_cutoff=2.0 * math.pi / 35.0,
+            **conv_args,
+        )
+
+        set_seed(333)
+        encoder_local = th.DiscreteContinuousConvS2(5, C, **encoder_args).to(self.device)
+        encoder_dist = thd.DistributedDiscreteContinuousConvS2(5, C, **encoder_args).to(self.device)
+        decoder_local = th.DiscreteContinuousConvS2(C, 5, **decoder_args).to(self.device)
+        decoder_dist = thd.DistributedDiscreteContinuousConvS2(C, 5, **decoder_args).to(self.device)
+        with torch.no_grad():
+            encoder_dist.weight.copy_(encoder_local.weight)
+            decoder_dist.weight.copy_(decoder_local.weight)
+
+        enc_inp_full = torch.randn((B, 5, 36, 72), dtype=torch.float32, device=self.device)
+        dec_inp_full = torch.randn((B, C, 36, 72), dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            enc_out_full = encoder_local(enc_inp_full)
+            dec_out_full = decoder_local(dec_inp_full)
+            enc_out_local = encoder_dist(self._split_helper(enc_inp_full, hdim=-2, wdim=-1))
+            dec_out_local = decoder_dist(self._split_helper(dec_inp_full, hdim=-2, wdim=-1))
+
+        for desc, out_local, out_full in [
+            ("encoder output", enc_out_local, enc_out_full),
+            ("decoder output", dec_out_local, dec_out_full),
+        ]:
+            with self.subTest(desc=desc):
+                out_gather_full = self._gather_helper(out_local, hdim=-2, wdim=-1)
+                self.assertTrue(
+                    reduce_success(
+                        compare_tensors(desc, out_gather_full, out_full, tol, tol, verbose=verbose), self.device
+                    )
+                )
+
     # the bilinear resampling in the decoder of SNO, from the internal 4 x 9 grid back onto 36 x 72, and the
     # opposite direction
     @parameterized.expand(
         [
-            # [4, 9, 36, 72, "legendre-gauss", "equiangular", 4, 8, 1e-5],
-            # [36, 72, 4, 9, "equiangular", "legendre-gauss", 4, 8, 1e-5],
+            [4, 9, 36, 72, "legendre-gauss", "equiangular", 4, 8, 1e-5],
+            [36, 72, 4, 9, "equiangular", "legendre-gauss", 4, 8, 1e-5],
         ],
         skip_on_empty=True,
     )
@@ -414,7 +471,7 @@ class TestDistributedLayers(unittest.TestCase):
         skip_on_empty=True,
     )
     def test_distributed_layer_batch_size_sequence(
-        self, kind, nlat_in, nlon_in, nlat_out, nlon_out, grid_in, grid_out, theta_cutoff, verbose=True
+        self, kind, nlat_in, nlon_in, nlat_out, nlon_out, grid_in, grid_out, theta_cutoff, verbose=False
     ):
         # the channels of SNO in the model test: 5 variables in and out, embed_dim 32 inside
         C, tol = 32, 1e-4
@@ -531,10 +588,10 @@ class TestDistributedLayers(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # [256, 512, 32, 8, True, 1e-4],
-            # [181, 360, 1, 10, True, 1e-4],
-            # [256, 512, 32, 8, False, 1e-4],
-            # [181, 360, 1, 10, False, 1e-4],
+            [256, 512, 32, 8, True, 1e-4],
+            [181, 360, 1, 10, True, 1e-4],
+            [256, 512, 32, 8, False, 1e-4],
+            [181, 360, 1, 10, False, 1e-4],
         ],
         skip_on_empty=True,
     )
@@ -680,10 +737,10 @@ class TestDistributedLayers(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # [181, 360, 1, 4, "equiangular", True, 1e-4],
-            # [181, 360, 1, 4, "equiangular", False, 1e-4],
-            # [180, 360, 1, 10, "legendre-gauss", True, 1e-4],
-            # [180, 360, 1, 10, "legendre-gauss", False, 1e-4],
+            [181, 360, 1, 4, "equiangular", True, 1e-4],
+            [181, 360, 1, 4, "equiangular", False, 1e-4],
+            [180, 360, 1, 10, "legendre-gauss", True, 1e-4],
+            [180, 360, 1, 10, "legendre-gauss", False, 1e-4],
         ],
         skip_on_empty=True,
     )
@@ -843,11 +900,11 @@ class TestDistributedLayers(unittest.TestCase):
     @parameterized.expand(
         [
             # nlat, nlon, batch, channels, hidden, input_format, bias, amp_mode, atol, rtol
-            # [32, 64, 2, 16, 64, "nchw", True, "bf16", 4e-2, 4e-2],
-            # [32, 64, 2, 16, 64, "nchw", True, "fp16", 2e-2, 2e-2],
-            # [32, 64, 2, 16, 64, "nchw", False, "bf16", 4e-2, 4e-2],
-            # [1, 64, 2, 16, 64, "traditional", True, "bf16", 4e-2, 4e-2],
-            # [1, 64, 2, 16, 64, "traditional", True, "fp16", 2e-2, 2e-2],
+            [32, 64, 2, 16, 64, "nchw", True, "bf16", 4e-2, 4e-2],
+            [32, 64, 2, 16, 64, "nchw", True, "fp16", 2e-2, 2e-2],
+            [32, 64, 2, 16, 64, "nchw", False, "bf16", 4e-2, 4e-2],
+            [1, 64, 2, 16, 64, "traditional", True, "bf16", 4e-2, 4e-2],
+            [1, 64, 2, 16, 64, "traditional", True, "fp16", 2e-2, 2e-2],
         ],
         skip_on_empty=True,
     )
