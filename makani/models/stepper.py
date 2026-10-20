@@ -59,7 +59,9 @@ class StepWrapper(nn.Module):
     denormalization of the output.
 
     ``forward`` takes a :class:`~makani.utils.dataloaders.rollout.Rollout` and
-    runs the model over all of its steps. The rollout carries the input
+    runs the model over all of its steps; :meth:`steps` hands out the
+    predictions one at a time instead, so that an evaluation can release each
+    one before the next, rather than keep all lead times. The rollout carries the input
     window, the dynamic features and the noise sample of each step, so the
     preprocessor keeps no state between steps, and the history statistics of a
     step are passed from its normalization to its denormalization. Outside a
@@ -229,7 +231,8 @@ class StepWrapper(nn.Module):
         Each prediction is fed back into the window of the next step, see
         :class:`~makani.utils.dataloaders.rollout.Rollout`. In training mode,
         push-forward mode and rollout checkpointing apply if configured. For a
-        single step outside a rollout, use :meth:`predict`.
+        single step outside a rollout, use :meth:`predict`; for the predictions
+        one step at a time, use :meth:`steps`.
 
         Parameters
         ----------
@@ -243,6 +246,37 @@ class StepWrapper(nn.Module):
             units, at the batch of the rollout with its ``E`` ensemble members
             folded in; :meth:`~makani.utils.dataloaders.rollout.Rollout.unfold`
             splits them out. Step ``k`` predicts target step ``k``.
+
+        Raises
+        ------
+        TypeError, ValueError, RuntimeError
+            As in :meth:`steps`.
+        """
+        # (B * E, n_steps, C_out, H, W), step k predicts target step k
+        return torch.cat(list(self.steps(rollout)), dim=1)
+
+    def steps(self, rollout: Rollout):
+        r"""
+        Run the model over the steps of a rollout, one prediction at a time.
+
+        The same rollout as :meth:`forward`, but the predictions are handed out
+        as they are made, so that the caller can release each one before the
+        next, e.g. in an evaluation over many lead times. Each prediction is
+        fed back into the window of the next step before it is handed out, so
+        the rollout has finished once the last one is. The rollout is checked
+        right away, not at the first step.
+
+        Parameters
+        ----------
+        rollout : Rollout
+            The rollout, not started yet.
+
+        Returns
+        -------
+        iterator of torch.Tensor
+            The prediction of each step, ``(B * E, 1, C_out, H, W)``, in
+            physical units, at the batch of the rollout with its ``E`` ensemble
+            members folded in.
 
         Raises
         ------
@@ -278,11 +312,10 @@ class StepWrapper(nn.Module):
             _assert_checkpoint_safe(self.model)
             self._checkpoint_checked = True
 
-        preds = []
+        return self._steps(rollout, push_forward, use_checkpoint)
+
+    def _steps(self, rollout, push_forward, use_checkpoint):
         for step in rollout:
             pred = self.predict_step(step, use_checkpoint=use_checkpoint)
-            preds.append(pred)
             rollout.advance(pred.detach() if push_forward else pred)
-
-        # (B * E, n_steps, C_out, H, W), step k predicts target step k
-        return torch.cat(preds, dim=1)
+            yield pred

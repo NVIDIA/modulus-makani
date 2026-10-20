@@ -694,8 +694,8 @@ class EnsembleTrainer(Trainer):
                     # the losses and metrics take the channels of a single step
                     flatten = self.preprocessor.flatten_history
 
-                    with self.autocast():
-                        preds_folded = self.model_eval(rollout)
+                    # one prediction at a time, so that each lead time is released after its metrics
+                    steps = self._eval_steps(rollout)
 
                     # loop over lead times
                     num_lead_times = tar.shape[1]
@@ -705,7 +705,7 @@ class EnsembleTrainer(Trainer):
 
                         with self.autocast():
                             # split the ensemble back out, (B, E, ...), for the loss
-                            pred = rollout.unfold(flatten(preds_folded[:, idt : idt + 1]))
+                            pred = rollout.unfold(flatten(next(steps)))
 
                             loss = self.loss_obj(pred, targ, None)
 

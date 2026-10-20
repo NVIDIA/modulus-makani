@@ -145,6 +145,28 @@ class TestRollout(unittest.TestCase):
         with self.assertRaises(ValueError):
             rollout.advance(torch.randn(_B, 2, _C, _H, _W))
 
+    def test_only_the_last_prediction_may_have_other_channels(self):
+        # a model with other outputs than inputs predicts a single step: nothing is fed back
+        for with_target in [True, False]:
+            with self.subTest(with_target=with_target):
+                rollout = Rollout(_batch(n_future=0, with_target=with_target), n_steps=1)
+                next(rollout)
+                rollout.advance(torch.randn(_B, 1, _C + 2, _H, _W))
+                with self.assertRaises(StopIteration):
+                    next(rollout)
+
+        # the rest of its shape is still checked
+        rollout = Rollout(_batch(n_future=0))
+        next(rollout)
+        with self.assertRaises(ValueError):
+            rollout.advance(torch.randn(_B, 1, _C + 2, _H, _W + 1))
+
+        # a prediction that goes into the next window has to fit it
+        rollout = Rollout(_batch(n_future=1))
+        next(rollout)
+        with self.assertRaises(ValueError):
+            rollout.advance(torch.randn(_B, 1, _C + 2, _H, _W))
+
     def test_started(self):
         rollout = Rollout(_batch(n_future=1))
         self.assertFalse(rollout.started)
@@ -650,6 +672,33 @@ class TestWrapperRollout(unittest.TestCase):
         for name in ref_grads:
             with self.subTest(gradient=name):
                 self.assertTrue(_scaled_rtol_match(name, grads[name], ref_grads[name]))
+
+    def test_steps_hand_out_what_forward_stacks(self):
+        # the same rollout, the predictions one at a time; the noise continues over the steps either way
+        noise = _NOISE["diffusion"]
+        params = _params(1, False, noise)
+        batch = self._batch()
+
+        with torch.no_grad():
+            wrapper = _make_wrapper(params, noise)
+            wrapper.eval()
+            ref = wrapper(_rollout(wrapper, batch))
+
+            wrapper = _make_wrapper(params, noise)
+            wrapper.eval()
+            rollout = _rollout(wrapper, batch)
+            preds = list(wrapper.steps(rollout))
+
+        self.assertEqual(len(preds), rollout.n_steps)
+        self.assertTrue(torch.equal(torch.cat(preds, dim=1), ref))
+        # the last prediction has gone into the rollout too, so it has finished
+        rollout.noise_state()
+
+        # the rollout is checked when the steps are asked for, not at the first one
+        with self.assertRaisesRegex(RuntimeError, "only once"):
+            wrapper.steps(rollout)
+        with self.assertRaises(TypeError):
+            wrapper.steps(batch)
 
     def test_a_rollout_runs_only_once(self):
         wrapper = _make_wrapper(_params(1, False, None), None)

@@ -335,14 +335,17 @@ class Rollout:
         The window drops its oldest step and appends ``pred``; the dynamic
         features and timestamps of the window move on to the predicted time.
         They come from the targets of the batch, or, for a batch without
-        targets, from the caller.
+        targets, from the caller. After the last step there is no next window,
+        so the rollout just finishes: its prediction may then have another
+        number of channels than the window, as for a model whose outputs differ
+        from its inputs, which can predict a single step only.
 
         Parameters
         ----------
         pred : torch.Tensor
             The prediction of the current step, ``(B * ensemble_size, 1, C, *grid)``,
-            in physical units. It is used as it is, so detach it first for
-            push-forward training.
+            in physical units, with any number of channels at the last step. It
+            is used as it is, so detach it first for push-forward training.
         dynamic_features : dict, optional
             Only for a batch without targets: the dynamic features at the
             predicted time, name to ``(B, 1, C_f, *grid)`` at the batch of the
@@ -356,21 +359,25 @@ class Rollout:
         RuntimeError
             If no step is waiting for its prediction.
         ValueError
-            If the prediction does not have the shape of one step of the window;
-            if features or a timestamp are given for a batch with targets, or
+            If the prediction does not have the shape of one step of the window,
+            or, at the last step, another batch, number of steps or grid; if features or a timestamp are given for a batch with targets, or
             are missing, have other names or more than one step for a batch
             without targets.
         """
         if not self._pending:
             raise RuntimeError("advance() needs a step of the rollout to advance: ask for the next step first")
 
-        expected = (self._input.shape[0], 1, *self._input.shape[2:])
-        if tuple(pred.shape) != expected:
-            raise ValueError(
-                f"The prediction has shape {tuple(pred.shape)}, one step of the window has shape {expected}"
-            )
-
         k = self._index
+        last = k + 1 == self._n_steps
+
+        # the last prediction does not go into a window, so only its channels may differ
+        expected = (self._input.shape[0], 1, *self._input.shape[2:])
+        shape = tuple(pred.shape)
+        if last:
+            expected = expected[:2] + shape[2:3] + expected[3:]
+        if shape != expected:
+            raise ValueError(f"The prediction has shape {shape}, one step of the window has shape {expected}")
+
         if self._has_target:
             if (dynamic_features is not None) or (timestamp is not None):
                 raise ValueError(
@@ -380,11 +387,11 @@ class Rollout:
                 name: feature[:, k : k + 1] for name, feature in self._batch[TARGET_DYNAMIC_FEATURES].items()
             }
             timestamp = self._batch[TARGET_TIMESTAMP][:, k : k + 1]
-        elif (k + 1 < self._n_steps) or (dynamic_features is not None) or (timestamp is not None):
+        elif (not last) or (dynamic_features is not None) or (timestamp is not None):
             self._check_next_step(dynamic_features, timestamp)
 
-        self._input = torch.cat([self._input[:, 1:], pred], dim=1)
-        if timestamp is not None:
+        if not last:
+            self._input = torch.cat([self._input[:, 1:], pred], dim=1)
             self._input_features = {
                 name: torch.cat([window[:, 1:], self._fold(dynamic_features[name])], dim=1)
                 for name, window in self._input_features.items()

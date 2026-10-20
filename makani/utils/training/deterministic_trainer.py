@@ -348,6 +348,14 @@ class Trainer(Driver):
         noise_source = self.preprocessor.noise_source(batch_size=batch[INPUT].shape[0] * ensemble_size)
         return Rollout(batch, noise_source=noise_source, ensemble_size=ensemble_size)
 
+    def _eval_steps(self, rollout):
+        # the predictions of a validation rollout one step at a time, so that each can be released
+        # after its metrics instead of keeping all lead times; DDP adds nothing without gradients
+        model = self.model_eval
+        if isinstance(model, nn.parallel.DistributedDataParallel):
+            model = model.module
+        return model.steps(rollout)
+
     def _set_train(self):
         self.model.train()
         self.loss_obj.train()
@@ -698,16 +706,15 @@ class Trainer(Driver):
                     batch = batch_to_device(data, self.device)
                     tar = batch[TARGET]
 
-                    # the autoregressive rollout over all target steps
-                    with self.autocast():
-                        preds = self.model_eval(self._rollout(batch))
+                    # the autoregressive rollout over all target steps, one prediction at a time
+                    steps = self._eval_steps(self._rollout(batch))
 
                     # losses and metrics, one target step at a time
                     for idt in range(tar.shape[1]):
 
                         with self.autocast():
                             # the losses and metrics take the channels of a single step
-                            pred = self.preprocessor.flatten_history(preds[:, idt : idt + 1])
+                            pred = self.preprocessor.flatten_history(next(steps))
                             targ = self.preprocessor.flatten_history(tar[:, idt : idt + 1])
                             loss = self.loss_obj(pred, targ)
 
