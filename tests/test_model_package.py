@@ -124,7 +124,8 @@ class TestZenithFeatureShapes(_ModelPackageTestBase):
 
     That is a dynamic feature as the preprocessor takes it: batch, time and
     channel leading, the grid trailing. Getting either of the two leading axes
-    wrong trips the batch or the time-window check when it is cached.
+    wrong trips the batch or the time-window check when the step wrapper
+    assembles its input.
     """
 
     def _check(self, n_history, batch, n_times):

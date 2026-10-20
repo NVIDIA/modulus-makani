@@ -58,6 +58,9 @@ class _RolloutMixin:
     history statistics of a step are passed from its normalization to its
     denormalization rather than stored.
 
+    Outside a rollout, :meth:`predict` and :meth:`encode` take one window, its
+    dynamic features and its noise sample directly, e.g. for the model package.
+
     Expects ``self.preprocessor`` and ``self.model``. ``_rollout_push_forward``
     and ``_rollout_checkpoint`` are the options of a training rollout;
     :class:`MultiStepWrapper` sets them from the configuration.
@@ -66,12 +69,20 @@ class _RolloutMixin:
     _rollout_push_forward = False
     _rollout_checkpoint = False
 
-    def _predict_window(self, inp, dynamic_features, noise, use_checkpoint: bool = False):
+    def _prepare_window(self, inp, dynamic_features, noise):
+        # the network input of one window, and the history statistics its prediction is denormalized with
         pp = self.preprocessor
 
         x = pp.assemble_input(inp, dynamic_features, noise)
         stats = pp.compute_history_stats(x)
         inpans = pp.pack_model_input(pp.history_normalize(x, target=False, stats=stats))
+
+        return inpans, stats
+
+    def _predict_window(self, inp, dynamic_features, noise, use_checkpoint: bool = False):
+        pp = self.preprocessor
+
+        inpans, stats = self._prepare_window(inp, dynamic_features, noise)
 
         if use_checkpoint:
             # see MultiStepWrapper._forward_train: only the network is recomputed
@@ -99,6 +110,57 @@ class _RolloutMixin:
             Passed on to ``torch.compile``.
         """
         self._predict_window = torch.compile(self._predict_window, **compile_kwargs)
+
+    def predict(self, inp, dynamic_features, noise=None):
+        r"""
+        Predict one step from a window, without a rollout.
+
+        Parameters
+        ----------
+        inp : torch.Tensor
+            The window, ``(B, n_history + 1, C, H, W)``, in physical units.
+        dynamic_features : dict
+            The dynamic features over the window, name to ``(B, n_history + 1, C_f, H, W)``;
+            empty if the model takes none.
+        noise : torch.Tensor, optional
+            The input noise sample, if the model takes noise, see
+            :meth:`~makani.models.preprocessor.Preprocessor2D.noise_source`.
+
+        Returns
+        -------
+        torch.Tensor
+            The prediction, ``(B, 1, C_out, H, W)``, in physical units.
+        """
+        return self._predict_window(inp, dynamic_features, noise)
+
+    def encode(self, inp, dynamic_features, noise=None):
+        r"""
+        The latent state of the network for one window, before decoding.
+
+        The input goes through the same preparation as in :meth:`predict`; only
+        the decoder, the bias correction and the denormalization are skipped.
+
+        Parameters
+        ----------
+        inp, dynamic_features, noise
+            As in :meth:`predict`.
+
+        Returns
+        -------
+        torch.Tensor
+            The latent features, ``(B, embed_dim, h, w)`` on the internal grid of the network.
+
+        Raises
+        ------
+        NotImplementedError
+            If the network does not expose ``encode_process``.
+        """
+        if not hasattr(self.model, "encode_process"):
+            raise NotImplementedError(f"{type(self.model).__name__} does not expose encode_process().")
+
+        inpans, _ = self._prepare_window(inp, dynamic_features, noise)
+
+        return self.model.encode_process(inpans)
 
     def predict_step(self, step: RolloutStep, use_checkpoint: bool = False):
         r"""

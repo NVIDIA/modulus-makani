@@ -26,7 +26,7 @@ from makani.utils.YParams import ParamsBase, ensure_resampled_shapes
 from makani.utils.driver import Driver
 from makani.third_party.climt.zenith_angle_v2 import cos_zenith_angle
 from makani.utils.dataloaders.data_helpers import get_data_normalization
-from makani.utils.dataloaders.batch import INPUT_DYNAMIC_FEATURES, ZENITH
+from makani.utils.dataloaders.batch import ZENITH
 from makani.models import model_registry
 import datetime
 import logging
@@ -279,12 +279,11 @@ class ModelWrapper(torch.nn.Module):
         return z.unsqueeze(2)
 
     def _prepare_input(self, x, time, normalized_data):
-        """Normalize the input and cache its dynamic features.
+        """Normalize the input.
 
         ``x`` is ``(B, (n_history + 1) * C, H, W)``, history in the flattened
         channel axis, oldest first, or ``(B, n_history + 1, C, H, W)``. Returns
-        the input with the time axis explicit, as the step wrappers take it. See
-        :meth:`forward` for the batching contract on ``time``.
+        the input with the time axis explicit, as the step wrappers take it.
         """
         preprocessor = self.model.preprocessor
         if x.dim() == 4:
@@ -294,10 +293,24 @@ class ModelWrapper(torch.nn.Module):
             # the statistics are per channel, (1, C, 1, 1); broadcast them over the time steps
             x = (x - self.in_bias.unsqueeze(1)) / self.in_scale.unsqueeze(1)
 
-        features = {ZENITH: self._zenith_features(x, time)} if self.add_zenith else {}
-        preprocessor.cache_dynamic_features({INPUT_DYNAMIC_FEATURES: features})
-
         return x
+
+    def _step_inputs(self, x, time, normalized_data, replace_state):
+        """Everything the step wrapper takes for one step: the window, its dynamic features and its noise.
+
+        The noise state is advanced here, replaced if ``replace_state`` is set, at the batch of ``x``;
+        see :meth:`forward` for the batching contract on ``time`` and the noise.
+        """
+        x = self._prepare_input(x, time, normalized_data)
+        features = {ZENITH: self._zenith_features(x, time)} if self.add_zenith else {}
+
+        noise = None
+        noise_source = self.model.preprocessor.noise_source(batch_size=x.shape[0])
+        if noise_source is not None:
+            noise_source.update(replace_state=replace_state)
+            noise = noise_source()
+
+        return x, features, noise
 
     def encode_process(self, x, time, normalized_data=True, replace_state=None):
         """Return the backbone's processed latent state without running its decoder.
@@ -313,13 +326,12 @@ class ModelWrapper(torch.nn.Module):
         ------
         NotImplementedError
             If the wrapped step wrapper or backbone does not implement
-            ``encode_process`` (currently only :class:`SingleStepWrapper` around
-            FCN3 does; ``MultiStepWrapper`` and ``ConstraintsWrapper`` do not).
+            ``encode_process`` (currently only FCN3 does).
         """
-        if not hasattr(self.model, "encode_process"):
+        if not hasattr(self.model, "encode"):
             raise NotImplementedError(f"{type(self.model).__name__} does not expose encode_process().")
-        x = self._prepare_input(x, time, normalized_data)
-        return self.model.encode_process(x, replace_state=replace_state)
+        x, features, noise = self._step_inputs(x, time, normalized_data, replace_state)
+        return self.model.encode(x, features, noise)
 
     def forward(self, x, time, normalized_data=True, replace_state=None):
         """Advance the model state by one timestep.
@@ -348,13 +360,11 @@ class ModelWrapper(torch.nn.Module):
         Notes
         -----
         **Batching contract.**
-        Any batch size ``B`` is supported. Two pieces of internal state are
-        sized from ``B`` on every call:
-
-        * The cached cosine-zenith feature, built to ``(B, n_history + 1, 1, H, W)``.
-        * The stochastic noise state, resized by the step wrapper. Note this is
-          independent of ``params.batch_size``, which is a *training* setting and
-          is typically 1 in a packaged model.
+        Any batch size ``B`` is supported. The cosine-zenith feature is built to
+        ``(B, n_history + 1, 1, H, W)`` on every call, and the stochastic noise
+        state, the only state the package keeps between calls, is sized to
+        ``B``. Note this is independent of ``params.batch_size``, which is a
+        *training* setting and is typically 1 in a packaged model.
 
         For a model with input noise, the first call at a new ``B`` must draw a
         fresh state: pass ``replace_state=True``, or prime once up front with
@@ -376,10 +386,10 @@ class ModelWrapper(torch.nn.Module):
         the noise state, which discards the autoregressive noise history for
         stateful noise modules.
         """
-        x = self._prepare_input(x, time, normalized_data)
+        x, features, noise = self._step_inputs(x, time, normalized_data, replace_state)
 
         # one step, (B, 1, C_out, H, W)
-        out = self.model(x, replace_state=replace_state).squeeze(1)
+        out = self.model.predict(x, features, noise).squeeze(1)
 
         if not normalized_data:
             out = out * self.out_scale + self.out_bias
