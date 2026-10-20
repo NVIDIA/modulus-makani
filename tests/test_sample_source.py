@@ -430,7 +430,7 @@ class _BaseESTests:
         n_frames = (N_HIST + 1) + (N_FUT + 1)
         singles = []
         for k in range(n_frames):
-            inp_k, _ = es_single(_SampleInfo(idx_in_epoch=k, epoch_idx=0, iteration=0))
+            inp_k, *_ = es_single(_SampleInfo(idx_in_epoch=k, epoch_idx=0, iteration=0))
             singles.append(inp_k[0])  # shape (n_ch, H, W) — copy returned by _reorder_channels
 
         for t in range(N_HIST + 1):
