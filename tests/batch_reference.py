@@ -52,6 +52,7 @@ from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.batch import to_legacy_tuple, INPUT, TARGET
 from makani.models.noise import DummyNoiseS2
 from makani.models.stepper import MultiStepWrapper
+from makani.utils.dataloaders.rollout import Rollout
 
 from .testutils import get_default_parameters, init_hdf5_dataset, H5_PATH
 
@@ -251,10 +252,10 @@ def _capture_stepper(paths, result):
         )
         wrapper.train()
 
-        # what the trainers do with a batch
-        wrapper.preprocessor.cache_dynamic_features(batch)
+        # what the trainers do with a batch: a rollout over its target steps, with the input noise
+        noise_source = wrapper.preprocessor.noise_source(batch_size=batch[INPUT].shape[0])
         with torch.no_grad():
-            out = wrapper(batch[INPUT])
+            out = wrapper(Rollout(batch, noise_source=noise_source))
 
         # recorded with the time steps folded into the channels, as the losses take them
         flatten = wrapper.preprocessor.flatten_history

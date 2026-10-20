@@ -32,12 +32,11 @@ from makani.utils.profiling import Timer
 
 # makani depenedencies
 from makani.utils import LossHandler, MetricsHandler
-from makani.utils.functions import expand_ensemble
 from makani.utils.driver import Driver
 from makani.utils.training import Trainer
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
-from makani.utils.dataloaders.batch import batch_to_device, map_dynamic_features, INPUT, TARGET
+from makani.utils.dataloaders.batch import batch_to_device, INPUT, TARGET
 from makani.utils.YParams import YParams
 
 # model registry
@@ -220,7 +219,6 @@ class EnsembleTrainer(Trainer):
         iterator = iter(self.train_dataloader)
         data = next(iterator)
         batch = batch_to_device(data, self.device)
-        self.preprocessor.cache_dynamic_features(batch)
         inp, tar = batch[INPUT], batch[TARGET]
         # get shapes
         inp_shape = inp.shape
@@ -487,34 +485,22 @@ class EnsembleTrainer(Trainer):
 
         return
 
-    def _ensemble_step(self, inp: torch.Tensor, tar: torch.Tensor):
+    def _ensemble_step(self, batch):
         """
-        Single forward on a folded batch of size (B*E, ...).
+        Single forward of the rollout over the batch, with the ensemble folded into the batch dim.
 
-        The ensemble dim is carried explicitly as dim 1 through unsqueeze+repeat_interleave,
-        then flattened into dim 0 just for the model forward; the prediction reshapes back
-        to (B, E, ...) for the loss. Noise is drawn once at the folded batch so each
-        (batch, ensemble member) pair sees an independent sample.
+        The rollout folds the members into the batch dim, (B*E, ...), for one forward per step and
+        unfolds the predictions to (B, E, ...) for the loss; the targets stay at (B, ...). The noise
+        is drawn at the folded batch, so each (batch, ensemble member) pair sees an independent sample.
         """
-        E = self.params.local_ensemble_size
-        B = inp.shape[0]
-
-        # (B, T, C, H, W) -> (B*E, T, C, H, W) with ensemble dim folded into batch
-        # (E==1 short-circuits inside expand_ensemble, no allocation)
-        inp_folded = expand_ensemble(inp, E)
-
-        # pre-adjust the preprocessor's noise state to the folded batch; the model is then
-        # called with update_state=False so it consumes this fresh state directly.
-        self.preprocessor.update_internal_state(replace_state=True, batch_size=inp_folded.shape[0])
-
-        pred_folded = self.model_train(inp_folded, update_state=False)
+        rollout = self._rollout(batch, ensemble_size=self.params.local_ensemble_size)
+        pred_folded = self.model_train(rollout)
 
         # the losses take the time steps folded into the channels, and the ensemble as dim 1
         flatten = self.preprocessor.flatten_history
-        pred_flat = flatten(pred_folded)
-        pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
+        pred = rollout.unfold(flatten(pred_folded))
 
-        loss = self.loss_obj(pred, flatten(tar), inp=flatten(inp))
+        loss = self.loss_obj(pred, flatten(batch[TARGET]), inp=flatten(batch[INPUT]))
 
         return pred, loss
 
@@ -546,17 +532,6 @@ class EnsembleTrainer(Trainer):
 
             # map to device
             batch = batch_to_device(data, self.device)
-
-            # When training with local_ensemble_size > 1 we fold the ensemble dim into the
-            # batch dim for a single forward pass. The dynamic features must therefore also
-            # carry an ensemble-expanded batch so shapes line up inside the preprocessor.
-            # x is expanded inside _ensemble_step (to preserve `inp.shape[0]` semantics
-            # below); y stays at its original batch since the loss expects (B, E, ...)
-            # pred vs (B, ...) target.
-            E = self.params.local_ensemble_size
-            batch = map_dynamic_features(batch, lambda feature: expand_ensemble(feature, E))
-
-            self.preprocessor.cache_dynamic_features(batch)
             inp, tar = batch[INPUT], batch[TARGET]
 
             # assuming float32
@@ -572,10 +547,10 @@ class EnsembleTrainer(Trainer):
             with self.autocast():
 
                 if do_update:
-                    pred, loss = self._ensemble_step(inp, tar)
+                    pred, loss = self._ensemble_step(batch)
                 else:
                     with self.model_train.no_sync():
-                        pred, loss = self._ensemble_step(inp, tar)
+                        pred, loss = self._ensemble_step(batch)
                 loss = loss * loss_scaling_fact
 
             # stop on a non-finite loss before it reaches the weights, on all ranks together
@@ -711,27 +686,18 @@ class EnsembleTrainer(Trainer):
                     # map to gpu
                     batch = batch_to_device(data, self.device)
 
-                    # When local_ensemble_size > 1, fold the ensemble dim into the batch dim
-                    # for a single forward pass per rollout step. The dynamic features must be
-                    # expanded so they line up with the folded-batch input; the target stays
-                    # at the original batch — the loss expects (B, E, ...) pred against
-                    # (B, ...) target.
-                    E = self.params.local_ensemble_size
-                    batch = map_dynamic_features(batch, lambda feature: expand_ensemble(feature, E))
-
-                    self.preprocessor.cache_dynamic_features(batch)
-                    inp, tar = batch[INPUT], batch[TARGET]
-
-                    B = inp.shape[0]
-
-                    # expand the input batch to (B*E, ...) for the folded-batch forward
-                    inp = expand_ensemble(inp, E)
+                    # the rollout folds the ensemble into the batch dim for a single forward
+                    # per step, (B*E, ...); the target stays at the original batch -- the loss
+                    # expects (B, E, ...) pred against (B, ...) target. The noise is replaced at
+                    # the first step and continued after it.
+                    tar = batch[TARGET]
+                    rollout = self._rollout(batch, ensemble_size=self.params.local_ensemble_size)
 
                     # the losses and metrics take the channels of a single step
                     flatten = self.preprocessor.flatten_history
 
-                    # draw a fresh stationary noise state at the folded batch for this episode
-                    self.preprocessor.update_internal_state(replace_state=True, batch_size=inp.shape[0])
+                    with self.autocast():
+                        preds_folded = self.model_eval(rollout)
 
                     # loop over lead times
                     num_lead_times = tar.shape[1]
@@ -740,21 +706,8 @@ class EnsembleTrainer(Trainer):
                         targ = flatten(tar[:, idt : idt + 1])
 
                         with self.autocast():
-                            # single forward on the folded batch: at idt==0 the noise state was
-                            # just drawn fresh, so skip the stepper's internal update; for
-                            # subsequent steps run the standard AR update.
-                            pred_folded = self.model_eval(
-                                inp,
-                                update_state=(idt != 0),
-                                replace_state=False,
-                            )
-
-                            # advance the input history / dynamic features once per step
-                            inp = self.preprocessor.append_history(inp, pred_folded, idt, update_state=True)
-
-                            # reshape back to (B, E, ...) for the loss
-                            pred_flat = flatten(pred_folded)
-                            pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
+                            # split the ensemble back out, (B, E, ...), for the loss
+                            pred = rollout.unfold(flatten(preds_folded[:, idt : idt + 1]))
 
                             loss = self.loss_obj(pred, targ, None)
 

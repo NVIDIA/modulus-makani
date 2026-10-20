@@ -185,24 +185,34 @@ class _GatherFromParallelRegion(torch.autograd.Function):
 @torch.compiler.disable
 def copy_to_parallel_region(input, comm_id):
     """Copy input"""
+    # a single rank has nothing to communicate; this also keeps the backward from reducing
+    # without a process group, or over the whole world inside comm.serial()
+    if comm.get_size(comm_id) == 1:
+        return input
     return _CopyToParallelRegion.apply(input, comm_id)
 
 
 @torch.compiler.disable
 def reduce_from_parallel_region(input, comm_id):
     """All-reduce the input from the matmul parallel region."""
+    if comm.get_size(comm_id) == 1:
+        return input
     return _ReduceFromParallelRegion.apply(input, comm_id)
 
 
 @torch.compiler.disable
 def scatter_to_parallel_region(input, dim, comm_id):
     """Split the input and keep only the corresponding chuck to the rank."""
+    if comm.get_size(comm_id) == 1:
+        return input
     return _ScatterToParallelRegion.apply(input, dim, comm_id)
 
 
 @torch.compiler.disable
 def gather_from_parallel_region(input, dim, shapes, comm_id):
     """Gather the input from matmul parallel region and concatenate."""
+    if comm.get_size(comm_id) == 1:
+        return input
     return _GatherFromParallelRegion.apply(input, dim, shapes, comm_id)
 
 
@@ -237,6 +247,8 @@ def distributed_transpose(x, dims, shapes, comm_id):
     torch.Tensor
         The redistributed tensor, now sharded along ``dims[1]``.
     """
+    if comm.get_size(comm_id) == 1:
+        return x
     return _DistributedTranspose.apply(x, dims, shapes, comm_id)
 
 

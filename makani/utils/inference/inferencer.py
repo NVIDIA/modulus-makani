@@ -33,9 +33,9 @@ from makani.utils.dataloaders.batch import (
     batch_to_device,
     INPUT,
     INPUT_DYNAMIC_FEATURES,
-    TARGET_DYNAMIC_FEATURES,
     INPUT_TIMESTAMP,
 )
+from makani.utils.dataloaders.rollout import Rollout
 from makani.utils.dataloaders.data_helpers import get_date_from_timestamp, get_data_normalization, get_climatology
 from makani.utils.YParams import YParams
 
@@ -610,10 +610,7 @@ class Inferencer(Driver):
             climatology_iterator = iter(self.climatology_dataloader)
 
         # create loader for the full epoch
-        inp = None  # folded-batch input carried across rollout steps, shape (B*E, n_history + 1, C, H, W)
-        inp_features = None  # input dynamic features, expanded to (B*E, ...)
-        tinp = None  # input timestamp (unexpanded, shape (B, ...)) kept for date logging / rollout buffer
-        B = None  # unexpanded batch size captured at episode start
+        rollout = None  # the rollout of the current initial condition, the ensemble folded into the batch
         idt = 0
         E = self.params.local_ensemble_size
         with torch.inference_mode():
@@ -633,11 +630,6 @@ class Inferencer(Driver):
                     gbatch = batch_to_device(token, self.device)
                     gfield = gbatch[INPUT]
                     gtime = gbatch[INPUT_TIMESTAMP]
-
-                    # the dynamic features, folded to the ensemble batch like the input
-                    gfeatures = {
-                        name: expand_ensemble(feature, E) for name, feature in gbatch[INPUT_DYNAMIC_FEATURES].items()
-                    }
 
                     # get mask
                     if self.mask_dataset is not None:
@@ -662,56 +654,44 @@ class Inferencer(Driver):
                         clims = None
 
                     if idte == 0:
-                        # episode start: a new initial condition.
-                        # The ensemble dim is folded into the batch dim for the whole rollout
-                        # (shape (B*E, ...) going into the model). Noise state is reset once
-                        # here and then evolves via AR updates during the rollout.
-                        inp_raw, tinp = gfield, gtime
-                        inp_features = gfeatures
+                        # episode start: a new initial condition. The rollout folds the ensemble
+                        # dim into the batch dim, (B*E, ...) going into the model, and replaces
+                        # the noise state at its first step; it evolves via AR updates after that.
+                        tinp = gtime
 
                         dates = date_fn(tinp.flatten().detach().cpu()).tolist()
                         datestring = ", ".join([d.strftime("%Y-%m-%dT%H:%M:%S") for d in dates])
                         print(f"inferencing dates: {datestring}")
 
-                        B = inp_raw.shape[0]
-
-                        # fold the ensemble dim into the batch dim (no-op when E==1), keeping
-                        # the time axis: (B*E, n_history + 1, C, H, W)
-                        inp = expand_ensemble(inp_raw, E)
-
-                        # reset noise state at the folded batch for this episode
-                        self.preprocessor.update_internal_state(replace_state=True, batch_size=inp.shape[0])
+                        noise_source = self.preprocessor.noise_source(batch_size=gfield.shape[0] * E)
+                        rollout = Rollout(gbatch, n_steps=rollout_steps, noise_source=noise_source, ensemble_size=E)
 
                         if rollout_buffer is not None:
-                            inp_flat = self.preprocessor.flatten_history(inp)
-                            inpt_viz = inp_flat.reshape(B, E, *inp_flat.shape[1:])
-                            rollout_buffer.update(inpt_viz, tinp[:, 0], idt=idte)
+                            inp_flat = self.preprocessor.flatten_history(expand_ensemble(gfield, E))
+                            rollout_buffer.update(rollout.unfold(inp_flat), tinp[:, 0], idt=idte)
 
                     else:
-                        # rollout step
-                        tar, ttar = gfield, gtime
-                        tar_features = gfeatures
+                        # rollout step: the sample is the verification, its latest step is the
+                        # predicted time
+                        tar, ttar = gfield[:, -1:], gtime[:, -1:]
+                        tar_features = {
+                            name: feature[:, -1:] for name, feature in gbatch[INPUT_DYNAMIC_FEATURES].items()
+                        }
 
                         # the losses, metrics and buffers take the channels flat
                         targ = self.preprocessor.flatten_history(tar)
 
-                        # the dynamic features at (B*E, ...) to match the folded-batch inp; the
-                        # verification sample supplies the target side
-                        self.preprocessor.cache_dynamic_features(
-                            {INPUT_DYNAMIC_FEATURES: inp_features, TARGET_DYNAMIC_FEATURES: tar_features}
-                        )
-
                         with self.autocast():
-                            # single forward on the folded batch; noise does an AR update
-                            # (replace_state=False) before being consumed this step
-                            pred_step = self.model(inp, update_state=True, replace_state=False)
+                            # single forward on the folded batch
+                            step = next(rollout)
+                            pred_step = self.model.predict_step(step)
 
-                            # advance the input history / dynamic features once per step
-                            inp = self.preprocessor.append_history(inp, pred_step, 0, update_state=True)
+                            # the batch has no targets: the verification sample supplies the
+                            # dynamic features and the time the window moves on to
+                            rollout.advance(pred_step, dynamic_features=tar_features, timestamp=ttar)
 
-                            # reshape back to (B, E, ...) for downstream metrics / loss / buffers
-                            pred_flat = self.preprocessor.flatten_history(pred_step)
-                            pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
+                            # split the ensemble back out, (B, E, ...), for metrics / loss / buffers
+                            pred = rollout.unfold(self.preprocessor.flatten_history(pred_step))
 
                             # set weight to None here, since I am not sure what to do for spectral components
                             # in spectral CRPS
@@ -719,10 +699,6 @@ class Inferencer(Driver):
 
                             if rollout_buffer is not None:
                                 rollout_buffer.update(pred, ttar[:, 0], idt=idte)
-
-                        # swap dynamic features/timestamp for the next rollout step
-                        inp_features = tar_features
-                        tinp = ttar
 
                         # update the metrics starting from the first actual prediction
                         if metrics is not None:

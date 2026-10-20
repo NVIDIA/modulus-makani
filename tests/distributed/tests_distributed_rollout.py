@@ -20,8 +20,8 @@ The trainers wrap the model in DDP, and a rollout runs the model once per step
 before a single backward. Two ways of doing that are compared against the same
 rollout without DDP:
 
-* the loop inside one DDP forward: DDP wraps a module whose forward runs the
-  whole rollout, as it wraps MultiStepWrapper now;
+* the loop inside one DDP forward: DDP wraps the wrapper, whose forward runs the
+  whole rollout, as the deterministic trainer does;
 * one DDP forward per step, with ``no_sync`` for all but the last.
 
 The model is serial and replicated on every rank, and every rank rolls out the
@@ -45,7 +45,6 @@ from parameterized import parameterized
 from makani.utils import comm
 from makani.mpu.mappings import init_gradient_reduction_hooks
 from makani.utils.dataloaders.batch import TARGET, batch_to_device
-from makani.utils.dataloaders.rollout import Rollout, run_rollout
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from .distributed_helpers import _init_grid, reduce_success, teardown_comms
@@ -59,23 +58,9 @@ from ..test_rollout import (
     _gradients,
     _loss,
     _make_wrapper,
-    _model_step,
-    _noise_source,
     _params,
+    _rollout,
 )
-
-
-class _RolloutModule(nn.Module):
-    """The unit DDP wraps: its forward runs the whole rollout."""
-
-    def __init__(self, wrapper, push_forward):
-        super().__init__()
-        self.preprocessor = wrapper.preprocessor
-        self.model = wrapper.model
-        self.push_forward = push_forward
-
-    def forward(self, rollout):
-        return run_rollout(_model_step(self.preprocessor, self.model), rollout, push_forward=self.push_forward)
 
 
 class _StepModule(nn.Module):
@@ -85,9 +70,10 @@ class _StepModule(nn.Module):
         super().__init__()
         self.preprocessor = wrapper.preprocessor
         self.model = wrapper.model
+        self._wrapper = [wrapper]
 
     def forward(self, step):
-        return _model_step(self.preprocessor, self.model)(step)
+        return self._wrapper[0].predict_step(step)
 
 
 _CASES = [
@@ -120,13 +106,11 @@ class TestDistributedRollout(unittest.TestCase):
         set_seed(1)
         return batch_to_device(_batch(n_history=n_history, n_future=_N_FUTURE, grid=(_H * 4, _W * 4)), self.device)
 
-    def _reference(self, wrapper, push_forward, batch):
+    def _reference(self, wrapper, batch):
         # the same wrapper in every iteration, so that its noise moves on like the one under DDP
         wrapper.zero_grad(set_to_none=True)
         with comm.serial():
-            rollout = Rollout(batch, noise_source=_noise_source(wrapper.preprocessor))
-            pred = run_rollout(_model_step(wrapper.preprocessor, wrapper.model), rollout, push_forward=push_forward)
-            _loss(pred, batch[TARGET]).backward()
+            _loss(wrapper(_rollout(wrapper, batch)), batch[TARGET]).backward()
         return _gradients(wrapper)
 
     def _ddp(self, module):
@@ -154,17 +138,15 @@ class TestDistributedRollout(unittest.TestCase):
     @parameterized.expand(_CASES)
     def test_rollout_inside_one_ddp_forward(self, noise_name, n_history, push_forward):
         batch = self._batch(n_history)
-        module = _RolloutModule(self._wrapper(noise_name, n_history, push_forward), push_forward)
+        module = self._wrapper(noise_name, n_history, push_forward)
         ddp = self._ddp(module)
         reference = self._wrapper(noise_name, n_history, push_forward)
 
         for iteration in range(2):
-            ref = self._reference(reference, push_forward, batch)
+            ref = self._reference(reference, batch)
             module.zero_grad(set_to_none=True)
             with comm.serial():
-                rollout = Rollout(batch, noise_source=_noise_source(module.preprocessor))
-                _loss(ddp(rollout), batch[TARGET]).backward()
-            # the module names its children like the wrapper does, so the gradients compare by name
+                _loss(ddp(_rollout(module, batch)), batch[TARGET]).backward()
             self._check(f"iteration {iteration}", _gradients(module), ref)
 
     @parameterized.expand(_CASES)
@@ -175,10 +157,10 @@ class TestDistributedRollout(unittest.TestCase):
         reference = self._wrapper(noise_name, n_history, push_forward)
 
         for iteration in range(2):
-            ref = self._reference(reference, push_forward, batch)
+            ref = self._reference(reference, batch)
             module.zero_grad(set_to_none=True)
             with comm.serial():
-                rollout = Rollout(batch, noise_source=_noise_source(module.preprocessor))
+                rollout = _rollout(module, batch)
                 preds = []
                 for step in rollout:
                     last = step.index == rollout.n_steps - 1

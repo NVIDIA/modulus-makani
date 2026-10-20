@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 # torch
 import torch
-from torch import amp
+from torch import amp, nn
 import torch.distributed as dist
 
 import wandb
@@ -36,6 +36,7 @@ from makani.utils.driver import Driver
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
 from makani.utils.dataloaders.batch import batch_to_device, INPUT, TARGET
+from makani.utils.dataloaders.rollout import Rollout
 from makani.utils.YParams import YParams
 
 # model registry
@@ -222,7 +223,6 @@ class Trainer(Driver):
         iterator = iter(self.train_dataloader)
         data = next(iterator)
         batch = batch_to_device(data, self.device)
-        self.preprocessor.cache_dynamic_features(batch)
         inp, tar = batch[INPUT], batch[TARGET]
         # get shapes
         inp_shape = inp.shape
@@ -320,7 +320,10 @@ class Trainer(Driver):
     def _compile_model(self, inp_shape):
 
         if self.params.jit_mode == "inductor":
-            self.model = torch.compile(self.model)
+            # compile the step, not the rollout: the loop and the noise stay in Python, and the
+            # compiled step does not depend on the number of steps. See _RolloutMixin.compile_step
+            wrapper = self.model.module if isinstance(self.model, nn.parallel.DistributedDataParallel) else self.model
+            wrapper.compile_step()
             # NOTE: do not torch.compile the whole LossHandler. It compiles its individual
             # loss terms internally (skipping the spherical-harmonic/spectral losses, whose
             # complex-valued SHT cannot be codegen'd by inductor's Triton backend —
@@ -339,6 +342,12 @@ class Trainer(Driver):
         # the losses take the time steps folded into the channels
         flatten = self.preprocessor.flatten_history
         return self.loss_obj(flatten(pred), flatten(tar), inp=flatten(inp))
+
+    def _rollout(self, batch, ensemble_size=1):
+        # the rollout over all target steps of the batch, with the input noise of the model at the
+        # batch the model sees, the ensemble members folded in
+        noise_source = self.preprocessor.noise_source(batch_size=batch[INPUT].shape[0] * ensemble_size)
+        return Rollout(batch, noise_source=noise_source, ensemble_size=ensemble_size)
 
     def _set_train(self):
         self.model.train()
@@ -535,7 +544,6 @@ class Trainer(Driver):
 
             # map to device
             batch = batch_to_device(data, self.device)
-            self.preprocessor.cache_dynamic_features(batch)
             inp, tar = batch[INPUT], batch[TARGET]
 
             # assuming float32
@@ -550,12 +558,12 @@ class Trainer(Driver):
             with self.autocast():
                 if do_update:
                     # regular forward pass including DDP
-                    pred = self.model_train(inp)
+                    pred = self.model_train(self._rollout(batch))
                     loss = self._loss(pred, tar, inp)
                 else:
                     # disable sync step
                     with self.model_train.no_sync():
-                        pred = self.model_train(inp)
+                        pred = self.model_train(self._rollout(batch))
                         loss = self._loss(pred, tar, inp)
                 loss = loss * loss_scaling_fact
 
@@ -689,19 +697,18 @@ class Trainer(Driver):
 
                     # map to gpu
                     batch = batch_to_device(data, self.device)
-                    self.preprocessor.cache_dynamic_features(batch)
-                    inp, tar = batch[INPUT], batch[TARGET]
+                    tar = batch[TARGET]
 
-                    # do autoregression, one target step at a time
-                    inpt = inp
+                    # the autoregressive rollout over all target steps
+                    with self.autocast():
+                        preds = self.model_eval(self._rollout(batch))
+
+                    # losses and metrics, one target step at a time
                     for idt in range(tar.shape[1]):
 
-                        # FW pass
                         with self.autocast():
-                            pred_step = self.model_eval(inpt)
-
                             # the losses and metrics take the channels of a single step
-                            pred = self.preprocessor.flatten_history(pred_step)
+                            pred = self.preprocessor.flatten_history(preds[:, idt : idt + 1])
                             targ = self.preprocessor.flatten_history(tar[:, idt : idt + 1])
                             loss = self.loss_obj(pred, targ)
 
@@ -722,9 +729,6 @@ class Trainer(Driver):
 
                         # put in the metrics handler
                         self.metrics.update(pred, targ, loss, idt)
-
-                        # append history
-                        inpt = self.preprocessor.append_history(inpt, pred_step, idt)
 
                     self.step_timer.end_step()
                     if torch.cuda.is_available():

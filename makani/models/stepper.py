@@ -18,6 +18,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from makani.models.preprocessor import Preprocessor2D
+from makani.utils.dataloaders.rollout import Rollout, RolloutStep
 
 
 def _assert_checkpoint_safe(module: nn.Module):
@@ -46,7 +47,98 @@ def _assert_checkpoint_safe(module: nn.Module):
         )
 
 
-class SingleStepWrapper(nn.Module):
+class _RolloutMixin:
+    r"""
+    The stateless rollout shared by the wrappers.
+
+    Given a :class:`~makani.utils.dataloaders.rollout.Rollout`, the wrappers
+    run the model over all of its steps. The rollout carries the input window,
+    the dynamic features and the noise sample of each step, so the
+    preprocessor keeps no state between steps: no feature caches, and the
+    history statistics of a step are passed from its normalization to its
+    denormalization rather than stored.
+
+    Expects ``self.preprocessor`` and ``self.model``. ``_rollout_push_forward``
+    and ``_rollout_checkpoint`` are the options of a training rollout;
+    :class:`MultiStepWrapper` sets them from the configuration.
+    """
+
+    _rollout_push_forward = False
+    _rollout_checkpoint = False
+
+    def _predict_window(self, inp, dynamic_features, noise, use_checkpoint: bool = False):
+        pp = self.preprocessor
+
+        x = pp.assemble_input(inp, dynamic_features, noise)
+        stats = pp.compute_history_stats(x)
+        inpans = pp.pack_model_input(pp.history_normalize(x, target=False, stats=stats))
+
+        if use_checkpoint:
+            # see MultiStepWrapper._forward_train: only the network is recomputed
+            predn = checkpoint(self.model, inpans, use_reentrant=False, preserve_rng_state=True)
+        else:
+            predn = self.model(inpans)
+
+        # the network predicts one step as a flat channel stack; give it its time axis back
+        predn = pp.correct_bias(predn).unsqueeze(1)
+
+        return pp.history_denormalize(predn, target=True, stats=stats)
+
+    def compile_step(self, **compile_kwargs):
+        r"""
+        ``torch.compile`` the prediction of one rollout step.
+
+        A rollout runs its loop, and draws its noise, in Python; what is worth
+        compiling is the step: preprocessing, network and postprocessing. The
+        compiled step does not depend on the number of steps, and the state
+        dict keeps its keys.
+
+        Parameters
+        ----------
+        **compile_kwargs
+            Passed on to ``torch.compile``.
+        """
+        self._predict_window = torch.compile(self._predict_window, **compile_kwargs)
+
+    def predict_step(self, step: RolloutStep, use_checkpoint: bool = False):
+        r"""
+        Predict one step of a rollout.
+
+        Parameters
+        ----------
+        step : RolloutStep
+            The step, as a :class:`~makani.utils.dataloaders.rollout.Rollout` hands it out.
+        use_checkpoint : bool, optional
+            Recompute the network in the backward pass instead of keeping its
+            activations. By default ``False``.
+
+        Returns
+        -------
+        torch.Tensor
+            The prediction, ``(B, 1, C_out, H, W)``, in physical units.
+        """
+        return self._predict_window(step.input, step.input_dynamic_features, step.noise, use_checkpoint)
+
+    def _forward_rollout(self, rollout: Rollout):
+        if rollout.n_steps == 0:
+            raise ValueError("The rollout has no steps to predict")
+        if rollout.started:
+            raise RuntimeError("The rollout has been stepped already: a rollout can be run only once, make a new one")
+        push_forward = self.training and self._rollout_push_forward
+        # push-forward already detaches between steps, so checkpointing would be redundant there
+        use_checkpoint = self.training and self._rollout_checkpoint and torch.is_grad_enabled() and not push_forward
+
+        preds = []
+        for step in rollout:
+            pred = self.predict_step(step, use_checkpoint=use_checkpoint)
+            preds.append(pred)
+            rollout.advance(pred.detach() if push_forward else pred)
+
+        # (B, n_steps, C_out, H, W), aligned with the targets
+        return torch.cat(preds, dim=1)
+
+
+class SingleStepWrapper(_RolloutMixin, nn.Module):
     r"""
     Bind a model to its preprocessor for a single forecast step.
 
@@ -101,8 +193,11 @@ class SingleStepWrapper(nn.Module):
 
         Parameters
         ----------
-        inp : torch.Tensor
+        inp : torch.Tensor or Rollout
             Input of shape ``(B, n_history + 1, C, H, W)`` in physical units.
+            Given a :class:`~makani.utils.dataloaders.rollout.Rollout`, the
+            model is run over all of its steps instead, see :class:`_RolloutMixin`;
+            the state arguments do not apply then, the rollout drives the noise.
         update_state : bool, optional
             Advance the stochastic noise state before the forward pass, by
             default ``True``.
@@ -115,8 +210,11 @@ class SingleStepWrapper(nn.Module):
         -------
         torch.Tensor
             Prediction of shape ``(B, 1, C_out, H, W)``, denormalized back to
-            physical units.
+            physical units; ``(B, n_steps, C_out, H, W)`` for a rollout.
         """
+        if isinstance(inp, Rollout):
+            return self._forward_rollout(inp)
+
         inpans = self._preprocess(inp, update_state=update_state, replace_state=replace_state)
 
         return _finish_step(self.preprocessor, self.model(inpans))
@@ -187,7 +285,7 @@ def _finish_step(preprocessor, predn):
     return preprocessor.history_denormalize(predn, target=True)
 
 
-class MultiStepWrapper(nn.Module):
+class MultiStepWrapper(_RolloutMixin, nn.Module):
     r"""
     Bind a model to its preprocessor for an autoregressive rollout.
 
@@ -238,6 +336,10 @@ class MultiStepWrapper(nn.Module):
 
         # collect parameters for history
         self.n_future = params.n_future
+
+        # the same options for a rollout
+        self._rollout_push_forward = self.push_forward_mode
+        self._rollout_checkpoint = self.multistep_checkpoint
 
     def _forward_train(self, inp, update_state=True, replace_state=True):
         result = []
@@ -307,11 +409,17 @@ class MultiStepWrapper(nn.Module):
         and rollout checkpointing, which do not apply under ``no_grad``. The
         evaluation path predicts one step; the caller drives the rollout.
 
+        Given a :class:`~makani.utils.dataloaders.rollout.Rollout` instead of
+        a tensor, the model is run over all steps of the rollout, in training
+        and evaluation mode alike, see :class:`_RolloutMixin`. Push-forward
+        mode and rollout checkpointing apply in training mode.
+
         Parameters
         ----------
-        inp : torch.Tensor
+        inp : torch.Tensor or Rollout
             Initial input of shape ``(B, n_history + 1, C, H, W)`` in physical
-            units.
+            units, or a rollout; the state arguments do not apply to a rollout,
+            it drives the noise itself.
         update_state : bool, optional
             Advance the stochastic noise state before the rollout, by default
             ``True``.
@@ -323,8 +431,12 @@ class MultiStepWrapper(nn.Module):
         -------
         torch.Tensor
             Predictions of shape ``(B, n_future + 1, C_out, H, W)`` in training
-            mode and ``(B, 1, C_out, H, W)`` in evaluation mode.
+            mode and ``(B, 1, C_out, H, W)`` in evaluation mode;
+            ``(B, n_steps, C_out, H, W)`` for a rollout.
         """
+        if isinstance(inp, Rollout):
+            return self._forward_rollout(inp)
+
         # decide which routine to call
         if self.training:
             y = self._forward_train(inp, update_state=update_state, replace_state=replace_state)

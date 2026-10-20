@@ -165,6 +165,17 @@ class BaseNoiseS2(nn.Module):
                 persistent=False,
             )
 
+    def _detach_state(self):
+        """
+        Cut the state loose from the autograd graph before it is overwritten in place.
+
+        Learnable stateful noise keeps its state in the graph during a rollout, see
+        :meth:`DiffusionNoiseS2.update`; writing into that tensor in place would corrupt the
+        backward of the steps that used it.
+        """
+        if self.state.grad_fn is not None:
+            self._buffers["state"] = self.state.detach().clone()
+
     def is_stateful(self):
         r"""
         Whether the noise carries state across calls.
@@ -237,6 +248,7 @@ class BaseNoiseS2(nn.Module):
         """
         if batch_size is not None:
             self._ensure_state(batch_size)
+        self._detach_state()
         with torch.no_grad():
             self.state.zero_()
 
@@ -368,6 +380,7 @@ class BaseNoiseS2(nn.Module):
             )
         if tuple(newstate.shape) != tuple(self.state.shape):
             self._ensure_state(newstate.shape[0])
+        self._detach_state()
         with torch.no_grad():
             self.state.copy_(newstate)
         return
@@ -863,25 +876,29 @@ class DiffusionNoiseS2(BaseNoiseS2):
         if batch_size is not None:
             self._ensure_state(batch_size)
 
+        # the innovations are drawn without gradients
         with torch.no_grad():
-            with amp.autocast(device_type=self.state.device.type, enabled=False):
-                # draw either the full T-step history (replace) or a single step (AR)
-                if replace_state:
-                    eta_l = torch.empty_like(self.state)
-                else:
-                    B = self.state.shape[0]
-                    eta_l = torch.empty(
-                        (B, 1, self.num_channels, self.lmax_local, self.mmax_local, 2),
-                        dtype=self.state.dtype,
-                        device=self.state.device,
-                    )
-                if self.state.is_cuda:
-                    eta_l.normal_(mean=0.0, std=1.0, generator=self.rng_gpu)
-                else:
-                    eta_l.normal_(mean=0.0, std=1.0, generator=self.rng_cpu)
+            # draw either the full T-step history (replace) or a single step (AR)
+            if replace_state:
+                eta = torch.empty_like(self.state)
+            else:
+                B = self.state.shape[0]
+                eta = torch.empty(
+                    (B, 1, self.num_channels, self.lmax_local, self.mmax_local, 2),
+                    dtype=self.state.dtype,
+                    device=self.state.device,
+                )
+            if self.state.is_cuda:
+                eta.normal_(mean=0.0, std=1.0, generator=self.rng_gpu)
+            else:
+                eta.normal_(mean=0.0, std=1.0, generator=self.rng_cpu)
 
+        # the recurrence keeps its graph if the noise is learnable: phi and sigma_l enter the
+        # state only here, and get their gradients through it in the steps that use the state
+        with torch.set_grad_enabled(self.learnable and torch.is_grad_enabled()):
+            with amp.autocast(device_type=self.state.device.type, enabled=False):
                 # multiply by sigma
-                eta_l = self.sigma_l * eta_l
+                eta_l = self.sigma_l * eta
 
                 # reflect if required:
                 if self.reflect:
@@ -896,14 +913,22 @@ class DiffusionNoiseS2(BaseNoiseS2):
                     else:
                         newstate = self.phi * self.state + eta_l
                 else:
-                    newstate = eta_l
-                    # the very first element in the time history requires a different weighting to sample the stationary distribution
-                    newstate[:, 0, ...] = newstate[:, 0, ...] / torch.sqrt(1.0 - self.phi**2)
+                    # the very first element in the time history requires a different weighting to sample the
+                    # stationary distribution; out of place, so that the graph stays intact
+                    newstate = torch.cat([eta_l[:, :1] / torch.sqrt(1.0 - self.phi**2), eta_l[:, 1:]], dim=1)
                     # get the right history by multiplying with the discount matrix
                     if self.num_time_steps > 1:
                         newstate = torch.einsum("ctr,brclmu->btclmu", self.discount, newstate).contiguous()
 
-                # shape matches self.state after _ensure_state above
+        if newstate.requires_grad:
+            # the state is the tensor of the recurrence, not a copy of it, so that the graph reaches phi
+            # and sigma_l. A rollout has to replace the state at its first step: continuing it from a
+            # previous rollout would chain into the graph of that rollout, which is gone after its backward
+            self._buffers["state"] = newstate
+        else:
+            # shape matches self.state after _ensure_state above
+            self._detach_state()
+            with torch.no_grad():
                 self.state.copy_(newstate)
 
         return

@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from parameterized import parameterized
 
-from makani.models.stepper import MultiStepWrapper
+from makani.models.stepper import MultiStepWrapper, SingleStepWrapper
 from makani.utils.dataloaders.batch import (
     INPUT,
     TARGET,
@@ -33,6 +33,7 @@ from makani.utils.dataloaders.batch import (
     make_batch,
 )
 from makani.utils.dataloaders.rollout import Rollout, run_rollout
+from makani.utils.functions import expand_ensemble
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from .testutils import get_default_parameters, set_seed, compare_tensors, disable_tf32
@@ -133,6 +134,14 @@ class TestRollout(unittest.TestCase):
         with self.assertRaises(ValueError):
             rollout.advance(torch.randn(_B, 2, _C, _H, _W))
 
+    def test_started(self):
+        rollout = Rollout(_batch(n_future=1))
+        self.assertFalse(rollout.started)
+        next(rollout)
+        self.assertTrue(rollout.started)
+        rollout.advance(torch.randn(_B, 1, _C, _H, _W))
+        self.assertTrue(rollout.started)
+
     def test_number_of_steps(self):
         self.assertEqual(len(Rollout(_batch(n_future=3))), 4)
         self.assertEqual(len(Rollout(_batch(n_future=3), n_steps=2)), 2)
@@ -143,12 +152,64 @@ class TestRollout(unittest.TestCase):
         batch = _batch(with_target=False)
         with self.assertRaises(ValueError):
             Rollout(batch)
-        with self.assertRaises(NotImplementedError):
-            Rollout(batch, n_steps=2)
 
         step = next(Rollout(batch, n_steps=1))
         self.assertIsNone(step.target)
         self.assertEqual(step.target_dynamic_features, {})
+
+    def test_without_targets_the_caller_supplies_the_next_step(self):
+        # how the inferencer rolls out: the verification samples arrive one step at a time, and with
+        # them the features and the time of the predicted step. That is the rollout of the batch with
+        # those targets.
+        E = 2
+        batch = _batch(n_history=1, n_future=2)
+        streamed = Rollout(_take(batch, None, without_target=True), n_steps=3, ensemble_size=E)
+        reference = Rollout(batch, ensemble_size=E)
+
+        for k, (step, ref) in enumerate(zip(streamed, reference)):
+            with self.subTest(step=k):
+                self.assertTrue(torch.equal(step.input, ref.input))
+                self.assertTrue(torch.equal(step.input_dynamic_features[ZENITH], ref.input_dynamic_features[ZENITH]))
+                self.assertTrue(torch.equal(step.input_timestamp, ref.input_timestamp))
+                self.assertIsNone(step.target)
+
+            pred = torch.randn(_B * E, 1, _C, _H, _W)
+            reference.advance(pred)
+            streamed.advance(
+                pred,
+                dynamic_features={ZENITH: batch[TARGET_DYNAMIC_FEATURES][ZENITH][:, k : k + 1]},
+                timestamp=batch[TARGET_TIMESTAMP][:, k : k + 1],
+            )
+
+    def test_without_targets_the_next_step_is_checked(self):
+        batch = _take(_batch(n_history=1, n_future=2), None, without_target=True)
+        pred = torch.randn(_B, 1, _C, _H, _W)
+        zenith = torch.randn(_B, 1, 1, _H, _W)
+        time = torch.zeros(_B, 1, dtype=torch.float64)
+
+        cases = {
+            "missing": {},
+            "no timestamp": {"dynamic_features": {ZENITH: zenith}},
+            "other features": {"dynamic_features": {"other": zenith}, "timestamp": time},
+            "two steps": {"dynamic_features": {ZENITH: torch.cat([zenith, zenith], 1)}, "timestamp": time},
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(case=name):
+                rollout = Rollout(batch, n_steps=2)
+                next(rollout)
+                with self.assertRaises(ValueError):
+                    rollout.advance(pred, **kwargs)
+
+        # nothing is needed after the last step
+        rollout = Rollout(batch, n_steps=1)
+        next(rollout)
+        rollout.advance(pred)
+
+        # with targets, the next step comes from the batch
+        rollout = Rollout(_batch())
+        next(rollout)
+        with self.assertRaises(ValueError):
+            rollout.advance(pred, dynamic_features={ZENITH: zenith}, timestamp=time)
 
     def test_noise_is_replaced_first_and_continued_after(self):
         noise = _RecordingNoise()
@@ -190,17 +251,70 @@ class TestRollout(unittest.TestCase):
                 expected = (4.0 if push_forward else 12.0) * batch[INPUT][:, -1].sum()
                 self.assertTrue(torch.allclose(grad, expected, rtol=1e-5))
 
+    def test_ensemble_folds_what_the_model_sees(self):
+        # with an ensemble, the rollout is that of the batch with every member a copy of its sample,
+        # except for the targets, which stay at the batch of the data
+        E = 3
+        batch = _batch(n_history=1, n_future=2)
+        rollout = Rollout(batch, ensemble_size=E)
+        reference = Rollout(
+            make_batch(
+                inp=expand_ensemble(batch[INPUT], E),
+                inp_timestamp=expand_ensemble(batch[INPUT_TIMESTAMP], E),
+                tar=expand_ensemble(batch[TARGET], E),
+                tar_timestamp=expand_ensemble(batch[TARGET_TIMESTAMP], E),
+                inp_zenith=expand_ensemble(batch[INPUT_DYNAMIC_FEATURES][ZENITH], E),
+                tar_zenith=expand_ensemble(batch[TARGET_DYNAMIC_FEATURES][ZENITH], E),
+            )
+        )
+
+        self.assertEqual(rollout.ensemble_size, E)
+        for k, (step, ref) in enumerate(zip(rollout, reference)):
+            with self.subTest(step=k):
+                self.assertEqual(step.input.shape[0], _B * E)
+                self.assertTrue(torch.equal(step.input, ref.input))
+                self.assertTrue(torch.equal(step.input_dynamic_features[ZENITH], ref.input_dynamic_features[ZENITH]))
+                self.assertTrue(torch.equal(step.input_timestamp, ref.input_timestamp))
+                self.assertTrue(torch.equal(step.target_dynamic_features[ZENITH], ref.target_dynamic_features[ZENITH]))
+                self.assertTrue(torch.equal(step.target_timestamp, ref.target_timestamp))
+                self.assertTrue(torch.equal(step.target, batch[TARGET][:, k : k + 1]))
+
+            # predictions come at the batch of the model, and differ between the members
+            pred = torch.randn(_B * E, 1, _C, _H, _W)
+            rollout.advance(pred)
+            reference.advance(pred)
+
+    def test_unfold_splits_the_members_out(self):
+        E = 3
+        rollout = Rollout(_batch(), ensemble_size=E)
+        x = torch.randn(_B, _C, _H, _W)
+        unfolded = rollout.unfold(expand_ensemble(x, E))
+        self.assertEqual(tuple(unfolded.shape), (_B, E, _C, _H, _W))
+        for e in range(E):
+            self.assertTrue(torch.equal(unfolded[:, e], x))
+
+        with self.assertRaises(ValueError):
+            rollout.unfold(torch.randn(_B * E + 1, _C))
+        with self.assertRaises(ValueError):
+            Rollout(_batch(), ensemble_size=0)
+
+    def test_ensemble_predictions_of_the_wrong_batch_are_refused(self):
+        rollout = Rollout(_batch(), ensemble_size=2)
+        next(rollout)
+        with self.assertRaises(ValueError):
+            rollout.advance(torch.randn(_B, 1, _C, _H, _W))
+
 
 # ---------------------------------------------------------------------------
 # A rollout reproduces MultiStepWrapper
 # ---------------------------------------------------------------------------
 #
-# The reference is the MultiStepWrapper with its Preprocessor2D as it is now: the
+# The reference is the MultiStepWrapper driven with a tensor, the stateful path: the
 # preprocessor caches the dynamic features of the batch, draws the noise itself and
-# slides its caches with append_history. The new path takes the features and the
-# noise from the RolloutStep instead, and runs the same preprocessor operations on
-# them. Both must agree in the predictions, the loss and every gradient, the noise
-# parameters included when the noise is trainable.
+# slides its caches with append_history. Driven with a Rollout, the wrappers take
+# the features and the noise from each RolloutStep instead, and the preprocessor
+# keeps no state. Both must agree in the predictions, the loss and every gradient,
+# the noise parameters included when the noise is trainable.
 
 _NOISE = {
     "none": None,
@@ -258,34 +372,19 @@ def _params(n_history, push_forward, noise):
     return params
 
 
-def _make_wrapper(params, noise):
+def _make_wrapper(params, noise, wrapper_cls=MultiStepWrapper):
     n_noise = noise["n_channels"] if noise is not None else 0
     in_chans = (params.n_history + 1) * (_C + 1 + n_noise)
     # the same seed for every wrapper: the same weights, and the noise is seeded from its own fixed seed
     set_seed(333)
-    wrapper = MultiStepWrapper(params, lambda: _TinyNet(in_chans, _C))
+    wrapper = wrapper_cls(params, lambda: _TinyNet(in_chans, _C))
     wrapper.train()
     return wrapper
 
 
-def _model_step(preprocessor, model):
-    """One step as the stateless preprocessor will run it: features and noise come from the step."""
-
-    def step_fn(step):
-        parts = [step.input] + [step.input_dynamic_features[name] for name in preprocessor.dynamic_features]
-        if step.noise is not None:
-            parts.append(step.noise)
-        x = torch.cat(parts, dim=2)
-        preprocessor.history_compute_stats(x)
-        xn = preprocessor.history_normalize(x, target=False)
-        predn = model(preprocessor.pack_model_input(xn))
-        return preprocessor.history_denormalize(preprocessor.correct_bias(predn).unsqueeze(1), target=True)
-
-    return step_fn
-
-
-def _noise_source(preprocessor):
-    return getattr(preprocessor, "input_noise", None)
+def _rollout(wrapper, batch, **kwargs):
+    """A rollout of the batch, with the input noise of the wrapper."""
+    return Rollout(batch, noise_source=wrapper.preprocessor.noise_source(batch_size=batch[INPUT].shape[0]), **kwargs)
 
 
 def _loss(pred, tar):
@@ -339,9 +438,7 @@ class TestRolloutMatchesMultiStepWrapper(unittest.TestCase):
             self.assertTrue(any(".input_noise." in name for name in ref[2]), "the noise should be trainable")
 
         wrapper = _make_wrapper(params, noise)
-        pp = wrapper.preprocessor
-        rollout = Rollout(batch, noise_source=_noise_source(pp))
-        pred = run_rollout(_model_step(pp, wrapper.model), rollout, push_forward=push_forward)
+        pred = wrapper(_rollout(wrapper, batch))
         loss = _loss(pred, batch[TARGET])
         loss.backward()
 
@@ -358,19 +455,203 @@ class TestRolloutMatchesMultiStepWrapper(unittest.TestCase):
         ref = self._reference(params, noise, batch)
 
         wrapper = _make_wrapper(params, noise)
-        pp = wrapper.preprocessor
-        step_fn = _model_step(pp, wrapper.model)
-        rollout = Rollout(batch, noise_source=_noise_source(pp))
+        rollout = _rollout(wrapper, batch)
         preds = []
         loss = torch.zeros(())
         for step in rollout:
-            pred = step_fn(step)
+            pred = wrapper.predict_step(step)
             preds.append(pred)
             loss = loss + _STEP_WEIGHTS[step.index] * torch.square(pred - step.target).mean()
             rollout.advance(pred.detach() if push_forward else pred)
         loss.backward()
 
         self._compare("summed", torch.cat(preds, dim=1).detach(), loss.detach(), _gradients(wrapper), ref)
+
+
+def _take(batch, n, without_target=False):
+    """The first n samples of a batch, all of them for ``None``; without the target side if asked."""
+    target_keys = (TARGET, TARGET_DYNAMIC_FEATURES, TARGET_TIMESTAMP) if without_target else ()
+    return {
+        key: (_take(value, n) if isinstance(value, dict) else value[:n])
+        for key, value in batch.items()
+        if key not in target_keys
+    }
+
+
+class TestWrapperRollout(unittest.TestCase):
+    """The rollout path of the wrappers: evaluation, single steps, checkpointing, and no state left behind."""
+
+    def setUp(self):
+        disable_tf32()
+
+    def _batch(self, n_history=1, n_future=_N_FUTURE):
+        set_seed(1)
+        return _batch(n_history=n_history, n_future=n_future, grid=(_H * 4, _W * 4))
+
+    def test_evaluation_matches_the_stepwise_loop(self):
+        # how the deterministic trainer validated before: one forward per step in eval mode, the
+        # window slid by append_history
+        params = _params(1, False, None)
+        batch = self._batch()
+        wrapper = _make_wrapper(params, None)
+        wrapper.eval()
+
+        with torch.no_grad():
+            wrapper.preprocessor.cache_dynamic_features(batch)
+            inpt = batch[INPUT]
+            ref = []
+            for idt in range(batch[TARGET].shape[1]):
+                pred = wrapper(inpt)
+                ref.append(pred)
+                inpt = wrapper.preprocessor.append_history(inpt, pred, idt)
+            ref = torch.cat(ref, dim=1)
+
+            pred = wrapper(_rollout(wrapper, batch))
+
+        self.assertEqual(tuple(pred.shape), tuple(batch[TARGET].shape))
+        self.assertTrue(_scaled_rtol_match("predictions", pred, ref))
+
+    def test_single_step_wrapper(self):
+        # with n_future = 0 the trainer gets a SingleStepWrapper: one step, as its tensor forward predicts it
+        noise = _NOISE["white_learnable"]
+        params = _params(1, False, noise)
+        params.n_future = 0
+        batch = self._batch(n_future=0)
+
+        ref_wrapper = _make_wrapper(params, noise, SingleStepWrapper)
+        ref_wrapper.preprocessor.cache_dynamic_features(batch)
+        ref = ref_wrapper(batch[INPUT])
+        torch.square(ref - batch[TARGET]).mean().backward()
+
+        wrapper = _make_wrapper(params, noise, SingleStepWrapper)
+        pred = wrapper(_rollout(wrapper, batch))
+        torch.square(pred - batch[TARGET]).mean().backward()
+
+        self.assertTrue(_scaled_rtol_match("predictions", pred.detach(), ref.detach()))
+        ref_grads, grads = _gradients(ref_wrapper), _gradients(wrapper)
+        self.assertEqual(set(grads), set(ref_grads))
+        for name in ref_grads:
+            with self.subTest(gradient=name):
+                self.assertTrue(_scaled_rtol_match(name, grads[name], ref_grads[name]))
+
+    def test_checkpointing_keeps_the_gradients(self):
+        batch = self._batch()
+        grads = {}
+        for multistep_checkpoint in (False, True):
+            params = _params(1, False, None)
+            params.multistep_checkpoint = multistep_checkpoint
+            wrapper = _make_wrapper(params, None)
+            _loss(wrapper(_rollout(wrapper, batch)), batch[TARGET]).backward()
+            grads[multistep_checkpoint] = _gradients(wrapper)
+
+        self.assertEqual(set(grads[True]), set(grads[False]))
+        for name in grads[False]:
+            with self.subTest(gradient=name):
+                self.assertTrue(_scaled_rtol_match(name, grads[True][name], grads[False][name]))
+
+    def test_a_rollout_runs_only_once(self):
+        wrapper = _make_wrapper(_params(1, False, None), None)
+        rollout = _rollout(wrapper, self._batch())
+        wrapper(rollout)
+        with self.assertRaisesRegex(RuntimeError, "only once"):
+            wrapper(rollout)
+
+    def test_preprocessor_keeps_no_state(self):
+        noise = _NOISE["white"]
+        wrapper = _make_wrapper(_params(1, False, noise), noise)
+        wrapper(_rollout(wrapper, self._batch()))
+
+        pp = wrapper.preprocessor
+        self.assertIsNone(pp.history_mean)
+        self.assertIsNone(pp.history_std)
+        self.assertEqual(pp.get_dynamic_features(), ({}, {}))
+
+    def test_ensemble_members_without_noise_match_the_plain_rollout(self):
+        # without noise nothing distinguishes the members, so each one predicts what the rollout of the
+        # data batch predicts
+        E = 3
+        wrapper = _make_wrapper(_params(1, False, None), None)
+        wrapper.eval()
+        batch = self._batch()
+        with torch.no_grad():
+            ref = wrapper(_rollout(wrapper, batch))
+            rollout = Rollout(batch, ensemble_size=E)
+            pred = rollout.unfold(wrapper(rollout))
+
+        self.assertEqual(tuple(pred.shape), (_B, E, *ref.shape[1:]))
+        for e in range(E):
+            with self.subTest(member=e):
+                self.assertTrue(_scaled_rtol_match("member", pred[:, e], ref))
+
+    def test_noise_follows_the_batch_of_the_rollout(self):
+        # validation batches can differ from the training ones: the state is resized when the rollout
+        # replaces it at its first step
+        noise = _NOISE["diffusion"]
+        wrapper = _make_wrapper(_params(1, False, noise), noise)
+        batch = self._batch()
+        for n in (_B, 1, _B):
+            with self.subTest(batch=n):
+                pred = wrapper(_rollout(wrapper, _take(batch, n)))
+                self.assertEqual(pred.shape[0], n)
+
+        # continuing the sequence at another batch would restart the stateful noise from zero
+        with self.assertRaises(RuntimeError):
+            wrapper(_rollout(wrapper, _take(batch, 1), continue_noise=True))
+
+
+class TestStatelessPreprocessor(unittest.TestCase):
+
+    def setUp(self):
+        disable_tf32()
+        set_seed(1)
+
+    def test_statistics_match_the_stored_ones(self):
+        pp = _make_wrapper(_params(1, False, None), None).preprocessor
+        x = torch.randn(_B, 2, _C, _H * 4, _W * 4)
+        y = torch.randn(_B, 1, _C - 1, _H * 4, _W * 4)
+
+        stats = pp.compute_history_stats(x)
+        self.assertIsNone(pp.history_mean)
+        pp.history_compute_stats(x)
+
+        self.assertTrue(torch.equal(stats.mean, pp.history_mean))
+        self.assertTrue(torch.equal(stats.std, pp.history_std))
+        self.assertTrue(torch.equal(pp.history_normalize(x, stats=stats), pp.history_normalize(x)))
+        self.assertTrue(
+            torch.equal(pp.history_denormalize(y, target=True, stats=stats), pp.history_denormalize(y, target=True))
+        )
+
+    def test_assemble_input_matches_append_dynamic_features(self):
+        noise = _NOISE["white"]
+        pp = _make_wrapper(_params(1, False, noise), noise).preprocessor
+        batch = self._batch()
+        pp.cache_dynamic_features(batch)
+        pp.update_internal_state(replace_state=True)
+
+        ref = pp.append_dynamic_features(batch[INPUT])
+        sample = pp.input_noise()
+        self.assertTrue(torch.equal(pp.assemble_input(batch[INPUT], batch[INPUT_DYNAMIC_FEATURES], sample), ref))
+
+    def test_assemble_input_checks_its_inputs(self):
+        batch = self._batch()
+        inp, features = batch[INPUT], batch[INPUT_DYNAMIC_FEATURES]
+
+        noise = _NOISE["white"]
+        pp = _make_wrapper(_params(1, False, noise), noise).preprocessor
+        sample = torch.zeros(_B, 2, 1, _H * 4, _W * 4)
+        with self.subTest("missing feature"), self.assertRaises(ValueError):
+            pp.assemble_input(inp, {}, sample)
+        with self.subTest("extra feature"), self.assertRaises(ValueError):
+            pp.assemble_input(inp, {**features, "other": features[ZENITH]}, sample)
+        with self.subTest("missing noise"), self.assertRaises(ValueError):
+            pp.assemble_input(inp, features, None)
+
+        pp = _make_wrapper(_params(1, False, None), None).preprocessor
+        with self.subTest("unexpected noise"), self.assertRaises(ValueError):
+            pp.assemble_input(inp, features, sample)
+
+    def _batch(self):
+        return _batch(n_history=1, n_future=_N_FUTURE, grid=(_H * 4, _W * 4))
 
 
 if __name__ == "__main__":

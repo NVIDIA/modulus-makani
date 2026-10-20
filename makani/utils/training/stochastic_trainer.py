@@ -29,11 +29,11 @@ import wandb
 
 # makani depenedencies
 from makani.utils import LossHandler, MetricsHandler
-from makani.utils.functions import expand_ensemble
 from makani.utils.driver import Driver
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
-from makani.utils.dataloaders.batch import batch_to_device, map_dynamic_features, INPUT, TARGET
+from makani.utils.dataloaders.batch import batch_to_device, INPUT, TARGET, INPUT_DYNAMIC_FEATURES
+from makani.utils.dataloaders.rollout import Rollout
 from makani.utils.YParams import YParams
 
 # model registry
@@ -205,7 +205,6 @@ class StochasticTrainer(Driver):
         iterator = iter(self.train_dataloader)
         data = next(iterator)
         batch = batch_to_device(data, self.device)
-        self.preprocessor.cache_dynamic_features(batch)
         # the interpolant takes the time steps folded into the channels
         inp = self.preprocessor.flatten_history(batch[INPUT])
         tar = self.preprocessor.flatten_history(batch[TARGET])
@@ -504,7 +503,7 @@ class StochasticTrainer(Driver):
 
             # map to device
             batch = batch_to_device(data, self.device)
-            self.preprocessor.cache_dynamic_features(batch)
+            dynamic_features = batch[INPUT_DYNAMIC_FEATURES]
 
             # the interpolant takes the time steps folded into the channels
             inp = self.preprocessor.flatten_history(batch[INPUT])
@@ -521,11 +520,15 @@ class StochasticTrainer(Driver):
 
             with self.autocast():
                 if do_update:
-                    pred, tar = self.model_train(inp, tar, n_samples=self.params.stochastic_size)
+                    pred, tar = self.model_train(
+                        inp, tar, dynamic_features=dynamic_features, n_samples=self.params.stochastic_size
+                    )
                     loss = self.loss_obj(pred, tar, inp=inp)
                 else:
                     with self.model_train.no_sync():
-                        pred, tar = self.model_train(inp, tar, n_samples=self.params.stochastic_size)
+                        pred, tar = self.model_train(
+                            inp, tar, dynamic_features=dynamic_features, n_samples=self.params.stochastic_size
+                        )
                         loss = self.loss_obj(pred, tar, inp=inp)
                 loss = loss * loss_scaling_fact
 
@@ -659,43 +662,33 @@ class StochasticTrainer(Driver):
                     # map to gpu
                     batch = batch_to_device(data, self.device)
 
-                    # When local_ensemble_size > 1, fold the ensemble dim into the batch
-                    # dim for a single forward per rollout step. The dynamic features must
-                    # be expanded to (B*E, ...) so the preprocessor's cache lines up with
-                    # the folded-batch input; tar stays at the original batch — the loss
+                    # the rollout folds the ensemble into the batch dim for a single forward
+                    # per step, (B*E, ...); the targets stay at the original batch -- the loss
                     # expects (B, E, ...) pred vs (B, ...) target.
-                    E = self.params.local_ensemble_size
-                    batch = map_dynamic_features(batch, lambda feature: expand_ensemble(feature, E))
-
-                    self.preprocessor.cache_dynamic_features(batch)
-                    inp, tar = batch[INPUT], batch[TARGET]
-
-                    B = inp.shape[0]
-
-                    # expand the input batch to (B*E, ...) for the folded-batch forward
-                    inp = expand_ensemble(inp, E)
+                    rollout = Rollout(batch, ensemble_size=self.params.local_ensemble_size)
 
                     # the interpolant, the losses and the metrics take the time steps
                     # folded into the channels
                     flatten = self.preprocessor.flatten_history
 
-                    for idt in range(tar.shape[1]):
-                        targ = flatten(tar[:, idt : idt + 1])
+                    for step in rollout:
+                        idt = step.index
+                        targ = flatten(step.target)
 
                         with self.autocast():
                             # single forward on the folded batch; StochasticInterpolant.forward
-                            # handles the batch-resize of both the preprocessor's input_noise
-                            # and its own noise_module internally.
+                            # resizes its noise_module to the batch internally.
                             pred_flat = self.model_eval(
-                                flatten(inp), n_steps=self.params.stochastic_interpolation_steps
+                                flatten(step.input),
+                                dynamic_features=step.input_dynamic_features,
+                                n_steps=self.params.stochastic_interpolation_steps,
                             )
 
-                            # advance the input history / dynamic features once per step; the
-                            # interpolant predicts a single step
-                            inp = self.preprocessor.append_history(inp, pred_flat.unsqueeze(1), idt, update_state=True)
+                            # the interpolant predicts a single step, which the next one starts from
+                            rollout.advance(pred_flat.unsqueeze(1))
 
-                            # reshape back to (B, E, ...) for the loss and downstream buffers
-                            pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
+                            # split the ensemble back out, (B, E, ...), for the loss and downstream buffers
+                            pred = rollout.unfold(pred_flat)
 
                             loss = self.loss_obj(pred, targ)
 

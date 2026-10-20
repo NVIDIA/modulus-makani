@@ -32,6 +32,26 @@ All of this is bookkeeping over the keys of the batch, see
 :mod:`makani.utils.dataloaders.batch`: nothing here knows about the model,
 normalization or packing. The time axis stays explicit, and the grid trails,
 so a rollout works for lat/lon and mesh batches alike.
+
+An ensemble is rolled out as one batch: with ``ensemble_size=E`` the members
+are folded into the batch dimension of everything the model sees, ``(B, ...)``
+to ``(B * E, ...)``, member-major within each sample, see
+:func:`makani.utils.functions.expand_ensemble`. The targets stay at ``B``, and
+:meth:`Rollout.unfold` brings the predictions to ``(B, E, ...)`` for the losses::
+
+    rollout = Rollout(batch, ensemble_size=E, noise_source=noise)
+    preds = model(rollout)            # (B * E, n_steps, C, *grid)
+    loss = loss_fn(rollout.unfold(preds), batch[TARGET])
+
+A batch without targets can be rolled out too, when the dynamic features and
+timestamps of the predicted steps come from elsewhere, e.g. from the samples
+an inference run reads one step at a time. They are handed to
+:meth:`Rollout.advance` with the prediction::
+
+    rollout = Rollout(initial_condition, n_steps=n)
+    for step, sample in zip(rollout, verification_samples):
+        pred = model_step(step)
+        rollout.advance(pred, dynamic_features=sample_features, timestamp=sample_time)
 """
 
 from dataclasses import dataclass, field
@@ -39,6 +59,7 @@ from typing import Callable, Dict, Optional
 
 import torch
 
+from makani.utils.functions import expand_ensemble
 from makani.utils.dataloaders.batch import (
     INPUT,
     TARGET,
@@ -54,6 +75,10 @@ from makani.utils.dataloaders.batch import (
 class RolloutStep:
     """
     What one step of a rollout predicts from, and what it predicts.
+
+    With an ensemble, everything but the target has the batch of the model,
+    ``B * ensemble_size`` where the shapes below say ``B``, see :class:`Rollout`;
+    the target keeps the batch of the data.
 
     Attributes
     ----------
@@ -100,7 +125,8 @@ class Rollout:
     batch : dict
         The batch, see :mod:`makani.utils.dataloaders.batch`.
     n_steps : int, optional
-        Number of steps. Defaults to the number of target steps.
+        Number of steps. Defaults to the number of target steps, and is
+        required for a batch without targets.
     noise_source : optional
         Source of the noise of each step, an external input like a forcing.
         Called as ``noise_source.update(replace_state=...)`` before each step,
@@ -112,15 +138,17 @@ class Rollout:
         Continue the noise state of a previous rollout at the first step
         instead of replacing it, e.g. for an inference run split into several
         rollouts. By default ``False``.
+    ensemble_size : int, optional
+        Number of ensemble members, folded into the batch dimension of the
+        input window, the dynamic features, the timestamps and the predictions,
+        but not of the targets. The noise source has to produce samples at that
+        batch, ``B * ensemble_size``. By default ``1``.
 
     Raises
     ------
     ValueError
-        If the batch has fewer target steps than ``n_steps``, or no targets and
-        no ``n_steps``.
-    NotImplementedError
-        For more than one step without targets: the dynamic features and
-        timestamps of later steps would have to come from elsewhere.
+        If the batch has fewer target steps than ``n_steps``, no targets and
+        no ``n_steps``, or ``ensemble_size`` is smaller than 1.
     """
 
     def __init__(
@@ -129,7 +157,10 @@ class Rollout:
         n_steps: Optional[int] = None,
         noise_source: Optional[Callable[[], torch.Tensor]] = None,
         continue_noise: bool = False,
+        ensemble_size: int = 1,
     ):
+        if ensemble_size < 1:
+            raise ValueError(f"ensemble_size has to be at least 1, got {ensemble_size}")
         self._has_target = TARGET in batch
         if n_steps is None:
             if not self._has_target:
@@ -137,20 +168,17 @@ class Rollout:
             n_steps = batch[TARGET].shape[1]
         if self._has_target and n_steps > batch[TARGET].shape[1]:
             raise ValueError(f"{n_steps} rollout steps, but the batch has {batch[TARGET].shape[1]} target steps")
-        if (not self._has_target) and n_steps > 1:
-            raise NotImplementedError(
-                "A rollout without targets over more than one step needs the dynamic features and "
-                "timestamps of the later steps from elsewhere, which is not supported yet"
-            )
 
         self._batch = batch
         self._n_steps = n_steps
         self._noise_source = noise_source
         self._continue_noise = continue_noise
+        self._ensemble_size = ensemble_size
 
-        self._input = batch[INPUT]
-        self._input_features = dict(batch[INPUT_DYNAMIC_FEATURES])
-        self._input_timestamp = batch[INPUT_TIMESTAMP]
+        # the window the model sees is folded once; the target steps only when they are used
+        self._input = self._fold(batch[INPUT])
+        self._input_features = {name: self._fold(feature) for name, feature in batch[INPUT_DYNAMIC_FEATURES].items()}
+        self._input_timestamp = self._fold(batch[INPUT_TIMESTAMP])
 
         self._index = 0
         self._pending = False
@@ -159,6 +187,43 @@ class Rollout:
     def n_steps(self) -> int:
         """Number of steps of the rollout."""
         return self._n_steps
+
+    @property
+    def ensemble_size(self) -> int:
+        """Number of ensemble members folded into the batch dimension."""
+        return self._ensemble_size
+
+    def _fold(self, x: torch.Tensor) -> torch.Tensor:
+        return expand_ensemble(x, self._ensemble_size)
+
+    def unfold(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Split the ensemble members out of the batch dimension.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            A tensor at the batch of the model, ``(B * ensemble_size, ...)``,
+            e.g. the predictions.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B, ensemble_size, ...)``, a view of ``x`` where possible.
+
+        Raises
+        ------
+        ValueError
+            If the batch dimension of ``x`` is not a multiple of the ensemble size.
+        """
+        if x.shape[0] % self._ensemble_size != 0:
+            raise ValueError(f"A batch of {x.shape[0]} does not split into ensembles of {self._ensemble_size} members")
+        return x.reshape(x.shape[0] // self._ensemble_size, self._ensemble_size, *x.shape[1:])
+
+    @property
+    def started(self) -> bool:
+        """Whether a step of the rollout has been handed out; a rollout can be run only once."""
+        return self._pending or (self._index > 0)
 
     def __len__(self) -> int:
         return self._n_steps
@@ -189,9 +254,10 @@ class Rollout:
         if self._has_target:
             target = self._batch[TARGET][:, k : k + 1]
             target_features = {
-                name: feature[:, k : k + 1] for name, feature in self._batch[TARGET_DYNAMIC_FEATURES].items()
+                name: self._fold(feature[:, k : k + 1])
+                for name, feature in self._batch[TARGET_DYNAMIC_FEATURES].items()
             }
-            target_timestamp = self._batch[TARGET_TIMESTAMP][:, k : k + 1]
+            target_timestamp = self._fold(self._batch[TARGET_TIMESTAMP][:, k : k + 1])
 
         self._pending = True
 
@@ -206,26 +272,43 @@ class Rollout:
             noise=noise,
         )
 
-    def advance(self, pred: torch.Tensor):
+    def advance(
+        self,
+        pred: torch.Tensor,
+        dynamic_features: Optional[Dict[str, torch.Tensor]] = None,
+        timestamp: Optional[torch.Tensor] = None,
+    ):
         """
         Slide the rollout by one step, with the prediction of the current one.
 
         The window drops its oldest step and appends ``pred``; the dynamic
         features and timestamps of the window move on to the predicted time.
+        They come from the targets of the batch, or, for a batch without
+        targets, from the caller.
 
         Parameters
         ----------
         pred : torch.Tensor
-            The prediction of the current step, ``(B, 1, C, *grid)``, in
-            physical units. It is used as it is, so detach it first for
+            The prediction of the current step, ``(B * ensemble_size, 1, C, *grid)``,
+            in physical units. It is used as it is, so detach it first for
             push-forward training.
+        dynamic_features : dict, optional
+            Only for a batch without targets: the dynamic features at the
+            predicted time, name to ``(B, 1, C_f, *grid)`` at the batch of the
+            data. Required if another step follows.
+        timestamp : torch.Tensor, optional
+            Only for a batch without targets: the predicted time, ``(B, 1)``.
+            Required if another step follows.
 
         Raises
         ------
         RuntimeError
             If no step is waiting for its prediction.
         ValueError
-            If the prediction does not have the shape of one step of the window.
+            If the prediction does not have the shape of one step of the window;
+            if features or a timestamp are given for a batch with targets, or
+            are missing, have other names or more than one step for a batch
+            without targets.
         """
         if not self._pending:
             raise RuntimeError("advance() needs a step of the rollout to advance: ask for the next step first")
@@ -237,19 +320,44 @@ class Rollout:
             )
 
         k = self._index
-        self._input = torch.cat([self._input[:, 1:], pred], dim=1)
         if self._has_target:
-            target_features = self._batch[TARGET_DYNAMIC_FEATURES]
+            if (dynamic_features is not None) or (timestamp is not None):
+                raise ValueError(
+                    "The batch has targets, the dynamic features and timestamps of the predicted steps come from them"
+                )
+            dynamic_features = {
+                name: feature[:, k : k + 1] for name, feature in self._batch[TARGET_DYNAMIC_FEATURES].items()
+            }
+            timestamp = self._batch[TARGET_TIMESTAMP][:, k : k + 1]
+        elif (k + 1 < self._n_steps) or (dynamic_features is not None) or (timestamp is not None):
+            self._check_next_step(dynamic_features, timestamp)
+
+        self._input = torch.cat([self._input[:, 1:], pred], dim=1)
+        if timestamp is not None:
             self._input_features = {
-                name: torch.cat([window[:, 1:], target_features[name][:, k : k + 1]], dim=1)
+                name: torch.cat([window[:, 1:], self._fold(dynamic_features[name])], dim=1)
                 for name, window in self._input_features.items()
             }
-            self._input_timestamp = torch.cat(
-                [self._input_timestamp[:, 1:], self._batch[TARGET_TIMESTAMP][:, k : k + 1]], dim=1
-            )
+            self._input_timestamp = torch.cat([self._input_timestamp[:, 1:], self._fold(timestamp)], dim=1)
 
         self._index += 1
         self._pending = False
+
+    def _check_next_step(self, dynamic_features, timestamp):
+        # what the caller hands in for the predicted step of a batch without targets
+        if (dynamic_features is None) or (timestamp is None):
+            raise ValueError(
+                "The batch has no targets: advance() needs the dynamic features and the timestamp of the "
+                "predicted step for the next one"
+            )
+        if set(dynamic_features) != set(self._input_features):
+            raise ValueError(
+                f"The window has the dynamic features {sorted(self._input_features)}, "
+                f"got {sorted(dynamic_features)} for the predicted step"
+            )
+        for name, feature in [*dynamic_features.items(), ("timestamp", timestamp)]:
+            if feature.shape[1] != 1:
+                raise ValueError(f"{name} of the predicted step has {feature.shape[1]} steps, expected 1")
 
 
 def run_rollout(

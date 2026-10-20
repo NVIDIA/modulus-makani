@@ -190,7 +190,6 @@ class AutoencoderTrainer(Driver):
         iterator = iter(self.train_dataloader)
         data = next(iterator)
         batch = batch_to_device(data, self.device)
-        self.preprocessor.cache_dynamic_features(batch)
         # the autoencoder takes the time steps folded into the channels
         inp = self.preprocessor.flatten_history(batch[INPUT])
         tar = self.preprocessor.flatten_history(batch[TARGET])
@@ -512,7 +511,6 @@ class AutoencoderTrainer(Driver):
 
             # map to device
             batch = batch_to_device(data, self.device)
-            self.preprocessor.cache_dynamic_features(batch)
             tar = batch[TARGET]
 
             # the autoencoder takes the time steps folded into the channels
@@ -661,7 +659,6 @@ class AutoencoderTrainer(Driver):
 
                     # map to gpu
                     batch = batch_to_device(data, self.device)
-                    self.preprocessor.cache_dynamic_features(batch)
 
                     # the autoencoder reconstructs its input, with the time steps folded into
                     # the channels

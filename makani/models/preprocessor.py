@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple, Union
 
 
 import torch
@@ -38,6 +38,42 @@ def _run_eager(fn, *args, **kwargs):
     like this one is respected — so we break at the call site instead.
     """
     return fn(*args, **kwargs)
+
+
+class HistoryStats(NamedTuple):
+    r"""
+    Normalization statistics of one history window.
+
+    ``mean`` and ``std`` are ``(B, 1, C, 1, 1)``, so that they broadcast over the
+    time and grid dimensions; the ``"timediff"`` mode fills ``diff_mean`` and
+    ``diff_var`` instead.
+    """
+
+    mean: Optional[torch.Tensor] = None
+    std: Optional[torch.Tensor] = None
+    diff_mean: Optional[torch.Tensor] = None
+    diff_var: Optional[torch.Tensor] = None
+
+
+class _NoiseSource:
+    """
+    The input noise of a preprocessor, as :class:`~makani.utils.dataloaders.rollout.Rollout` drives it.
+
+    Sizes the noise state to the batch of the rollout, with the guard of
+    :meth:`Preprocessor2D.update_internal_state` against resizing stateful
+    noise in the middle of a sequence.
+    """
+
+    def __init__(self, preprocessor, batch_size=None):
+        self.preprocessor = preprocessor
+        self.batch_size = batch_size
+
+    def update(self, replace_state=False):
+        self.preprocessor.update_internal_state(replace_state=replace_state, batch_size=self.batch_size)
+
+    def __call__(self):
+        # eagerly: the noise is complex-valued and cannot be inductor-compiled, see _run_eager
+        return _run_eager(self.preprocessor.input_noise)
 
 
 class Preprocessor2D(nn.Module):
@@ -409,25 +445,14 @@ class Preprocessor2D(nn.Module):
         self._check_time_axis(x, "append_dynamic_features")
 
         cache = self._dynamic_cache[self._mode()]["input"]
-        appended = []
         for name in self.dynamic_features:
             if name not in cache:
                 raise RuntimeError(
                     f"append_dynamic_features: the model takes the dynamic feature '{name}', but none is "
                     f"cached for this batch. Call cache_dynamic_features with the batch first."
                 )
-            feature = cache[name]
-            # if these diverge, the cat below would fail with a cryptic message. torch._check
-            # keeps this a runtime assertion under torch.compile instead of a graph break.
-            torch._check(
-                (feature.shape[0] == x.shape[0]) and (feature.shape[1] == x.shape[1]),
-                lambda: (
-                    f"append_dynamic_features: '{name}' has batch and time {tuple(feature.shape[:2])}, "
-                    f"the input {tuple(x.shape[:2])}. Was it cached at a different batch size?"
-                ),
-            )
-            appended.append(feature)
 
+        noise = None
         if hasattr(self, "input_noise"):
             # run the noise module eagerly: it is complex-valued (SHT) and cannot be inductor-
             # compiled; the method-level disable on its forward is not honored through the
@@ -442,6 +467,76 @@ class Preprocessor2D(nn.Module):
                     f"batch than the current forward pass?"
                 ),
             )
+
+        return self.assemble_input(x, cache, noise)
+
+    def assemble_input(self, x, dynamic_features: Dict[str, torch.Tensor], noise: Optional[torch.Tensor] = None):
+        r"""
+        Append given dynamic features and noise to the input.
+
+        The stateless counterpart of :meth:`append_dynamic_features`: the
+        features and the noise sample are passed in, as a
+        :class:`~makani.utils.dataloaders.rollout.RolloutStep` carries them,
+        rather than read from the caches and the noise module. The channels are
+        appended in the same fixed order,
+        ``[x | dynamic features, in the order of dynamic_features | noise]``;
+        in ``perturb`` mode the noise is added to the selected channels instead.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input of shape ``(B, n_history + 1, C, H, W)``.
+        dynamic_features : dict
+            The features of the window by name, each ``(B, n_history + 1, C_f, H, W)``.
+            Has to hold exactly the features the model takes, :attr:`dynamic_features`.
+        noise : torch.Tensor, optional
+            The noise sample for this window. Required if, and only if, the
+            preprocessor has input noise.
+
+        Returns
+        -------
+        torch.Tensor
+            Input with the appended channels, ``(B, n_history + 1, C', H, W)``.
+
+        Raises
+        ------
+        ValueError
+            If the features are not the ones the model takes, or the noise is
+            missing or unexpected.
+        """
+        self._check_time_axis(x, "assemble_input")
+
+        if set(dynamic_features) != set(self.dynamic_features):
+            raise ValueError(
+                f"assemble_input: the model takes the dynamic features {sorted(self.dynamic_features)}, "
+                f"got {sorted(dynamic_features)}"
+            )
+        if hasattr(self, "input_noise") != (noise is not None):
+            raise ValueError(
+                "assemble_input: the preprocessor has input noise, but no noise sample was given"
+                if noise is None
+                else "assemble_input: a noise sample was given, but the preprocessor has no input noise"
+            )
+
+        appended = []
+        for name in self.dynamic_features:
+            feature = dynamic_features[name]
+            # if these diverge, the cat below would fail with a cryptic message. torch._check
+            # keeps this a runtime assertion under torch.compile instead of a graph break.
+            torch._check(
+                (feature.shape[0] == x.shape[0]) and (feature.shape[1] == x.shape[1]),
+                lambda: (
+                    f"assemble_input: '{name}' has batch and time {tuple(feature.shape[:2])}, "
+                    f"the input {tuple(x.shape[:2])}. Was it made at a different batch size?"
+                ),
+            )
+            appended.append(feature)
+
+        if noise is not None:
+            torch._check(
+                noise.shape[0] == x.shape[0],
+                lambda: f"assemble_input: the noise has batch {noise.shape[0]}, the input {x.shape[0]}",
+            )
             if self.input_noise_mode == "concatenate":
                 appended.append(noise)
             elif self.input_noise_mode == "perturb":
@@ -455,27 +550,104 @@ class Preprocessor2D(nn.Module):
 
         return torch.cat([x] + appended, dim=2)
 
-    def history_compute_stats(self, x):
+    def noise_source(self, batch_size=None):
         r"""
-        Compute and cache the normalization statistics for a history window.
+        The input noise as a noise source for a :class:`~makani.utils.dataloaders.rollout.Rollout`.
 
-        Must be called before :meth:`history_normalize` or
-        :meth:`history_denormalize`, and re-called whenever the batch size
-        changes. Statistics are area-weighted using the grid quadrature, so
-        they are true spherical means rather than uniform grid averages, and
-        are broadcast across the spatial model-parallel group so every rank
-        normalizes identically.
+        Parameters
+        ----------
+        batch_size : int, optional
+            The batch of the rollout. The noise state is resized to it when the
+            rollout replaces the state at its first step; continuing a sequence
+            at another batch raises, see :meth:`update_internal_state`. ``None``
+            leaves the state at its current size.
+
+        Returns
+        -------
+        object or None
+            ``None`` if no input noise is configured.
+        """
+        if not hasattr(self, "input_noise"):
+            return None
+
+        return _NoiseSource(self, batch_size=batch_size)
+
+    def compute_history_stats(self, x) -> HistoryStats:
+        r"""
+        Compute the normalization statistics of a history window.
+
+        Statistics are area-weighted using the grid quadrature, so they are true
+        spherical means rather than uniform grid averages, and are broadcast
+        across the spatial model-parallel group so every rank normalizes
+        identically.
 
         The behavior depends on ``history_normalization_mode``:
 
         * ``"none"`` -- statistics are set to zero mean and unit standard
           deviation, making normalization a no-op.
         * ``"timediff"`` -- statistics of the *differences* between consecutive
-          time steps are cached instead, characterizing the tendency rather than
-          the state.
+          time steps, characterizing the tendency rather than the state.
         * anything else (e.g. ``"exponential"``) -- a weighted mean and standard
           deviation over the history window, using
           ``history_normalization_weights``.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            History window of shape ``(B, n_history + 1, C, H, W)``.
+
+        Returns
+        -------
+        HistoryStats
+            The statistics, to pass to :meth:`history_normalize` and
+            :meth:`history_denormalize`. Nothing is stored on the module.
+        """
+        self._check_time_axis(x, "compute_history_stats")
+
+        if self.history_normalization_mode == "none":
+            return HistoryStats(
+                mean=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32, device=x.device),
+                std=torch.ones((1, 1, 1, 1, 1), dtype=torch.float32, device=x.device),
+            )
+
+        if self.history_normalization_mode == "timediff":
+            # time difference mean:
+            diff_mean = torch.mean(self.quadrature(x[:, 1:, ...] - x[:, 0:-1, ...]), dim=(1, 2))
+
+            # time difference std
+            diff_var = torch.mean(
+                self.quadrature(torch.square((x[:, 1:, ...] - x[:, 0:-1, ...]) - diff_mean)), dim=(1, 2)
+            )
+
+            return HistoryStats(
+                diff_mean=copy_to_parallel_region(diff_mean, "spatial"),
+                diff_var=copy_to_parallel_region(diff_var, "spatial"),
+            )
+
+        # quadrature reduces (H, W) -> (B, T, C); the weighted sum over T -> (B, 1, C)
+        mean = torch.sum(self.quadrature(x * self.history_normalization_weights), dim=1, keepdim=True)
+        b_, _, c_ = mean.shape
+        mean = mean.reshape(b_, 1, c_, 1, 1)
+
+        std = torch.sum(
+            self.quadrature(torch.square(x - mean) * self.history_normalization_weights),
+            dim=1,
+            keepdim=True,
+        )
+        std = torch.sqrt(std.reshape(b_, 1, c_, 1, 1))
+
+        # copy to parallel region
+        return HistoryStats(mean=copy_to_parallel_region(mean, "spatial"), std=copy_to_parallel_region(std, "spatial"))
+
+    def history_compute_stats(self, x):
+        r"""
+        Compute and store the normalization statistics for a history window.
+
+        The stateful counterpart of :meth:`compute_history_stats`: the
+        statistics are stored on the module, where :meth:`history_normalize`
+        and :meth:`history_denormalize` find them when called without
+        ``stats``. Must be called before those, and re-called whenever the batch
+        size changes.
 
         Parameters
         ----------
@@ -490,43 +662,18 @@ class Preprocessor2D(nn.Module):
             over the time and grid dimensions (or ``history_diff_mean`` /
             ``history_diff_var`` in ``"timediff"`` mode).
         """
-        self._check_time_axis(x, "history_compute_stats")
+        stats = self.compute_history_stats(x)
 
-        if self.history_normalization_mode == "none":
-            self.history_mean = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32, device=x.device)
-            self.history_std = torch.ones((1, 1, 1, 1, 1), dtype=torch.float32, device=x.device)
-        elif self.history_normalization_mode == "timediff":
-            # time difference mean:
-            self.history_diff_mean = torch.mean(self.quadrature(x[:, 1:, ...] - x[:, 0:-1, ...]), dim=(1, 2))
-
-            # time difference std
-            self.history_diff_var = torch.mean(
-                self.quadrature(torch.square((x[:, 1:, ...] - x[:, 0:-1, ...]) - self.history_diff_mean)), dim=(1, 2)
-            )
-
-            # time difference stds
-            self.history_diff_mean = copy_to_parallel_region(self.history_diff_mean, "spatial")
-            self.history_diff_var = copy_to_parallel_region(self.history_diff_var, "spatial")
+        if self.history_normalization_mode == "timediff":
+            self.history_diff_mean = stats.diff_mean
+            self.history_diff_var = stats.diff_var
         else:
-            # quadrature reduces (H, W) -> (B, T, C); the weighted sum over T -> (B, 1, C)
-            self.history_mean = torch.sum(self.quadrature(x * self.history_normalization_weights), dim=1, keepdim=True)
-            b_, _, c_ = self.history_mean.shape
-            self.history_mean = self.history_mean.reshape(b_, 1, c_, 1, 1)
-
-            self.history_std = torch.sum(
-                self.quadrature(torch.square(x - self.history_mean) * self.history_normalization_weights),
-                dim=1,
-                keepdim=True,
-            )
-            self.history_std = torch.sqrt(self.history_std.reshape(b_, 1, c_, 1, 1))
-
-            # copy to parallel region
-            self.history_mean = copy_to_parallel_region(self.history_mean, "spatial")
-            self.history_std = copy_to_parallel_region(self.history_std, "spatial")
+            self.history_mean = stats.mean
+            self.history_std = stats.std
 
         return
 
-    def _check_history_stats(self, x, caller: str):
+    def _check_history_stats(self, x, caller: str, stats: Optional[HistoryStats] = None):
         """
         Controlled-fail validation for history normalization paths.
 
@@ -538,12 +685,13 @@ class Preprocessor2D(nn.Module):
           normalize/denormalize is being invoked on a differently-sized input
           without a fresh history_compute_stats call.
         """
-        if self.history_mean is None or self.history_std is None:
+        mean = self.history_mean if stats is None else stats.mean
+        if mean is None or (self.history_std if stats is None else stats.std) is None:
             raise RuntimeError(
                 f"{caller}: history_mean / history_std are None. "
                 f"Call history_compute_stats(x) before {caller} (mode='{self.history_normalization_mode}')."
             )
-        stats_batch = self.history_mean.shape[0]
+        stats_batch = mean.shape[0]
         torch._check(
             stats_batch == x.shape[0],
             lambda: (
@@ -553,9 +701,9 @@ class Preprocessor2D(nn.Module):
             ),
         )
 
-    def history_normalize(self, x, target=False):
+    def history_normalize(self, x, target=False, stats: Optional[HistoryStats] = None):
         r"""
-        Normalize a tensor with the cached history statistics.
+        Normalize a tensor with the history statistics.
 
         A no-op in the ``"none"`` and ``"timediff"`` modes, which do not define
         a state-space normalization.
@@ -568,6 +716,9 @@ class Preprocessor2D(nn.Module):
             If ``True``, ``x`` holds only the predicted channels, which lead
             the input channels the statistics were computed on, so only those
             statistics are used. By default ``False``.
+        stats : HistoryStats, optional
+            The statistics, from :meth:`compute_history_stats`. By default the
+            ones stored by :meth:`history_compute_stats`.
 
         Returns
         -------
@@ -577,21 +728,22 @@ class Preprocessor2D(nn.Module):
         Raises
         ------
         RuntimeError
-            If :meth:`history_compute_stats` has not been called yet.
+            If no ``stats`` are given and :meth:`history_compute_stats` has not
+            been called yet.
         """
         if self.history_normalization_mode in ["none", "timediff"]:
             return x
 
         self._check_time_axis(x, "history_normalize")
-        self._check_history_stats(x, caller="history_normalize")
+        self._check_history_stats(x, caller="history_normalize", stats=stats)
 
-        mean, std = self._history_stats(x, target)
+        mean, std = self._history_stats(x, target, stats)
 
         return (x - mean) / std
 
-    def history_denormalize(self, xn, target=False):
+    def history_denormalize(self, xn, target=False, stats: Optional[HistoryStats] = None):
         r"""
-        Undo :meth:`history_normalize` using the cached statistics.
+        Undo :meth:`history_normalize`.
 
         A no-op in the ``"none"`` and ``"timediff"`` modes.
 
@@ -602,6 +754,9 @@ class Preprocessor2D(nn.Module):
         target : bool, optional
             If ``True``, ``xn`` holds only the predicted channels, see
             :meth:`history_normalize`. By default ``False``.
+        stats : HistoryStats, optional
+            The statistics, from :meth:`compute_history_stats`. By default the
+            ones stored by :meth:`history_compute_stats`.
 
         Returns
         -------
@@ -611,24 +766,26 @@ class Preprocessor2D(nn.Module):
         Raises
         ------
         RuntimeError
-            If :meth:`history_compute_stats` has not been called yet.
+            If no ``stats`` are given and :meth:`history_compute_stats` has not
+            been called yet.
         """
         if self.history_normalization_mode in ["none", "timediff"]:
             return xn
 
         self._check_time_axis(xn, "history_denormalize")
-        self._check_history_stats(xn, caller="history_denormalize")
+        self._check_history_stats(xn, caller="history_denormalize", stats=stats)
 
-        mean, std = self._history_stats(xn, target)
+        mean, std = self._history_stats(xn, target, stats)
 
         return xn * std + mean
 
-    def _history_stats(self, x, target):
+    def _history_stats(self, x, target, stats=None):
         # (B, 1, C, 1, 1), broadcast over time and grid
+        mean, std = (self.history_mean, self.history_std) if stats is None else (stats.mean, stats.std)
         if target:
             num_channels = x.shape[2]
-            return self.history_mean[:, :, :num_channels], self.history_std[:, :, :num_channels]
-        return self.history_mean, self.history_std
+            return mean[:, :, :num_channels], std[:, :, :num_channels]
+        return mean, std
 
     def _mode(self):
         return "train" if self.training else "eval"

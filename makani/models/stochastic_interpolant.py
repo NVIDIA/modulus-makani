@@ -385,20 +385,29 @@ class StochasticInterpolantWrapper(nn.Module):
 
         return b
 
-    def _forward_train(self, inp, tar, n_samples=1):
+    def _stack_dynamic_features(self, dynamic_features):
+        # the dynamic features of the input step, stacked to [B, C, H, W], or None without any
+        dynamic_features = {} if dynamic_features is None else dynamic_features
+        expected = set(self.preprocessor.dynamic_features)
+        if set(dynamic_features) != expected:
+            raise ValueError(f"the model takes the dynamic features {sorted(expected)}, got {sorted(dynamic_features)}")
+
+        inpu = self.preprocessor.stack_dynamic_features(dynamic_features)
+        if inpu is not None:
+            # remove the time dim, there is no history
+            inpu = inpu.squeeze(1)
+
+        return inpu
+
+    def _forward_train(self, inp, tar, inpu, n_samples=1):
 
         # get input shape [B, C, H, W]
         ishape = list(inp.shape)
         samples_fact = 2 if self.antithetic_sampling else 1
 
-        # extract the dynamic and static features, expand and flatten
+        # expand and flatten the dynamic and static features
         with torch.no_grad():
-            # get the dynamic features, in shape [B, T, C, H, W]
-            inpu = self.preprocessor.stack_dynamic_features(self.preprocessor.get_dynamic_features()[0])
-
             if inpu is not None:
-                # rewmove time dim to get shape [B, C, H, W]
-                inpu = inpu.squeeze(1)
                 # convert to shape [B*S, C, H, W]
                 inpu = expand_time(inpu, n_samples * samples_fact).flatten(0, 1)
 
@@ -442,18 +451,11 @@ class StochasticInterpolantWrapper(nn.Module):
 
         return drift_pred, drift
 
-    def _forward_eval(self, inp, n_steps=1):
+    def _forward_eval(self, inp, inpu, n_steps=1):
 
         torch._check(len(inp.shape) == 4, lambda: f"expected a 4D input, got {len(inp.shape)}D")
 
         with torch.no_grad():
-            # get the dynamic features in shape [B, T, C, H, W]
-            inpu = self.preprocessor.stack_dynamic_features(self.preprocessor.get_dynamic_features()[0])
-
-            if inpu is not None:
-                # rewmove time dim to get shape [B, C, H, W]
-                inpu = inpu.squeeze(1)
-
             # get static in shape [B, C, H, W]
             static = self.preprocessor.get_static_features()
 
@@ -501,7 +503,7 @@ class StochasticInterpolantWrapper(nn.Module):
 
         return x
 
-    def forward(self, inp, tar=None, n_samples=1, n_steps=1):
+    def forward(self, inp, tar=None, dynamic_features=None, n_samples=1, n_steps=1):
         r"""
         Train on interpolant samples, or generate a forecast by integrating the SDE.
 
@@ -513,9 +515,9 @@ class StochasticInterpolantWrapper(nn.Module):
         interpolant from the base distribution to the target distribution in
         ``n_steps`` steps, and ``n_samples`` is unused.
 
-        Both noise sources are resized to the current input batch and redrawn
-        from their stationary distribution on entry, so callers that fold an
-        ensemble dimension into the batch can pass a ``(B * E, ...)`` input
+        The noise of the sampler is resized to the current input batch and
+        redrawn from its stationary distribution on entry, so callers that fold
+        an ensemble dimension into the batch can pass a ``(B * E, ...)`` input
         without managing noise state themselves.
 
         Parameters
@@ -525,6 +527,9 @@ class StochasticInterpolantWrapper(nn.Module):
         tar : torch.Tensor, optional
             Target of shape ``(B, out_chans, nlat, nlon)``. Required in
             training mode, ignored in evaluation mode.
+        dynamic_features : dict, optional
+            The dynamic features of the input, name to ``(B, 1, C_f, nlat, nlon)``,
+            as in the batch. Required if the model takes dynamic features.
         n_samples : int, optional
             Number of interpolant time samples per batch element during
             training, by default ``1``.
@@ -538,15 +543,20 @@ class StochasticInterpolantWrapper(nn.Module):
             predicted drift and the analytic drift of the interpolant path --
             for the loss to compare. In evaluation mode, the generated forecast
             of shape ``(B, out_chans, nlat, nlon)``.
+
+        Raises
+        ------
+        ValueError
+            If the dynamic features do not match the ones the model takes.
         """
-        # Keep both noise sources sized to the current input batch so callers that
-        # fold an ensemble dim into the batch (e.g. stochastic_trainer.validate_one_epoch)
+        # Keep the noise sized to the current input batch so callers that fold an
+        # ensemble dim into the batch (e.g. stochastic_trainer.validate_one_epoch)
         # can hand us a (B*E, ...) input without any state-resize plumbing of their own.
         # Drawing a fresh stationary state here also means the very first noise read
         # inside _forward_train / _forward_eval sees a non-trivial sample.
-        self.preprocessor.update_internal_state(replace_state=True, batch_size=inp.shape[0])
         self.noise_module.update(replace_state=True, batch_size=inp.shape[0])
+        inpu = self._stack_dynamic_features(dynamic_features)
         if self.training:
-            return self._forward_train(inp, tar, n_samples=n_samples)
+            return self._forward_train(inp, tar, inpu, n_samples=n_samples)
         else:
-            return self._forward_eval(inp, n_steps=n_steps)
+            return self._forward_eval(inp, inpu, n_steps=n_steps)
