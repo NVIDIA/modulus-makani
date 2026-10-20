@@ -74,8 +74,8 @@ class DaliDataloader(object):
     """Feeds batches to training, reading through a dataset backend.
 
     Iterating yields the tensors named when the pipeline was built: the input and
-    target windows, followed by the zenith angles and timestamps when those were
-    asked for. Normalization and any grid conversion happen on the GPU, so what
+    target windows, followed by the zenith angles when those were asked for, and
+    the timestamps. Normalization and any grid conversion happen on the GPU, so what
     comes out is ready for the model.
 
     Built from ``params``, which names the dataset and its layout, the channels,
@@ -272,8 +272,6 @@ class DaliDataloader(object):
             device_id=self.device_index,
             truncate_old=True,
             zenith_angle=self.add_zenith,
-            # every batch carries its timestamps
-            return_timestamp=True,
             lat_lon=self.lat_lon,
             dataset_name=self.dataset_name,
             timestamp_name=params.get("timestamp_name", "timestamp"),

@@ -217,11 +217,18 @@ class ModelWrapper(torch.nn.Module):
     def update_state(self, replace_state=True, batch_size=None):
         """Advance the stochastic state without running a forward pass.
 
-        ``batch_size`` sizes the noise state; pass the batch you intend to run
-        with. Leaving it None keeps whatever size the state currently has, which
-        for a freshly loaded package is ``params.batch_size`` (usually 1).
-        :meth:`forward` sizes the state itself, so this is only needed when
-        priming the state ahead of the first call.
+        :meth:`forward` sizes the state itself when called with
+        ``replace_state=True``; prime it here only to continue a sequence from
+        the first call on, at the batch you intend to run.
+
+        Parameters
+        ----------
+        replace_state : bool, optional
+            Draw a fresh state instead of taking one autoregressive step. By
+            default ``True``.
+        batch_size : int, optional
+            Size the noise state to this batch. ``None`` keeps the current size,
+            which for a freshly loaded package is ``params.batch_size`` (usually 1).
         """
         self.model.preprocessor.update_internal_state(replace_state=replace_state, batch_size=batch_size)
         return
@@ -283,7 +290,7 @@ class ModelWrapper(torch.nn.Module):
 
         ``x`` is ``(B, (n_history + 1) * C, H, W)``, history in the flattened
         channel axis, oldest first, or ``(B, n_history + 1, C, H, W)``. Returns
-        the input with the time axis explicit, as the step wrappers take it.
+        the input with the time axis explicit, as :class:`StepWrapper` takes it.
         """
         preprocessor = self.model.preprocessor
         if x.dim() == 4:
@@ -296,7 +303,7 @@ class ModelWrapper(torch.nn.Module):
         return x
 
     def _step_inputs(self, x, time, normalized_data, replace_state):
-        """Everything the step wrapper takes for one step: the window, its dynamic features and its noise.
+        """Everything :class:`StepWrapper` takes for one step: the window, its dynamic features and its noise.
 
         The noise state is advanced here, replaced if ``replace_state`` is set, at the batch of ``x``;
         see :meth:`forward` for the batching contract on ``time`` and the noise.
@@ -322,11 +329,26 @@ class ModelWrapper(torch.nn.Module):
         in the backbone's latent feature space and ``normalized_data`` affects
         only how ``x`` is interpreted, never the output.
 
+        Like :meth:`forward`, the call advances the noise state by one step, so
+        ``encode_process`` followed by ``forward`` on the same input draws two
+        different noise samples.
+
+        Parameters
+        ----------
+        x, time, normalized_data, replace_state
+            As in :meth:`forward`.
+
+        Returns
+        -------
+        torch.Tensor
+            The latent features, ``(B, embed_dim, h, w)`` on the internal grid of
+            the backbone.
+
         Raises
         ------
         NotImplementedError
-            If the wrapped step wrapper or backbone does not implement
-            ``encode_process`` (currently only FCN3 does).
+            If the backbone does not implement ``encode_process`` (currently only
+            FCN3 does).
         """
         if not hasattr(self.model, "encode"):
             raise NotImplementedError(f"{type(self.model).__name__} does not expose encode_process().")
@@ -349,7 +371,9 @@ class ModelWrapper(torch.nn.Module):
             denormalized on the way out. If True (default), both are assumed to
             already be in normalized space.
         replace_state : bool or None, optional
-            Forwarded to the step wrapper's stochastic-state update.
+            If true, draw a fresh noise state at the batch of ``x`` before the
+            step; otherwise continue the noise sequence by one step. Ignored for
+            a model without input noise.
 
         Returns
         -------
@@ -382,9 +406,15 @@ class ModelWrapper(torch.nn.Module):
         count raises rather than silently mis-broadcasting. At ``B == 1`` the two
         forms coincide.
 
-        Keep ``B`` fixed across a rollout. Changing it mid-rollout reallocates
-        the noise state, which discards the autoregressive noise history for
-        stateful noise modules.
+        Keep ``B`` fixed across a rollout. Changing it mid-rollout is refused for
+        stateful noise unless ``replace_state=True``, which starts a fresh noise
+        sequence.
+
+        Raises
+        ------
+        RuntimeError
+            If stateful noise would have to be resized while continuing its
+            sequence, see above.
         """
         x, features, noise = self._step_inputs(x, time, normalized_data, replace_state)
 
@@ -447,6 +477,9 @@ def save_model_package(params):
 def load_model_package(package, pretrained=True, device="cpu", multistep=False):
     """
     Loads model package and return the wrapper which can be used for inference.
+
+    ``multistep`` is accepted for backward compatibility and has no effect: the
+    same wrapper serves single steps and rollouts.
     """
     path = package.get("config.json")
     params = ParamsBase.from_json(path)
@@ -463,7 +496,7 @@ def load_model_package(package, pretrained=True, device="cpu", multistep=False):
     params.img_local_shape_y = params.img_shape_y
 
     # get the model and
-    model = model_registry.get_model(params, multistep=multistep).to(device)
+    model = model_registry.get_model(params).to(device)
 
     if pretrained:
         best_checkpoint_path = package.get(LocalPackage.MODEL_PACKAGE_CHECKPOINT_PATH)

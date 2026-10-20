@@ -55,7 +55,7 @@ an inference run reads one step at a time. They are handed to
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 
@@ -131,13 +131,21 @@ class Rollout:
         Source of the noise of each step, an external input like a forcing.
         Called as ``noise_source.update(replace_state=...)`` before each step,
         replacing the state at the first step and continuing it after that,
-        and then as ``noise_source()`` for the sample of the step. The noise
-        modules in :mod:`makani.models.noise` have that interface; the rollout
-        does not own the source, the model does, since it may be trainable.
-    continue_noise : bool, optional
-        Continue the noise state of a previous rollout at the first step
-        instead of replacing it, e.g. for an inference run split into several
-        rollouts. By default ``False``.
+        and then as ``noise_source()`` for the sample of the step. For
+        :meth:`noise_state` and the ``noise_state`` argument it also provides
+        ``get_state()``, ``set_state(state)`` and a ``version`` that counts the
+        changes of its state, see
+        :meth:`~makani.models.preprocessor.Preprocessor2D.noise_source`. The
+        rollout does not own the source, the model does, since it may be
+        trainable.
+    noise_state : optional
+        Continue the noise sequence of a previous rollout, from what its
+        :meth:`noise_state` returned, instead of drawing a fresh state at the
+        first step. The two rollouts then draw the noise of one rollout over
+        all their steps, e.g. for an inference run split into several
+        rollouts. Gradients do not flow from one rollout into the other. The
+        noise source refuses, at the first step, a state taken at another
+        batch.
     ensemble_size : int, optional
         Number of ensemble members, folded into the batch dimension of the
         input window, the dynamic features, the timestamps and the predictions,
@@ -148,7 +156,8 @@ class Rollout:
     ------
     ValueError
         If the batch has fewer target steps than ``n_steps``, no targets and
-        no ``n_steps``, or ``ensemble_size`` is smaller than 1.
+        no ``n_steps``, ``ensemble_size`` is smaller than 1, or a
+        ``noise_state`` is given without a ``noise_source``.
     """
 
     def __init__(
@@ -156,11 +165,13 @@ class Rollout:
         batch: Batch,
         n_steps: Optional[int] = None,
         noise_source: Optional[Callable[[], torch.Tensor]] = None,
-        continue_noise: bool = False,
+        noise_state: Optional[Any] = None,
         ensemble_size: int = 1,
     ):
         if ensemble_size < 1:
             raise ValueError(f"ensemble_size has to be at least 1, got {ensemble_size}")
+        if (noise_state is not None) and (noise_source is None):
+            raise ValueError("A noise state can be continued only with a noise source")
         self._has_target = TARGET in batch
         if n_steps is None:
             if not self._has_target:
@@ -172,7 +183,9 @@ class Rollout:
         self._batch = batch
         self._n_steps = n_steps
         self._noise_source = noise_source
-        self._continue_noise = continue_noise
+        self._noise_state = noise_state
+        # the version of the noise state after the last update of this rollout, see noise_state()
+        self._noise_version = None
         self._ensemble_size = ensemble_size
 
         # the window the model sees is folded once; the target steps only when they are used
@@ -244,8 +257,10 @@ class Rollout:
 
         noise = None
         if self._noise_source is not None:
-            replace = (k == 0) and not self._continue_noise
-            self._noise_source.update(replace_state=replace)
+            if (k == 0) and (self._noise_state is not None):
+                self._noise_source.set_state(self._noise_state)
+            self._noise_source.update(replace_state=(k == 0) and (self._noise_state is None))
+            self._noise_version = self._noise_source.version
             noise = self._noise_source()
 
         target = None
@@ -271,6 +286,42 @@ class Rollout:
             target_timestamp=target_timestamp,
             noise=noise,
         )
+
+    def noise_state(self):
+        """
+        Snapshot the noise state of the finished rollout.
+
+        Pass it as ``noise_state`` to the next rollout to continue the noise
+        sequence there: the two rollouts then draw the same noise as one
+        rollout over all their steps. The noise module is shared, so take the
+        snapshot before anything else draws from it.
+
+        Returns
+        -------
+        object
+            The state, detached from the autograd graph; for the input noise of
+            a preprocessor a :class:`~makani.models.preprocessor.NoiseState`.
+
+        Raises
+        ------
+        ValueError
+            If the rollout has no noise source.
+        RuntimeError
+            If the rollout has not finished, or if the noise state has changed
+            since its last step, e.g. because another rollout drew from the
+            same noise module in between.
+        """
+        if self._noise_source is None:
+            raise ValueError("The rollout has no noise source")
+        if self._pending or (self._index < self._n_steps) or (self._noise_version is None):
+            raise RuntimeError("The noise state can be taken only from a finished rollout")
+        if self._noise_source.version != self._noise_version:
+            raise RuntimeError(
+                "The noise state has changed since the last step of the rollout, e.g. in another rollout: "
+                "take the snapshot right after the rollout"
+            )
+
+        return self._noise_source.get_state()
 
     def advance(
         self,
@@ -358,33 +409,3 @@ class Rollout:
         for name, feature in [*dynamic_features.items(), ("timestamp", timestamp)]:
             if feature.shape[1] != 1:
                 raise ValueError(f"{name} of the predicted step has {feature.shape[1]} steps, expected 1")
-
-
-def run_rollout(
-    model_step: Callable[[RolloutStep], torch.Tensor], rollout: Rollout, push_forward: bool = False
-) -> torch.Tensor:
-    """
-    Run a rollout to its end and stack the predictions along the time axis.
-
-    Parameters
-    ----------
-    model_step : callable
-        Maps a :class:`RolloutStep` to its prediction, ``(B, 1, C, *grid)``.
-    rollout : Rollout
-        The rollout to run.
-    push_forward : bool, optional
-        Detach each prediction before it enters the next window, so gradients
-        do not flow through the rollout. By default ``False``.
-
-    Returns
-    -------
-    torch.Tensor
-        The predictions, ``(B, n_steps, C, *grid)``, aligned with the targets.
-    """
-    preds = []
-    for step in rollout:
-        pred = model_step(step)
-        preds.append(pred)
-        rollout.advance(pred.detach() if push_forward else pred)
-
-    return torch.cat(preds, dim=1)

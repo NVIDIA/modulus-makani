@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 
 from makani.utils.YParams import ParamsBase, ensure_resampled_shapes
-from makani.models import SingleStepWrapper, MultiStepWrapper
+from makani.models import StepWrapper
 from makani.models import StochasticInterpolantWrapper
 from makani.utils.dataloaders.data_helpers import get_data_normalization
 
@@ -132,9 +132,7 @@ def list_models() -> List[str]:
     return list(_model_registry.keys())
 
 
-def get_model(
-    params: ParamsBase, use_stochastic_interpolation: bool = False, multistep: bool = False, **kwargs
-) -> "torch.nn.Module":
+def get_model(params: ParamsBase, use_stochastic_interpolation: bool = False, **kwargs) -> "torch.nn.Module":
     """
     Convenience routine that constructs the model passing parameters and kwargs.
     Unloads all the parameters in the params datastructure as a dict.
@@ -143,11 +141,16 @@ def get_model(
     ----------
     params : ParamsBase
         parameter struct.
+    use_stochastic_interpolation : bool, optional
+        Wrap the network in a :class:`StochasticInterpolantWrapper` instead of a
+        :class:`~makani.models.stepper.StepWrapper`. By default ``False``.
 
     Returns
     -------
     model : torch.nn.Module
-        The registered model.
+        The registered network, wrapped in a
+        :class:`~makani.models.stepper.StepWrapper` (or a
+        :class:`StochasticInterpolantWrapper`).
 
     Raises
     ------
@@ -255,11 +258,7 @@ def get_model(
         )
 
     if not use_stochastic_interpolation:
-        # wrap into Multi-Step if requested
-        if multistep:
-            model = MultiStepWrapper(params, model_handle)
-        else:
-            model = SingleStepWrapper(params, model_handle)
+        model = StepWrapper(params, model_handle)
     else:
         model = StochasticInterpolantWrapper(
             params,

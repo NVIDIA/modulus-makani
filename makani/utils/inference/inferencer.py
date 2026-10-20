@@ -115,7 +115,7 @@ class Inferencer(Driver):
         if not hasattr(self.params, "enable_synthetic_data"):
             self.params["enable_synthetic_data"] = False
 
-        if not self.params["enable_synthetic_data"]:
+        if not self.params.enable_synthetic_data:
             self.params["multifiles"] = True
 
         # the file path is taken from inf_data_path to perform inference on the out of sample dataset
@@ -194,8 +194,7 @@ class Inferencer(Driver):
             )
 
         # get model
-        self.multistep = False
-        self.model = model_registry.get_model(self.params, multistep=self.multistep).to(self.device)
+        self.model = model_registry.get_model(self.params).to(self.device)
         self.preprocessor = self.model.preprocessor
 
         # print model

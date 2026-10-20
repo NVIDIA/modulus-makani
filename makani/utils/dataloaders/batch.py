@@ -48,12 +48,10 @@ when empty. ``static_features`` (``(C_static, *grid)``) is reserved: the static
 fields are the same for every sample, so the preprocessor holds them on the
 device rather than every batch carrying a copy.
 
-The preprocessor consumes the dict; :func:`to_legacy_tuple` turns a batch back
-into the positional tuple the loaders used to emit, for comparisons with
-references recorded from it.
+A :class:`~makani.utils.dataloaders.rollout.Rollout` consumes the dict.
 """
 
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -145,86 +143,3 @@ def batch_to_device(batch: Batch, device: torch.device, non_blocking: bool = Fal
         return value
 
     return _move(batch)
-
-
-def map_dynamic_features(batch: Batch, fn: Callable[[torch.Tensor], torch.Tensor]) -> Batch:
-    """
-    Apply ``fn`` to every dynamic feature of a batch, input and target side.
-
-    The ensemble trainers fold the ensemble members into the batch dimension for
-    the model, and the dynamic features have to follow, while the target stays
-    at the original batch.
-
-    Parameters
-    ----------
-    batch : dict
-        The batch.
-    fn : callable
-        Maps a feature tensor to its replacement.
-
-    Returns
-    -------
-    dict
-        A new batch; the other entries are shared with the one passed in.
-    """
-    result = dict(batch)
-    for key in (INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES):
-        if key in batch:
-            result[key] = {name: fn(feature) for name, feature in batch[key].items()}
-    return result
-
-
-def to_legacy_tuple(batch: Batch, timestamps: bool = False) -> Tuple[torch.Tensor, ...]:
-    """
-    Convert a batch to the positional tuple the loaders used to emit.
-
-    The order is input, target, input zenith, target zenith and, if requested,
-    input and target timestamps, each item only if the batch has it.
-
-    Parameters
-    ----------
-    batch : dict
-        The batch.
-    timestamps : bool, optional
-        Append the timestamps. The training loaders never returned them, the
-        inference loaders always did.
-
-    Returns
-    -------
-    tuple of torch.Tensor
-
-    Raises
-    ------
-    ValueError
-        If the batch is not on a lat/lon grid, or carries a dynamic feature
-        the tuple has no place for.
-    """
-
-    inp = batch[INPUT]
-    if inp.dim() != 5:
-        raise ValueError(
-            f"The legacy tuple needs a lat/lon grid, shape (B, T, C, H, W), but the input has shape {tuple(inp.shape)}"
-        )
-
-    has_target = TARGET in batch
-
-    for key in (INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES):
-        unknown = set(batch.get(key, {})) - {ZENITH}
-        if unknown:
-            raise ValueError(f"The legacy tuple has no place for the dynamic features {sorted(unknown)}")
-
-    result = (inp,)
-    if has_target:
-        result += (batch[TARGET],)
-
-    if ZENITH in batch[INPUT_DYNAMIC_FEATURES]:
-        result += (batch[INPUT_DYNAMIC_FEATURES][ZENITH],)
-        if has_target:
-            result += (batch[TARGET_DYNAMIC_FEATURES][ZENITH],)
-
-    if timestamps:
-        result += (batch[INPUT_TIMESTAMP],)
-        if has_target:
-            result += (batch[TARGET_TIMESTAMP],)
-
-    return result

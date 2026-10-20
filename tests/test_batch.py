@@ -30,8 +30,6 @@ from makani.utils.dataloaders.batch import (
     ZENITH,
     make_batch,
     batch_to_device,
-    to_legacy_tuple,
-    map_dynamic_features,
 )
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -114,82 +112,6 @@ class TestBatchToDevice(unittest.TestCase):
 
         self.assertEqual(batch[INPUT].device.type, "cpu")
         self.assertEqual(batch[INPUT_DYNAMIC_FEATURES][ZENITH].device.type, "cpu")
-
-
-class TestToLegacyTuple(unittest.TestCase):
-
-    def test_training_order(self):
-        batch = _batch()
-        items = to_legacy_tuple(batch)
-        expected = (
-            batch[INPUT],
-            batch[TARGET],
-            batch[INPUT_DYNAMIC_FEATURES][ZENITH],
-            batch[TARGET_DYNAMIC_FEATURES][ZENITH],
-        )
-        self.assertEqual(len(items), len(expected))
-        for got, want in zip(items, expected):
-            self.assertIs(got, want)
-
-    def test_training_order_without_zenith(self):
-        batch = _batch(with_zenith=False)
-        items = to_legacy_tuple(batch)
-        self.assertEqual(len(items), 2)
-        self.assertIs(items[0], batch[INPUT])
-        self.assertIs(items[1], batch[TARGET])
-
-    def test_inference_order(self):
-        # what the inference loaders returned: input, zenith, timestamps
-        batch = _batch(with_target=False)
-        items = to_legacy_tuple(batch, timestamps=True)
-        expected = (batch[INPUT], batch[INPUT_DYNAMIC_FEATURES][ZENITH], batch[INPUT_TIMESTAMP])
-        self.assertEqual(len(items), len(expected))
-        for got, want in zip(items, expected):
-            self.assertIs(got, want)
-
-    def test_timestamps_come_last(self):
-        batch = _batch()
-        items = to_legacy_tuple(batch, timestamps=True)
-        self.assertEqual(len(items), 6)
-        self.assertIs(items[4], batch[INPUT_TIMESTAMP])
-        self.assertIs(items[5], batch[TARGET_TIMESTAMP])
-
-    def test_mesh_batch_is_rejected(self):
-        # the legacy consumers only know (H, W); a mesh must not be reshaped into one
-        batch = _batch(grid=(_H * _W,))
-        with self.assertRaises(ValueError):
-            to_legacy_tuple(batch)
-
-    def test_unknown_dynamic_feature_is_rejected(self):
-        # the tuple has no slot for it, and dropping it silently would change the model input
-        batch = _batch()
-        batch[INPUT_DYNAMIC_FEATURES]["forcing"] = _field(2, 1)
-        with self.assertRaises(ValueError):
-            to_legacy_tuple(batch)
-
-
-class TestMapDynamicFeatures(unittest.TestCase):
-
-    def test_maps_both_sides_and_nothing_else(self):
-        # the ensemble trainers fold the members into the batch for the features only
-        batch = _batch()
-        mapped = map_dynamic_features(batch, lambda feature: feature.repeat_interleave(3, dim=0))
-
-        self.assertEqual(mapped[INPUT_DYNAMIC_FEATURES][ZENITH].shape[0], 3 * _B)
-        self.assertEqual(mapped[TARGET_DYNAMIC_FEATURES][ZENITH].shape[0], 3 * _B)
-        self.assertIs(mapped[INPUT], batch[INPUT])
-        self.assertIs(mapped[TARGET], batch[TARGET])
-
-        # the batch passed in is left as it is
-        self.assertEqual(batch[INPUT_DYNAMIC_FEATURES][ZENITH].shape[0], _B)
-
-    def test_batch_without_target(self):
-        batch = _batch(with_target=False)
-        mapped = map_dynamic_features(batch, lambda feature: 2.0 * feature)
-        self.assertNotIn(TARGET_DYNAMIC_FEATURES, mapped)
-        self.assertTrue(
-            torch.equal(mapped[INPUT_DYNAMIC_FEATURES][ZENITH], 2.0 * batch[INPUT_DYNAMIC_FEATURES][ZENITH])
-        )
 
 
 if __name__ == "__main__":

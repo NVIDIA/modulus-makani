@@ -92,9 +92,8 @@ class SampleSource(object):
         one process describes the dataset instead of all of them.
     zenith_angle : bool
         Append the cosine of the solar zenith angle for every timestep of the
-        window, computed on this rank's coordinates.
-    return_timestamp : bool
-        Append the time of every timestep of the window.
+        window, computed on this rank's coordinates. The time of every timestep
+        of the window is always appended, last.
     lat_lon : tuple, optional
         Coordinates to use instead of those found in the files.
     dataset_name, timestamp_name : str
@@ -143,7 +142,6 @@ class SampleSource(object):
         truncate_old=True,
         enable_logging=True,
         zenith_angle=True,
-        return_timestamp=False,
         lat_lon=None,
         dataset_name="fields",
         timestamp_name="timestamp",
@@ -177,7 +175,6 @@ class SampleSource(object):
         self.shard_id = shard_id
         self.is_parallel = is_parallel
         self.zenith_angle = zenith_angle
-        self.return_timestamp = return_timestamp
         self.channel_names = channel_names
         self.num_retries = 5
 
@@ -414,8 +411,7 @@ class SampleSource(object):
         layout = ["FCHW", "FCHW"]
         if self.zenith_angle:
             layout += ["FCHW", "FCHW"]
-        if self.return_timestamp:
-            layout += ["F", "F"]
+        layout += ["F", "F"]
         return layout
 
     def _compute_timestamps(self, local_idx, file_idx):
@@ -506,14 +502,12 @@ class SampleSource(object):
         inp, tar = self._read_window(file_idx, local_idx)
         torch.cuda.nvtx.range_pop()
 
-        if self.zenith_angle or self.return_timestamp:
-            inp_time, tar_time = self._compute_timestamps(local_idx, file_idx)
+        inp_time, tar_time = self._compute_timestamps(local_idx, file_idx)
 
         result = (inp, tar)
         if self.zenith_angle:
             result = result + self._compute_zenith_angle(inp_time, tar_time)
-        if self.return_timestamp:
-            result = result + (inp_time, tar_time)
+        result = result + (inp_time, tar_time)
 
         torch.cuda.nvtx.range_pop()
 

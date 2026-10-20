@@ -557,6 +557,21 @@ class TestDiffusionNoiseS2(unittest.TestCase):
     def test_is_stateful(self):
         self.assertTrue(self._make_noise().is_stateful())
 
+    def test_state_written_in_inference_mode_can_be_updated_after_it(self):
+        # validation and inference run in inference mode, where the state becomes an inference tensor; the
+        # next update outside of it, e.g. in training, replaces it rather than writing into it
+        noise = self._make_noise()
+        with torch.inference_mode():
+            noise.update(replace_state=True, batch_size=self.B + 1)
+            noise.update(replace_state=False)
+
+        noise.update(replace_state=False)
+        self.assertFalse(noise.state.is_inference())
+        noise.reset()
+        self.assertFalse(noise.state.is_inference())
+        self.assertEqual(noise.state.shape[0], self.B + 1)
+        self.assertTrue(torch.all(noise.state == 0))
+
     def test_initial_state_shape(self):
         noise = self._make_noise()
         # state: (B, T, C, lmax_local, mmax_local, 2)

@@ -239,7 +239,6 @@ def _default_kwargs(location):
         truncate_old=False,
         enable_logging=False,
         zenith_angle=False,
-        return_timestamp=False,
         is_parallel=False,
         timestamp_boundary_list=[],
     )
@@ -312,7 +311,7 @@ class _BaseESTests:
 
     def test_basic_output_shapes(self):
         es = self._make()
-        inp, tar = self._call0(es)
+        inp, tar, *_ = self._call0(es)
         self.assertEqual(inp.shape, (1, _N_CH, _IMG_H, _IMG_W))
         self.assertEqual(tar.shape, (1, _N_CH, _IMG_H, _IMG_W))
 
@@ -320,27 +319,27 @@ class _BaseESTests:
 
     def test_n_history_adds_input_timesteps(self):
         es = self._make(n_history=2)
-        inp, _tar = self._call0(es)
+        inp, _tar, *_ = self._call0(es)
         self.assertEqual(inp.shape[0], 3)  # n_history + 1
 
     # ---- 3. n_future ----------------------------------------------------
 
     def test_n_future_adds_target_timesteps(self):
         es = self._make(n_future=2)
-        _inp, tar = self._call0(es)
+        _inp, tar, *_ = self._call0(es)
         self.assertEqual(tar.shape[0], 3)  # n_future + 1
 
     # ---- 4. subsampling -------------------------------------------------
 
     def test_subsampling_halves_spatial_dims(self):
         es = self._make(subsampling_factor=2)
-        inp, tar = self._call0(es)
+        inp, tar, *_ = self._call0(es)
         self.assertEqual(inp.shape, (1, _N_CH, math.ceil(_IMG_H / 2), math.ceil(_IMG_W / 2)))
         self.assertEqual(tar.shape, (1, _N_CH, math.ceil(_IMG_H / 2), math.ceil(_IMG_W / 2)))
 
     def test_subsampling_quarter_spatial_dims(self):
         es = self._make(subsampling_factor=4)
-        inp, tar = self._call0(es)
+        inp, tar, *_ = self._call0(es)
         self.assertEqual(inp.shape, (1, _N_CH, math.ceil(_IMG_H / 4), math.ceil(_IMG_W / 4)))
         self.assertEqual(tar.shape, (1, _N_CH, math.ceil(_IMG_H / 4), math.ceil(_IMG_W / 4)))
 
@@ -349,8 +348,8 @@ class _BaseESTests:
         S = 2
         es_full = self._make()
         es_sub = self._make(subsampling_factor=S)
-        inp_full, tar_full = self._call0(es_full)
-        inp_sub, tar_sub = self._call0(es_sub)
+        inp_full, tar_full, *_ = self._call0(es_full)
+        inp_sub, tar_sub, *_ = self._call0(es_sub)
         self.assertTrue(compare_arrays("subsampled inp", inp_sub, inp_full[:, :, ::S, ::S], verbose=verbose))
         self.assertTrue(compare_arrays("subsampled tar", tar_sub, tar_full[:, :, ::S, ::S], verbose=verbose))
 
@@ -359,7 +358,7 @@ class _BaseESTests:
     def test_spatial_crop_limits_dims(self):
         crop_h, crop_w = _IMG_H // 2, _IMG_W // 2
         es = self._make(crop_size=[crop_h, crop_w], crop_anchor=[0, 0])
-        inp, tar = self._call0(es)
+        inp, tar, *_ = self._call0(es)
         self.assertEqual(inp.shape, (1, _N_CH, crop_h, crop_w))
         self.assertEqual(tar.shape, (1, _N_CH, crop_h, crop_w))
 
@@ -367,7 +366,7 @@ class _BaseESTests:
         crop_h, crop_w = _IMG_H // 2, _IMG_W // 2
         anchor_h, anchor_w = 4, 8
         es = self._make(crop_size=[crop_h, crop_w], crop_anchor=[anchor_h, anchor_w])
-        inp, _tar = self._call0(es)
+        inp, _tar, *_ = self._call0(es)
         self.assertEqual(inp.shape, (1, _N_CH, crop_h, crop_w))
 
     def test_crop_matches_manual_crop(self, verbose=False):
@@ -375,8 +374,8 @@ class _BaseESTests:
         crop_h, crop_w = _IMG_H // 2, _IMG_W // 2
         es_full = self._make()
         es_crop = self._make(crop_size=[crop_h, crop_w], crop_anchor=[0, 0])
-        inp_full, tar_full = self._call0(es_full)
-        inp_crop, tar_crop = self._call0(es_crop)
+        inp_full, tar_full, *_ = self._call0(es_full)
+        inp_crop, tar_crop, *_ = self._call0(es_crop)
         self.assertTrue(compare_arrays("cropped inp", inp_crop, inp_full[:, :, :crop_h, :crop_w], verbose=verbose))
         self.assertTrue(compare_arrays("cropped tar", tar_crop, tar_full[:, :, :crop_h, :crop_w], verbose=verbose))
 
@@ -386,8 +385,8 @@ class _BaseESTests:
         anchor_h, anchor_w = 4, 8
         es_full = self._make()
         es_crop = self._make(crop_size=[crop_h, crop_w], crop_anchor=[anchor_h, anchor_w])
-        inp_full, tar_full = self._call0(es_full)
-        inp_crop, tar_crop = self._call0(es_crop)
+        inp_full, tar_full, *_ = self._call0(es_full)
+        inp_crop, tar_crop, *_ = self._call0(es_crop)
         self.assertTrue(
             compare_arrays(
                 "anchored crop inp",
@@ -425,7 +424,7 @@ class _BaseESTests:
         es_window = self._make(n_history=N_HIST, n_future=N_FUT)
         es_single = self._make()  # n_history=0, n_future=0
 
-        inp_win, tar_win = self._call0(es_window)
+        inp_win, tar_win, *_ = self._call0(es_window)
 
         # collect (N_HIST+1) + (N_FUT+1) = 6 individual frames
         n_frames = (N_HIST + 1) + (N_FUT + 1)
@@ -460,7 +459,7 @@ class _BaseESTests:
             in_channels=np.array([0, 1, 2]),
             out_channels=np.array([0, 1]),
         )
-        inp, tar = self._call0(es)
+        inp, tar, *_ = self._call0(es)
         self.assertEqual(inp.shape[1], 3)
         self.assertEqual(tar.shape[1], 2)
 
@@ -476,7 +475,7 @@ class _BaseESTests:
         """
         sel = [3, 1, 0, 2]
         es = self._make_distinctive(in_channels=np.array(sel))
-        inp, _tar = self._call0(es)
+        inp, _tar, *_ = self._call0(es)
         # expected shape matches the number of selected channels (4), not _N_CH (5)
         vals = [4.0, 2.0, 1.0, 3.0]
         expected = np.empty((len(sel), _IMG_H, _IMG_W), dtype=np.float32)
@@ -496,7 +495,7 @@ class _BaseESTests:
         """
         sel = [3, 1, 0, 2]
         es = self._make_distinctive(out_channels=np.array(sel))
-        _inp, tar = self._call0(es)
+        _inp, tar, *_ = self._call0(es)
         vals = [4.0, 2.0, 1.0, 3.0]
         expected = np.empty((len(sel), _IMG_H, _IMG_W), dtype=np.float32)
         for pos, val in enumerate(vals):
@@ -508,7 +507,7 @@ class _BaseESTests:
     def test_zenith_angle_appended(self):
         es = self._make(zenith_angle=True)
         result = self._call0(es)
-        self.assertEqual(len(result), 4)  # inp, tar, zen_inp, zen_tar
+        self.assertEqual(len(result), 6)  # inp, tar, zen_inp, zen_tar, inp_time, tar_time
         zen_inp, zen_tar = result[2], result[3]
         self.assertEqual(zen_inp.shape, (1, 1, _IMG_H, _IMG_W))
         self.assertEqual(zen_tar.shape, (1, 1, _IMG_H, _IMG_W))
@@ -521,38 +520,32 @@ class _BaseESTests:
         result = self._call0(es)
         self.assertEqual(result[2].shape, (1, 1, math.ceil(_IMG_H / 2), math.ceil(_IMG_W / 2)))
 
-    # ---- 9. return timestamp --------------------------------------------
+    # ---- 9. timestamps ----------------------------------------------------
 
-    def test_return_timestamp_appended(self):
-        es = self._make(return_timestamp=True)
+    def test_timestamps_appended(self):
+        es = self._make()
         result = self._call0(es)
         self.assertEqual(len(result), 4)  # inp, tar, inp_time, tar_time
         self.assertEqual(len(result[2]), 1)  # n_history + 1
         self.assertEqual(len(result[3]), 1)  # n_future + 1
 
-    def test_return_timestamp_n_history(self):
-        es = self._make(return_timestamp=True, n_history=2)
+    def test_timestamps_n_history(self):
+        es = self._make(n_history=2)
         result = self._call0(es)
         self.assertEqual(len(result[2]), 3)  # n_history + 1 = 3
 
-    # ---- 10. zenith + timestamp combined --------------------------------
-
-    def test_zenith_and_timestamp_both_appended(self):
-        es = self._make(zenith_angle=True, return_timestamp=True)
-        result = self._call0(es)
-        self.assertEqual(len(result), 6)  # inp, tar, zen_inp, zen_tar, inp_t, tar_t
+    # ---- 10. output layout -------------------------------------------------
 
     def test_output_layout_matches_outputs(self):
         # the DALI pipeline takes the number of outputs and their layouts from this
         for zenith_angle in [False, True]:
-            for return_timestamp in [False, True]:
-                with self.subTest(zenith_angle=zenith_angle, return_timestamp=return_timestamp):
-                    es = self._make(zenith_angle=zenith_angle, return_timestamp=return_timestamp)
-                    result = self._call0(es)
-                    layout = es.output_layout()
-                    self.assertEqual(len(layout), len(result))
-                    for output, axes in zip(result, layout):
-                        self.assertEqual(np.ndim(output), len(axes))
+            with self.subTest(zenith_angle=zenith_angle):
+                es = self._make(zenith_angle=zenith_angle)
+                result = self._call0(es)
+                layout = es.output_layout()
+                self.assertEqual(len(layout), len(result))
+                for output, axes in zip(result, layout):
+                    self.assertEqual(np.ndim(output), len(axes))
 
     # ---- 11. pickle round-trip ------------------------------------------
 
@@ -571,8 +564,8 @@ class _BaseESTests:
         es_ref = self._make()  # worker-process state (our simulation)
         es_restored = pickle.loads(pickle.dumps(self._make_for_pickle()))
 
-        inp_ref, tar_ref = self._call0(es_ref)
-        inp_res, tar_res = self._call0(es_restored)
+        inp_ref, tar_ref, *_ = self._call0(es_ref)
+        inp_res, tar_res, *_ = self._call0(es_restored)
 
         with self.subTest(desc="inp"):
             self.assertTrue(compare_arrays("pickled inp", inp_res, inp_ref, verbose=verbose))
@@ -634,7 +627,6 @@ class _BaseESTests:
             max_samples=N_SAMPLES + 1,  # +1: samples_end = (N+1) - 1 = N
             samples_per_epoch=EPOCH_LEN,
             batch_size=1,
-            return_timestamp=True,
         )
         self.assertEqual(es.n_samples_total, N_SAMPLES)
         self.assertEqual(es.num_steps_per_epoch, EPOCH_LEN)
@@ -694,7 +686,6 @@ class _BaseESTests:
             max_samples=N_SAMPLES + 1,  # samples_end = (N+1) - 1 = N
             samples_per_epoch=EPOCH_LEN,
             batch_size=1,
-            return_timestamp=True,
         )
 
         per_cycle_ts = []
@@ -744,7 +735,6 @@ class _BaseESTests:
             max_samples=N_SAMPLES + 1,
             samples_per_epoch=EPOCH_LEN,
             batch_size=1,
-            return_timestamp=True,
         )
         self.assertEqual(es.n_samples_total, N_SAMPLES)
         self.assertEqual(es.num_steps_per_epoch, EPOCH_LEN)
@@ -832,7 +822,7 @@ class _BaseESTests:
 
                 fps = set()
                 for step in range(es.num_steps_per_epoch):
-                    inp, _tar = es(
+                    inp, _tar, *_ = es(
                         _SampleInfo(
                             idx_in_epoch=step,
                             epoch_idx=0,
@@ -1139,7 +1129,7 @@ class TestPartialYearTimestamps(unittest.TestCase):
         self.assertEqual((last.month, last.day), (12, 31))
 
     def test_times_come_from_the_file(self):
-        es = _make_source(self.root, return_timestamp=True, n_history=1, n_future=1)
+        es = _make_source(self.root, n_history=1, n_future=1)
         for file_idx in range(2):
             # the first and the last window that fit inside the file
             length = len(self.file_timestamps[file_idx])
@@ -1150,7 +1140,7 @@ class TestPartialYearTimestamps(unittest.TestCase):
                 self.assertTrue(compare_arrays("target times", tar_time, exp_tar, atol=0.0, rtol=0.0, shape_check=True))
 
     def test_returned_times_match_the_first_sample(self):
-        es = _make_source(self.root, return_timestamp=True, n_history=1, n_future=1)
+        es = _make_source(self.root, n_history=1, n_future=1)
         _inp, _tar, inp_time, tar_time = es(_SampleInfo(idx_in_epoch=0, epoch_idx=0, iteration=0))
 
         # with shuffling off, the first sample is the first valid window of the July file

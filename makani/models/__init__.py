@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from .preprocessor import Preprocessor2D
-from .stepper import SingleStepWrapper, MultiStepWrapper
+from .stepper import StepWrapper
 from .stochastic_interpolant import StochasticInterpolantWrapper
 
 import makani.models.model_registry

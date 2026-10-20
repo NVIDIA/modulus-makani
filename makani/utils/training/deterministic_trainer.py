@@ -130,8 +130,7 @@ class Trainer(Driver):
 
         # init preprocessor and model
         with Timer() as timer:
-            self.multistep = self.params.n_future > 0
-            self.model = model_registry.get_model(self.params, multistep=self.multistep).to(self.device)
+            self.model = model_registry.get_model(self.params).to(self.device)
             self.preprocessor = self.model.preprocessor
         self.timers["model init"] = timer.time
 
@@ -321,7 +320,7 @@ class Trainer(Driver):
 
         if self.params.jit_mode == "inductor":
             # compile the step, not the rollout: the loop and the noise stay in Python, and the
-            # compiled step does not depend on the number of steps. See _RolloutMixin.compile_step
+            # compiled step does not depend on the number of steps. See StepWrapper.compile_step
             wrapper = self.model.module if isinstance(self.model, nn.parallel.DistributedDataParallel) else self.model
             wrapper.compile_step()
             # NOTE: do not torch.compile the whole LossHandler. It compiles its individual

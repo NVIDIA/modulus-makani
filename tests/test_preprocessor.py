@@ -22,7 +22,7 @@ import unittest
 import torch
 
 from makani.models.preprocessor import Preprocessor2D
-from makani.utils.dataloaders.batch import INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES, ZENITH
+from makani.utils.dataloaders.batch import ZENITH
 
 from .testutils import set_seed, get_default_parameters, compare_tensors, IMG_SIZE_H, IMG_SIZE_W
 
@@ -36,12 +36,10 @@ def _make_pp(n_history=0, add_zenith=False, **overrides):
     return Preprocessor2D(params)
 
 
-def _dynamic(inp=None, tar=None):
-    """The dynamic part of a batch, with the zenith angle as the only feature."""
-    batch = {INPUT_DYNAMIC_FEATURES: {} if inp is None else {ZENITH: inp}}
-    if tar is not None:
-        batch[TARGET_DYNAMIC_FEATURES] = {ZENITH: tar}
-    return batch
+def _noise(pp, batch_size):
+    """A fresh sample of the input noise of the preprocessor, as a rollout draws it at its first step."""
+    pp.update_internal_state(replace_state=True, batch_size=batch_size)
+    return pp.input_noise()
 
 
 class TestPreprocessor2DBasic(unittest.TestCase):
@@ -161,198 +159,49 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         self.assertEqual(sf.shape[-1], IMG_SIZE_W)
 
     # -----------------------------------------------------------------------
-    # append_history
+    # assemble_input: the dynamic features and the noise
     # -----------------------------------------------------------------------
 
-    def test_append_history_n_history_0_returns_the_prediction(self, verbose=False):
-        """When n_history=0, the next input is the prediction."""
-        x = self._field(1)
-        pred = self._field(1)
-        out = self.pp.append_history(x, pred, step=0)
-        self.assertTrue(compare_tensors("append_history n_history=0", out, pred, verbose=verbose))
-
-    def test_append_history_n_history_1_shape(self):
-        """When n_history=1, the window keeps its two steps."""
-        pp = _make_pp(n_history=1)
-        out = pp.append_history(self._field(2), self._field(1), step=0)
-        self.assertEqual(tuple(out.shape), (self.B, 2, self.C, self.H, self.W))
-
-    def test_append_history_n_history_1_rolls_content(self, verbose=False):
-        """append_history drops the oldest time step and appends the prediction as newest."""
-        pp = _make_pp(n_history=1)
-        x = self._field(2)
-        pred = self._field(1)
-        out = pp.append_history(x, pred, step=0)
-        self.assertTrue(compare_tensors("newest slot", out[:, -1], pred[:, 0], verbose=verbose))
-        self.assertTrue(compare_tensors("oldest slot rolled", out[:, 0], x[:, 1], verbose=verbose))
-
-    def test_append_history_needs_the_time_axis(self):
-        """Flat tensors are refused, they used to be unfolded here."""
-        pp = _make_pp(n_history=1)
-        with self.assertRaises(RuntimeError):
-            pp.append_history(self._rand(self.B, 2 * self.C, self.H, self.W), self._field(1), step=0)
-        with self.assertRaises(RuntimeError):
-            pp.append_history(self._field(2), self._rand(self.B, self.C, self.H, self.W), step=0)
-
-    # -----------------------------------------------------------------------
-    # cache_dynamic_features / get_dynamic_features
-    # -----------------------------------------------------------------------
-
-    def test_get_dynamic_features_empty_without_cache(self):
-        """Before caching, there are no features on either side."""
-        self.pp.eval()
-        self.assertEqual(self.pp.get_dynamic_features(), ({}, {}))
-
-    def test_cache_dynamic_features_stores_and_retrieves(self, verbose=False):
-        """Cached features are retrievable, in train and in eval mode."""
-        pp = _make_pp(add_zenith=True)
-        for mode in ["train", "eval"]:
-            with self.subTest(mode=mode):
-                getattr(pp, mode)()
-                xz, yz = self._zenith(1), self._zenith(2)
-                pp.cache_dynamic_features(_dynamic(xz, yz))
-                inp, tar = pp.get_dynamic_features()
-                self.assertTrue(compare_tensors(f"input ({mode})", inp[ZENITH], xz, verbose=verbose))
-                self.assertTrue(compare_tensors(f"target ({mode})", tar[ZENITH], yz, verbose=verbose))
-
-    def test_train_and_eval_caches_are_separate(self, verbose=False):
-        """Evaluation does not clobber the features of an in-flight training step."""
-        pp = _make_pp(add_zenith=True)
-        pp.train()
-        xz_train = self._zenith(1)
-        pp.cache_dynamic_features(_dynamic(xz_train, self._zenith(1)))
-        pp.eval()
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
-        pp.train()
-        inp, _ = pp.get_dynamic_features()
-        self.assertTrue(compare_tensors("train cache kept", inp[ZENITH], xz_train, verbose=verbose))
-
-    def test_get_dynamic_features_returns_copies(self, verbose=False):
-        """Changing what get_dynamic_features returns leaves the cache alone."""
-        pp = _make_pp(add_zenith=True)
-        xz = self._zenith(1)
-        pp.cache_dynamic_features(_dynamic(xz))
-        inp, _ = pp.get_dynamic_features()
-        inp[ZENITH].zero_()
-        inp, _ = pp.get_dynamic_features()
-        self.assertTrue(compare_tensors("cache untouched", inp[ZENITH], xz, verbose=verbose))
-
-    def test_cache_dynamic_features_same_shape_reuses_buffer(self):
-        """A second batch of the same shape is copied into the cached memory."""
-        pp = _make_pp(add_zenith=True)
-        for mode in ["train", "eval"]:
-            with self.subTest(mode=mode):
-                getattr(pp, mode)()
-                pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
-                ptr1 = pp._dynamic_cache[mode]["input"][ZENITH].data_ptr()
-                pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
-                ptr2 = pp._dynamic_cache[mode]["input"][ZENITH].data_ptr()
-                self.assertEqual(ptr1, ptr2)
-
-    def test_cache_dynamic_features_same_shape_updates_values(self, verbose=False):
-        """After the copy, the cache holds the values of the new batch."""
-        pp = _make_pp(add_zenith=True)
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
-        xz2 = self._zenith(1)
-        pp.cache_dynamic_features(_dynamic(xz2, self._zenith(1)))
-        inp, _ = pp.get_dynamic_features()
-        self.assertTrue(compare_tensors("copy path updated value", inp[ZENITH], xz2, verbose=verbose))
-
-    def test_cache_dynamic_features_shape_change_rebinds(self):
-        """When the shape changes, for example the batch size, the cache is replaced."""
-        pp = _make_pp(add_zenith=True)
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
-        ptr1 = pp._dynamic_cache["train"]["input"][ZENITH].data_ptr()
-        xz2 = self._zenith(1, B=self.B + 1)
-        pp.cache_dynamic_features(_dynamic(xz2, self._zenith(1, B=self.B + 1)))
-        cached = pp._dynamic_cache["train"]["input"][ZENITH]
-        self.assertNotEqual(ptr1, cached.data_ptr())
-        self.assertEqual(tuple(cached.shape), tuple(xz2.shape))
-
-    def test_cache_without_target_clears_the_target_side(self):
-        """An inference batch carries no target, so no stale target features remain."""
-        pp = _make_pp(add_zenith=True)
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
-        pp.cache_dynamic_features(_dynamic(self._zenith(1)))
-        _, tar = pp.get_dynamic_features()
-        self.assertEqual(tar, {})
-
-    def test_cache_rejects_a_missing_feature(self):
-        """A model built with the zenith angle cannot take a batch without it."""
-        pp = _make_pp(add_zenith=True)
-        with self.assertRaisesRegex(ValueError, "zenith"):
-            pp.cache_dynamic_features(_dynamic())
-
-    def test_cache_rejects_an_extra_feature(self):
-        """A feature the model does not take would be silently dropped."""
-        with self.assertRaisesRegex(ValueError, "zenith"):
-            self.pp.cache_dynamic_features(_dynamic(self._zenith(1)))
-
-    def test_cache_rejects_a_feature_without_time_axis(self):
-        """Features keep their time axis, like everything else in the preprocessor."""
-        pp = _make_pp(add_zenith=True)
-        with self.assertRaisesRegex(ValueError, "time axis"):
-            pp.cache_dynamic_features({INPUT_DYNAMIC_FEATURES: {ZENITH: self._rand(self.B, 1, self.H, self.W)}})
-
-    def test_cache_rejects_an_input_feature_of_the_wrong_window(self):
-        """The input features span the input window, n_history + 1 steps."""
-        pp = _make_pp(n_history=1, add_zenith=True)
-        with self.assertRaisesRegex(ValueError, "time steps"):
-            pp.cache_dynamic_features(_dynamic(self._zenith(1)))
-
-    # -----------------------------------------------------------------------
-    # append_dynamic_features
-    # -----------------------------------------------------------------------
-
-    def test_append_dynamic_features_noop_without_features(self, verbose=False):
+    def test_assemble_input_noop_without_features(self, verbose=False):
         """Without dynamic features or noise, the input comes back unchanged."""
-        for mode in ["train", "eval"]:
-            with self.subTest(mode=mode):
-                getattr(self.pp, mode)()
-                x = self._field(1)
-                out = self.pp.append_dynamic_features(x)
-                self.assertTrue(compare_tensors(f"noop {mode}", out, x, verbose=verbose))
+        x = self._field(1)
+        out = self.pp.assemble_input(x, {})
+        self.assertTrue(compare_tensors("noop", out, x, verbose=verbose))
 
-    def test_append_dynamic_features_appends_the_zenith_angle(self, verbose=False):
-        """The cached feature follows the input channels of its step."""
+    def test_assemble_input_appends_the_zenith_angle(self, verbose=False):
+        """The feature follows the input channels of its step."""
         pp = _make_pp(add_zenith=True)
-        for mode in ["train", "eval"]:
-            with self.subTest(mode=mode):
-                getattr(pp, mode)()
-                x, xz = self._field(1), self._zenith(1)
-                pp.cache_dynamic_features(_dynamic(xz, self._zenith(1)))
-                out = pp.append_dynamic_features(x)
-                self.assertEqual(tuple(out.shape), (self.B, 1, self.C + 1, self.H, self.W))
-                self.assertTrue(compare_tensors("x first", out[:, :, : self.C], x, verbose=verbose))
-                self.assertTrue(compare_tensors("zenith after", out[:, :, self.C :], xz, verbose=verbose))
+        x, xz = self._field(1), self._zenith(1)
+        out = pp.assemble_input(x, {ZENITH: xz})
+        self.assertEqual(tuple(out.shape), (self.B, 1, self.C + 1, self.H, self.W))
+        self.assertTrue(compare_tensors("x first", out[:, :, : self.C], x, verbose=verbose))
+        self.assertTrue(compare_tensors("zenith after", out[:, :, self.C :], xz, verbose=verbose))
 
-    def test_append_dynamic_features_per_step_with_history(self, verbose=False):
+    def test_assemble_input_per_step_with_history(self, verbose=False):
         """With history, every step gets the feature of that step."""
         pp = _make_pp(n_history=1, add_zenith=True)
         x, xz = self._field(2), self._zenith(2)
-        pp.cache_dynamic_features(_dynamic(xz))
-        out = pp.append_dynamic_features(x)
+        out = pp.assemble_input(x, {ZENITH: xz})
         for t in range(2):
             self.assertTrue(compare_tensors(f"x step {t}", out[:, t, : self.C], x[:, t], verbose=verbose))
             self.assertTrue(compare_tensors(f"zenith step {t}", out[:, t, self.C], xz[:, t, 0], verbose=verbose))
 
-    def test_append_dynamic_features_needs_the_cache(self):
-        """A model with the zenith angle refuses to run without it."""
-        pp = _make_pp(add_zenith=True)
-        with self.assertRaisesRegex(RuntimeError, "cache_dynamic_features"):
-            pp.append_dynamic_features(self._field(1))
+    def test_assemble_input_needs_the_features(self):
+        """A model with the zenith angle refuses to run without it, and a model without it refuses it."""
+        with self.assertRaisesRegex(ValueError, "zenith"):
+            _make_pp(add_zenith=True).assemble_input(self._field(1), {})
+        with self.assertRaisesRegex(ValueError, "zenith"):
+            self.pp.assemble_input(self._field(1), {ZENITH: self._zenith(1)})
 
-    def test_append_dynamic_features_needs_the_time_axis(self):
+    def test_assemble_input_needs_the_time_axis(self):
         """A flat input is refused."""
         with self.assertRaises(RuntimeError):
-            self.pp.append_dynamic_features(self._rand(self.B, self.C, self.H, self.W))
+            self.pp.assemble_input(self._rand(self.B, self.C, self.H, self.W), {})
 
     def test_concatenate_noise_channel_count(self):
         """Concatenated noise adds its channels after the dynamic features."""
         pp = _make_pp(add_zenith=True, input_noise={"type": "dummy", "mode": "concatenate", "n_channels": 2})
-        x = self._field(1)
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
-        out = pp.append_dynamic_features(x)
+        out = pp.assemble_input(self._field(1), {ZENITH: self._zenith(1)}, _noise(pp, self.B))
         # C original + 1 zenith + 2 noise channels
         self.assertEqual(out.shape[2], self.C + 1 + 2)
 
@@ -365,26 +214,23 @@ class TestPreprocessor2DBasic(unittest.TestCase):
             img_shape=[self.H, self.W], batch_size=self.B, num_channels=1, num_time_steps=1, mode="constant_random"
         )
         pp.update_internal_state()
-        x, xz = self._field(1), self._zenith(1)
-        pp.cache_dynamic_features(_dynamic(xz))
-        out = pp.append_dynamic_features(x)
+        x, xz, noise = self._field(1), self._zenith(1), pp.input_noise()
+        out = pp.assemble_input(x, {ZENITH: xz}, noise)
         self.assertTrue(compare_tensors("x", out[:, :, : self.C], x, verbose=verbose))
         self.assertTrue(compare_tensors("zenith", out[:, :, self.C : self.C + 1], xz, verbose=verbose))
-        self.assertTrue(compare_tensors("noise", out[:, :, self.C + 1 :], pp.input_noise(), verbose=verbose))
+        self.assertTrue(compare_tensors("noise", out[:, :, self.C + 1 :], noise, verbose=verbose))
 
     def test_concatenate_noise_original_channels_unchanged(self, verbose=False):
         """With concatenated noise the input channels are bit-identical to x."""
         pp = _make_pp(add_zenith=True, input_noise={"type": "dummy", "mode": "concatenate", "n_channels": 1})
         x = self._field(1)
-        pp.cache_dynamic_features(_dynamic(self._zenith(1)))
-        out = pp.append_dynamic_features(x)
+        out = pp.assemble_input(x, {ZENITH: self._zenith(1)}, _noise(pp, self.B))
         self.assertTrue(compare_tensors("x unchanged", out[:, :, : self.C], x, verbose=verbose))
 
     def test_perturb_noise_channel_count_unchanged(self):
         """Perturbing noise adds no channels of its own."""
         pp = _make_pp(add_zenith=True, input_noise={"type": "dummy", "mode": "perturb", "perturb_channels": ["u10m"]})
-        pp.cache_dynamic_features(_dynamic(self._zenith(1)))
-        out = pp.append_dynamic_features(self._field(1))
+        out = pp.assemble_input(self._field(1), {ZENITH: self._zenith(1)}, _noise(pp, self.B))
         # C original + 1 zenith, no extra noise channels
         self.assertEqual(out.shape[2], self.C + 1)
 
@@ -392,26 +238,22 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         """With zero DummyNoiseS2 in perturb mode, the x channels are bit-identical."""
         pp = _make_pp(input_noise={"type": "dummy", "mode": "perturb", "perturb_channels": ["u10m"]})
         x = self._field(1)
-        out = pp.append_dynamic_features(x)
+        out = pp.assemble_input(x, {}, _noise(pp, self.B))
         self.assertTrue(compare_tensors("x unchanged with zero perturb noise", out, x, verbose=verbose))
 
     def test_concatenate_noise_without_dynamic_features(self, verbose=False):
         """Without the zenith angle the noise is still appended, as the channel count expects."""
         pp = _make_pp(input_noise={"type": "dummy", "mode": "concatenate", "n_channels": 2})
-        for mode in ["train", "eval"]:
-            with self.subTest(mode=mode):
-                getattr(pp, mode)()
-                x = self._field(1)
-                pp.cache_dynamic_features(_dynamic())
-                out = pp.append_dynamic_features(x)
-                self.assertEqual(out.shape[2], self.C + 2)
-                self.assertTrue(compare_tensors("x channels unchanged", out[:, :, : self.C], x, verbose=verbose))
+        x = self._field(1)
+        out = pp.assemble_input(x, {}, _noise(pp, self.B))
+        self.assertEqual(out.shape[2], self.C + 2)
+        self.assertTrue(compare_tensors("x channels unchanged", out[:, :, : self.C], x, verbose=verbose))
 
     def test_concatenate_noise_with_history(self):
         """With history, the noise is appended to every step."""
         pp = _make_pp(n_history=1, input_noise={"type": "dummy", "mode": "concatenate", "n_channels": 1})
         x = self._field(2)
-        out = pp.append_dynamic_features(x)
+        out = pp.assemble_input(x, {}, _noise(pp, self.B))
         self.assertEqual(tuple(out.shape), (self.B, 2, self.C + 1, self.H, self.W))
         self.assertTrue(torch.equal(out[:, :, : self.C], x))
 
@@ -421,55 +263,6 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         xz = self._zenith(1)
         self.assertTrue(compare_tensors("stacked", pp.stack_dynamic_features({ZENITH: xz}), xz, verbose=verbose))
         self.assertIsNone(self.pp.stack_dynamic_features({}))
-
-    # -----------------------------------------------------------------------
-    # append_history advancing the dynamic features
-    # -----------------------------------------------------------------------
-
-    def test_append_history_n_history_0_takes_the_target_step(self, verbose=False):
-        """With n_history=0, the input feature becomes the target's feature of this step."""
-        pp = _make_pp(add_zenith=True)
-        yz = self._zenith(2)
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), yz))
-        pp.append_history(self._field(1), self._field(1), step=1, update_state=True)
-        inp, _ = pp.get_dynamic_features()
-        self.assertTrue(compare_tensors("input feature = target step 1", inp[ZENITH], yz[:, 1:2], verbose=verbose))
-
-    def test_append_history_n_history_1_rolls_newest(self, verbose=False):
-        """With n_history=1, the newest step of the input feature is the target's step."""
-        pp = _make_pp(n_history=1, add_zenith=True)
-        yz = self._zenith(2)
-        pp.cache_dynamic_features(_dynamic(self._zenith(2), yz))
-        pp.append_history(self._field(2), self._field(1), step=0, update_state=True)
-        inp, _ = pp.get_dynamic_features()
-        self.assertTrue(compare_tensors("newest = target step 0", inp[ZENITH][:, -1], yz[:, 0], verbose=verbose))
-
-    def test_append_history_n_history_1_rolls_oldest(self, verbose=False):
-        """With n_history=1, the oldest step of the input feature is its former newest."""
-        pp = _make_pp(n_history=1, add_zenith=True)
-        xz = self._zenith(2)
-        pp.cache_dynamic_features(_dynamic(xz, self._zenith(2)))
-        pp.append_history(self._field(2), self._field(1), step=0, update_state=True)
-        inp, _ = pp.get_dynamic_features()
-        self.assertTrue(compare_tensors("oldest = former newest", inp[ZENITH][:, 0], xz[:, 1], verbose=verbose))
-
-    def test_append_history_update_state_false_preserves_the_features(self, verbose=False):
-        """With update_state=False, the cached features stay as they are."""
-        pp = _make_pp(add_zenith=True)
-        xz = self._zenith(1)
-        pp.cache_dynamic_features(_dynamic(xz, self._zenith(1)))
-        pp.append_history(self._field(1), self._field(1), step=0, update_state=False)
-        inp, _ = pp.get_dynamic_features()
-        self.assertTrue(compare_tensors("unchanged", inp[ZENITH], xz, verbose=verbose))
-
-    def test_append_history_out_of_range_step_is_a_noop(self, verbose=False):
-        """Steps beyond the cached target window leave the features untouched."""
-        pp = _make_pp(add_zenith=True)
-        xz = self._zenith(1)
-        pp.cache_dynamic_features(_dynamic(xz, self._zenith(1)))
-        pp.append_history(self._field(1), self._field(1), step=5, update_state=True)
-        inp, _ = pp.get_dynamic_features()
-        self.assertTrue(compare_tensors("unchanged after out-of-range step", inp[ZENITH], xz, verbose=verbose))
 
     # -----------------------------------------------------------------------
     # correct_bias
@@ -589,20 +382,20 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         pp.update_internal_state()
 
     # -----------------------------------------------------------------------
-    # history_compute_stats / history_normalize / history_denormalize
+    # compute_history_stats / history_normalize / history_denormalize
     # -----------------------------------------------------------------------
 
     def test_history_normalize_none_mode_returns_x_unchanged(self, verbose=False):
         """history_normalization_mode='none': normalize is a no-op."""
         # default params have mode="none"
         x = self._field(1)
-        out = self.pp.history_normalize(x)
+        out = self.pp.history_normalize(x, self.pp.compute_history_stats(x))
         self.assertTrue(compare_tensors("normalize noop", out, x, verbose=verbose))
 
     def test_history_denormalize_none_mode_returns_x_unchanged(self, verbose=False):
         """history_normalization_mode='none': denormalize is a no-op."""
         x = self._field(1)
-        out = self.pp.history_denormalize(x)
+        out = self.pp.history_denormalize(x, self.pp.compute_history_stats(x))
         self.assertTrue(compare_tensors("denormalize noop", out, x, verbose=verbose))
 
     def _make_pp_mean(self, n_history=1):
@@ -617,145 +410,148 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         pp = self._make_pp_mean(n_history=1)
         flat = self._rand(self.B, 2 * self.C, self.H, self.W)
         with self.assertRaises(RuntimeError):
-            pp.history_compute_stats(flat)
-        pp.history_compute_stats(self._field(2))
+            pp.compute_history_stats(flat)
+        stats = pp.compute_history_stats(self._field(2))
         with self.assertRaises(RuntimeError):
-            pp.history_normalize(flat)
+            pp.history_normalize(flat, stats)
         with self.assertRaises(RuntimeError):
-            pp.history_denormalize(flat)
+            pp.history_denormalize(flat, stats)
 
     def test_history_normalize_denormalize_roundtrip_mean_mode(self, verbose=False):
         """normalize then denormalize recovers the original tensor (mean mode, n_history=1)."""
         pp = self._make_pp_mean(n_history=1)
         x = self._field(pp.n_history + 1)
-        pp.history_compute_stats(x)
-        xr = pp.history_denormalize(pp.history_normalize(x))
+        stats = pp.compute_history_stats(x)
+        xr = pp.history_denormalize(pp.history_normalize(x, stats), stats)
         self.assertTrue(compare_tensors("roundtrip", xr, x, atol=1e-5, rtol=1e-4, verbose=verbose))
 
     def test_history_normalize_denormalize_roundtrip_target_mean_mode(self, verbose=False):
         """normalize(target=True) then denormalize(target=True) recovers the original (mean mode)."""
         pp = self._make_pp_mean(n_history=1)
         # the input carries one more channel than the target, as with the zenith angle
-        pp.history_compute_stats(self._field(pp.n_history + 1, C=self.C + 1))
+        stats = pp.compute_history_stats(self._field(pp.n_history + 1, C=self.C + 1))
         y = self._field(1)
-        yr = pp.history_denormalize(pp.history_normalize(y, target=True), target=True)
+        yr = pp.history_denormalize(pp.history_normalize(y, stats, target=True), stats, target=True)
         self.assertTrue(compare_tensors("roundtrip target", yr, y, atol=1e-5, rtol=1e-4, verbose=verbose))
 
     def test_history_normalize_target_uses_the_leading_statistics(self, verbose=False):
         """A target holds the predicted channels, which lead the input channels."""
         pp = self._make_pp_mean(n_history=1)
-        pp.history_compute_stats(self._field(2, C=self.C + 1))
+        stats = pp.compute_history_stats(self._field(2, C=self.C + 1))
         y = self._field(1)
-        yn = pp.history_normalize(y, target=True)
-        expected = (y - pp.history_mean[:, :, : self.C]) / pp.history_std[:, :, : self.C]
+        yn = pp.history_normalize(y, stats, target=True)
+        expected = (y - stats.mean[:, :, : self.C]) / stats.std[:, :, : self.C]
         self.assertTrue(compare_tensors("target statistics", yn, expected, verbose=verbose))
 
     def test_history_normalize_uses_the_same_statistics_for_every_step(self, verbose=False):
         """The statistics are per channel and broadcast over the time steps."""
         pp = self._make_pp_mean(n_history=1)
         x = self._field(2)
-        pp.history_compute_stats(x)
-        xn = pp.history_normalize(x)
+        stats = pp.compute_history_stats(x)
+        xn = pp.history_normalize(x, stats)
         for t in range(2):
-            expected = (x[:, t] - pp.history_mean[:, 0]) / pp.history_std[:, 0]
+            expected = (x[:, t] - stats.mean[:, 0]) / stats.std[:, 0]
             self.assertTrue(compare_tensors(f"step {t}", xn[:, t], expected, verbose=verbose))
 
     def test_history_normalize_denormalize_roundtrip_exponential_mode(self, verbose=False):
         """Roundtrip holds for exponential normalization mode."""
         pp = self._make_pp_exponential(n_history=2)
         x = self._field(pp.n_history + 1)
-        pp.history_compute_stats(x)
-        xr = pp.history_denormalize(pp.history_normalize(x))
+        stats = pp.compute_history_stats(x)
+        xr = pp.history_denormalize(pp.history_normalize(x, stats), stats)
         self.assertTrue(compare_tensors("roundtrip exponential", xr, x, atol=1e-5, rtol=1e-4, verbose=verbose))
 
-    def test_history_compute_stats_mean_is_finite(self):
-        """After history_compute_stats, history_mean contains no NaN or Inf."""
+    def test_compute_history_stats_mean_is_finite(self):
+        """The mean contains no NaN or Inf."""
         pp = self._make_pp_mean(n_history=1)
-        pp.history_compute_stats(self._field(pp.n_history + 1))
-        self.assertIsNotNone(pp.history_mean)
-        self.assertFalse(torch.any(torch.isnan(pp.history_mean)).item())
-        self.assertFalse(torch.any(torch.isinf(pp.history_mean)).item())
+        stats = pp.compute_history_stats(self._field(pp.n_history + 1))
+        self.assertIsNotNone(stats.mean)
+        self.assertFalse(torch.any(torch.isnan(stats.mean)).item())
+        self.assertFalse(torch.any(torch.isinf(stats.mean)).item())
 
-    def test_history_compute_stats_std_is_finite_and_nonneg(self):
-        """After history_compute_stats, history_std is finite and non-negative."""
+    def test_compute_history_stats_std_is_finite_and_nonneg(self):
+        """The std is finite and non-negative."""
         pp = self._make_pp_mean(n_history=1)
-        pp.history_compute_stats(self._field(pp.n_history + 1))
-        self.assertIsNotNone(pp.history_std)
-        self.assertFalse(torch.any(torch.isnan(pp.history_std)).item())
-        self.assertFalse(torch.any(torch.isinf(pp.history_std)).item())
-        self.assertTrue((pp.history_std >= 0).all().item())
+        stats = pp.compute_history_stats(self._field(pp.n_history + 1))
+        self.assertIsNotNone(stats.std)
+        self.assertFalse(torch.any(torch.isnan(stats.std)).item())
+        self.assertFalse(torch.any(torch.isinf(stats.std)).item())
+        self.assertTrue((stats.std >= 0).all().item())
 
-    def test_history_compute_stats_shapes_mean_mode(self):
+    def test_compute_history_stats_shapes_mean_mode(self):
         """Mean and std are (B, 1, C, 1, 1), broadcasting over time and grid."""
         pp = self._make_pp_mean(n_history=1)
-        pp.history_compute_stats(self._field(pp.n_history + 1))
+        stats = pp.compute_history_stats(self._field(pp.n_history + 1))
         expected = (self.B, 1, self.C, 1, 1)
-        self.assertEqual(tuple(pp.history_mean.shape), expected)
-        self.assertEqual(tuple(pp.history_std.shape), expected)
+        self.assertEqual(tuple(stats.mean.shape), expected)
+        self.assertEqual(tuple(stats.std.shape), expected)
+
+    def test_history_normalize_refuses_statistics_of_another_batch(self):
+        """Statistics of one window do not apply to a window of another batch."""
+        pp = self._make_pp_mean(n_history=1)
+        stats = pp.compute_history_stats(self._field(2))
+        with self.assertRaisesRegex(RuntimeError, "batch mismatch"):
+            pp.history_normalize(self._field(2, B=self.B + 1), stats)
 
     # -----------------------------------------------------------------------
-    # history_compute_stats — known-answer tests
+    # compute_history_stats — known-answer tests
     # -----------------------------------------------------------------------
 
     def _check_constant_field(self, pp, value, verbose=False):
         T = pp.n_history + 1
         x = torch.full((self.B, T, self.C, self.H, self.W), value, dtype=torch.float32)
-        pp.history_compute_stats(x)
+        stats = pp.compute_history_stats(x)
         self.assertTrue(
             compare_tensors(
                 "constant-field mean",
-                pp.history_mean,
-                torch.full_like(pp.history_mean, value),
+                stats.mean,
+                torch.full_like(stats.mean, value),
                 atol=1e-5,
                 verbose=verbose,
             )
         )
         self.assertTrue(
-            compare_tensors(
-                "constant-field std", pp.history_std, torch.zeros_like(pp.history_std), atol=1e-5, verbose=verbose
-            )
+            compare_tensors("constant-field std", stats.std, torch.zeros_like(stats.std), atol=1e-5, verbose=verbose)
         )
 
-    def test_history_compute_stats_constant_field_mean_mode(self, verbose=False):
-        """Constant field value c -> history_mean == c, history_std == 0 (mean mode)."""
+    def test_compute_history_stats_constant_field_mean_mode(self, verbose=False):
+        """Constant field value c -> mean == c, std == 0 (mean mode)."""
         self._check_constant_field(self._make_pp_mean(n_history=1), 3.7, verbose=verbose)
 
-    def test_history_compute_stats_constant_field_exponential_mode(self, verbose=False):
+    def test_compute_history_stats_constant_field_exponential_mode(self, verbose=False):
         """Constant field -> mean == value, std == 0 (exponential mode)."""
         self._check_constant_field(self._make_pp_exponential(n_history=2), -1.25, verbose=verbose)
 
-    def test_history_compute_stats_per_channel_constants_mean_mode(self, verbose=False):
-        """Per-channel constants: history_mean of channel c equals channel c's constant value."""
+    def test_compute_history_stats_per_channel_constants_mean_mode(self, verbose=False):
+        """Per-channel constants: the mean of channel c equals channel c's constant value."""
         pp = self._make_pp_mean(n_history=1)
         T = pp.n_history + 1
         # every spatial/time value of channel c is (c + 1.0)
         x = torch.zeros(self.B, T, self.C, self.H, self.W, dtype=torch.float32)
         for c in range(self.C):
             x[:, :, c, :, :] = float(c + 1)
-        pp.history_compute_stats(x)
+        stats = pp.compute_history_stats(x)
         expected_mean = torch.arange(1, self.C + 1, dtype=torch.float32).reshape(1, 1, self.C, 1, 1)
-        self.assertTrue(compare_tensors("per-channel mean", pp.history_mean, expected_mean, atol=1e-5, verbose=verbose))
+        self.assertTrue(compare_tensors("per-channel mean", stats.mean, expected_mean, atol=1e-5, verbose=verbose))
         self.assertTrue(
-            compare_tensors(
-                "per-channel std", pp.history_std, torch.zeros_like(pp.history_std), atol=1e-5, verbose=verbose
-            )
+            compare_tensors("per-channel std", stats.std, torch.zeros_like(stats.std), atol=1e-5, verbose=verbose)
         )
 
-    def test_history_compute_stats_matches_analytical_weighted_mean_exponential(self, verbose=False):
-        """Spatially-constant-per-step fields: history_mean recovers the analytical weighted temporal average."""
+    def test_compute_history_stats_matches_analytical_weighted_mean_exponential(self, verbose=False):
+        """Spatially-constant-per-step fields: the mean recovers the analytical weighted temporal average."""
         pp = self._make_pp_exponential(n_history=2)
         T = pp.n_history + 1
         # spatially constant per (time, channel) but distinct across time & channel
         values = (torch.arange(T * self.C, dtype=torch.float32) + 1.0).reshape(T, self.C)
         x = values.reshape(1, T, self.C, 1, 1).expand(self.B, T, self.C, self.H, self.W).contiguous()
-        pp.history_compute_stats(x)
+        stats = pp.compute_history_stats(x)
         # reconstruct weights exactly as the preprocessor does: first element is oldest
         w = torch.exp(-0.5 * torch.arange(start=T - 1, end=-1, step=-1, dtype=torch.float32))
         w = w / w.sum()
         expected_mean = (w.unsqueeze(-1) * values).sum(dim=0).reshape(1, 1, self.C, 1, 1)
         self.assertTrue(
             compare_tensors(
-                "analytical weighted mean", pp.history_mean, expected_mean, atol=1e-5, rtol=1e-5, verbose=verbose
+                "analytical weighted mean", stats.mean, expected_mean, atol=1e-5, rtol=1e-5, verbose=verbose
             )
         )
 
@@ -767,29 +563,29 @@ class TestPreprocessor2DBasic(unittest.TestCase):
             x[:, t, :, :, :] = (a + b * t).reshape(1, self.C, 1, 1)
         return a, b, x
 
-    def test_history_compute_stats_linear_ramp_mean_mode_mean(self, verbose=False):
-        """Linear ramp v_t = a_c + b_c * t (spatially constant): history_mean matches a_c + b_c * t_bar."""
+    def test_compute_history_stats_linear_ramp_mean_mode_mean(self, verbose=False):
+        """Linear ramp v_t = a_c + b_c * t (spatially constant): the mean matches a_c + b_c * t_bar."""
         pp = self._make_pp_mean(n_history=2)
         T = pp.n_history + 1
         a, b, x = self._linear_ramp(T)
-        pp.history_compute_stats(x)
+        stats = pp.compute_history_stats(x)
         t_bar = torch.arange(T, dtype=torch.float32).mean()
         expected_mean = (a + b * t_bar).reshape(1, 1, self.C, 1, 1)
         self.assertTrue(
-            compare_tensors("linear ramp mean", pp.history_mean, expected_mean, atol=1e-5, rtol=1e-5, verbose=verbose)
+            compare_tensors("linear ramp mean", stats.mean, expected_mean, atol=1e-5, rtol=1e-5, verbose=verbose)
         )
 
-    def test_history_compute_stats_linear_ramp_mean_mode_std(self, verbose=False):
-        """Linear ramp: history_std = |b_c| * sqrt(Var_t) (uniform-weight variance of 0..T-1)."""
+    def test_compute_history_stats_linear_ramp_mean_mode_std(self, verbose=False):
+        """Linear ramp: the std = |b_c| * sqrt(Var_t) (uniform-weight variance of 0..T-1)."""
         pp = self._make_pp_mean(n_history=2)
         T = pp.n_history + 1
         _, b, x = self._linear_ramp(T)
-        pp.history_compute_stats(x)
+        stats = pp.compute_history_stats(x)
         t_vec = torch.arange(T, dtype=torch.float32)
         var_t = ((t_vec - t_vec.mean()) ** 2).mean()
         expected_std = (b.abs() * torch.sqrt(var_t)).reshape(1, 1, self.C, 1, 1)
         self.assertTrue(
-            compare_tensors("linear ramp std", pp.history_std, expected_std, atol=1e-5, rtol=1e-5, verbose=verbose)
+            compare_tensors("linear ramp std", stats.std, expected_std, atol=1e-5, rtol=1e-5, verbose=verbose)
         )
 
     # -----------------------------------------------------------------------
@@ -798,8 +594,7 @@ class TestPreprocessor2DBasic(unittest.TestCase):
 
     def _check_post_condition(self, pp, weights, verbose=False):
         x = self._field(pp.n_history + 1)
-        pp.history_compute_stats(x)
-        xn = pp.history_normalize(x)
+        xn = pp.history_normalize(x, pp.compute_history_stats(x))
         quad_xn = pp.quadrature(xn)  # (B, T, C)
         quad_xn2 = pp.quadrature(xn**2)  # (B, T, C)
         weighted_mean = (weights * quad_xn).sum(dim=1)  # (B, C)
@@ -853,36 +648,35 @@ class TestPreprocessor2DBasic(unittest.TestCase):
             num_time_steps=pp.n_history + 1,
             mode="constant_random",
         )
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
         return pp
 
     def test_noise_determinism_same_seed_produces_equal_outputs(self, verbose=False):
         """set_rng(seed=42) twice, each followed by a forward pass, yields identical outputs."""
         pp = self._make_pp_with_constant_random_noise()
-        x = self._field(1)
+        x, xz = self._field(1), self._zenith(1)
 
         pp.set_rng(reset=True, seed=42)
         pp.update_internal_state()
-        out1 = pp.append_dynamic_features(x)
+        out1 = pp.assemble_input(x, {ZENITH: xz}, pp.input_noise())
 
         pp.set_rng(reset=True, seed=42)
         pp.update_internal_state()
-        out2 = pp.append_dynamic_features(x)
+        out2 = pp.assemble_input(x, {ZENITH: xz}, pp.input_noise())
 
         self.assertTrue(compare_tensors("noise same seed", out1, out2, verbose=verbose))
 
     def test_noise_determinism_different_seed_produces_different_outputs(self, verbose=False):
         """Two different seeds give different outputs (the noise channels differ)."""
         pp = self._make_pp_with_constant_random_noise()
-        x = self._field(1)
+        x, xz = self._field(1), self._zenith(1)
 
         pp.set_rng(reset=True, seed=42)
         pp.update_internal_state()
-        out1 = pp.append_dynamic_features(x)
+        out1 = pp.assemble_input(x, {ZENITH: xz}, pp.input_noise())
 
         pp.set_rng(reset=True, seed=999)
         pp.update_internal_state()
-        out2 = pp.append_dynamic_features(x)
+        out2 = pp.assemble_input(x, {ZENITH: xz}, pp.input_noise())
 
         self.assertFalse(compare_tensors("noise different seeds", out1, out2, verbose=verbose))
 
@@ -892,22 +686,21 @@ class TestPreprocessor2DBasic(unittest.TestCase):
 
     def _check_grad_flows(self, pp):
         pp.train()
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
         x = self._field(1).requires_grad_(True)
-        out = pp.append_dynamic_features(x)
+        out = pp.assemble_input(x, {ZENITH: self._zenith(1)}, _noise(pp, self.B))
         out.sum().backward()
         self.assertIsNotNone(x.grad)
         self.assertTrue(torch.isfinite(x.grad).all().item())
         # each element of x appears exactly once in the output, so the gradient is 1
         self.assertTrue(torch.all(x.grad == 1.0).item())
 
-    def test_append_dynamic_features_grad_flows_concatenate_noise(self):
+    def test_assemble_input_grad_flows_concatenate_noise(self):
         """Appending with concatenated noise preserves autograd w.r.t. x."""
         self._check_grad_flows(
             _make_pp(add_zenith=True, input_noise={"type": "dummy", "mode": "concatenate", "n_channels": 1})
         )
 
-    def test_append_dynamic_features_grad_flows_perturb_noise(self):
+    def test_assemble_input_grad_flows_perturb_noise(self):
         """Appending with perturbing noise preserves autograd w.r.t. x."""
         self._check_grad_flows(
             _make_pp(add_zenith=True, input_noise={"type": "dummy", "mode": "perturb", "perturb_channels": ["u10m"]})
@@ -917,9 +710,9 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         """history_normalize is differentiable w.r.t. its input (mean mode)."""
         pp = self._make_pp_mean(n_history=1)
         T = pp.n_history + 1
-        pp.history_compute_stats(self._field(T))
+        stats = pp.compute_history_stats(self._field(T))
         x = self._field(T).requires_grad_(True)
-        out = pp.history_normalize(x)
+        out = pp.history_normalize(x, stats)
         out.sum().backward()
         self.assertIsNotNone(x.grad)
         self.assertTrue(torch.isfinite(x.grad).all().item())
@@ -931,35 +724,31 @@ class TestPreprocessor2DBasic(unittest.TestCase):
     # -----------------------------------------------------------------------
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
-    def test_append_dynamic_features_cpu_gpu_match(self, verbose=False):
-        """append_dynamic_features matches on CPU and GPU (no noise)."""
+    def test_assemble_input_cpu_gpu_match(self, verbose=False):
+        """assemble_input matches on CPU and GPU (no noise)."""
         pp_cpu = _make_pp(add_zenith=True)
         pp_gpu = _make_pp(add_zenith=True).to("cuda")
-        x, xz, yz = self._field(1), self._zenith(1), self._zenith(1)
-        pp_cpu.cache_dynamic_features(_dynamic(xz, yz))
-        pp_gpu.cache_dynamic_features(_dynamic(xz.to("cuda"), yz.to("cuda")))
-        out_cpu = pp_cpu.append_dynamic_features(x)
-        out_gpu = pp_gpu.append_dynamic_features(x.to("cuda")).cpu()
+        x, xz = self._field(1), self._zenith(1)
+        out_cpu = pp_cpu.assemble_input(x, {ZENITH: xz})
+        out_gpu = pp_gpu.assemble_input(x.to("cuda"), {ZENITH: xz.to("cuda")}).cpu()
         self.assertTrue(
-            compare_tensors(
-                "append_dynamic_features cpu vs gpu", out_cpu, out_gpu, atol=1e-6, rtol=1e-5, verbose=verbose
-            )
+            compare_tensors("assemble_input cpu vs gpu", out_cpu, out_gpu, atol=1e-6, rtol=1e-5, verbose=verbose)
         )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
-    def test_history_compute_stats_cpu_gpu_match(self, verbose=False):
-        """history_compute_stats produces matching mean/std on CPU and GPU (mean mode)."""
+    def test_compute_history_stats_cpu_gpu_match(self, verbose=False):
+        """compute_history_stats produces matching mean/std on CPU and GPU (mean mode)."""
         pp_cpu = self._make_pp_mean(n_history=1)
         pp_gpu = self._make_pp_mean(n_history=1).to("cuda")
         x = self._field(pp_cpu.n_history + 1)
-        pp_cpu.history_compute_stats(x)
-        pp_gpu.history_compute_stats(x.to("cuda"))
-        for name in ("history_mean", "history_std"):
+        stats_cpu = pp_cpu.compute_history_stats(x)
+        stats_gpu = pp_gpu.compute_history_stats(x.to("cuda"))
+        for name in ("mean", "std"):
             self.assertTrue(
                 compare_tensors(
                     f"{name} cpu vs gpu",
-                    getattr(pp_cpu, name),
-                    getattr(pp_gpu, name).cpu(),
+                    getattr(stats_cpu, name),
+                    getattr(stats_gpu, name).cpu(),
                     atol=1e-5,
                     rtol=1e-5,
                     verbose=verbose,
@@ -972,10 +761,9 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         pp_cpu = self._make_pp_mean(n_history=1)
         pp_gpu = self._make_pp_mean(n_history=1).to("cuda")
         x = self._field(pp_cpu.n_history + 1)
-        pp_cpu.history_compute_stats(x)
-        pp_gpu.history_compute_stats(x.to("cuda"))
-        xn_cpu = pp_cpu.history_normalize(x)
-        xn_gpu = pp_gpu.history_normalize(x.to("cuda")).cpu()
+        xn_cpu = pp_cpu.history_normalize(x, pp_cpu.compute_history_stats(x))
+        xg = x.to("cuda")
+        xn_gpu = pp_gpu.history_normalize(xg, pp_gpu.compute_history_stats(xg)).cpu()
         self.assertTrue(
             compare_tensors("history_normalize cpu vs gpu", xn_cpu, xn_gpu, atol=1e-5, rtol=1e-4, verbose=verbose)
         )
@@ -996,33 +784,27 @@ class TestPreprocessor2DBasic(unittest.TestCase):
             pp.expand_history(x_bad, nhist=pp.n_history + 1)
         self.assertIn("not divisible", str(cm.exception))
 
-    def test_append_dynamic_features_raises_on_feature_batch_mismatch(self):
-        """The input and the cached features must have the same batch size.
+    def test_assemble_input_raises_on_feature_batch_mismatch(self):
+        """The input and the features must have the same batch size.
 
         The check is a torch._check (compile-safe), so it surfaces as RuntimeError.
         """
         pp = _make_pp(add_zenith=True)
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
         with self.assertRaises(RuntimeError) as cm:
-            pp.append_dynamic_features(self._field(1, B=self.B + 1))
+            pp.assemble_input(self._field(1, B=self.B + 1), {ZENITH: self._zenith(1)})
         self.assertIn("different batch size", str(cm.exception))
 
-    def test_append_dynamic_features_raises_on_noise_state_batch_mismatch(self):
-        """The input_noise state and the input must have the same batch size.
+    def test_assemble_input_raises_on_noise_batch_mismatch(self):
+        """The noise sample and the input must have the same batch size.
 
         The check is a torch._check (compile-safe), so it surfaces as RuntimeError.
         """
         pp = _make_pp(add_zenith=True, input_noise={"type": "dummy", "mode": "concatenate", "n_channels": 1})
-        # cache the features at batch B and pass input at batch B so the first check passes;
-        # bump noise state to a different batch to hit the second (noise) check.
-        pp.cache_dynamic_features(_dynamic(self._zenith(1), self._zenith(1)))
-        pp.update_internal_state(replace_state=True, batch_size=self.B + 2)
+        noise = _noise(pp, self.B + 2)
 
         with self.assertRaises(RuntimeError) as cm:
-            pp.append_dynamic_features(self._field(1))
-        msg = str(cm.exception)
-        self.assertIn("batch mismatch", msg)
-        self.assertIn("input_noise state", msg)
+            pp.assemble_input(self._field(1), {ZENITH: self._zenith(1)}, noise)
+        self.assertIn("the noise has batch", str(cm.exception))
 
 
 if __name__ == "__main__":

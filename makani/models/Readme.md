@@ -25,7 +25,7 @@ makani
 │   ├── model_package.py            # model package implementation
 │   ├── model_registry.py           # model registry with get_model routine that takes care of wrapping the model
 │   ├── preprocessor.py             # implementation of preprocessor for dealing with unpredicted channels
-│   ├── steppers.py                 # implements multistep and singlestep wrappers
+│   ├── stepper.py                  # StepWrapper: binds a model to its preprocessor, runs a Rollout
 │   └── Readme.md                   # this file
 ...
 
@@ -38,7 +38,7 @@ The model registry is a central place for organizing models in makani. By defaul
 ```python
 from makani.models import model_registry
 
-model = model_registry.get_model(params, multistep=False)
+model = model_registry.get_model(params)
 ```
 
 where `params` is the parameters object used to instantiate the model. Custom models can be registered in the registry using the `register` method. Models are required to take keyword arguments. These are automatically parsed from the `params` datastructure and passed to the model.

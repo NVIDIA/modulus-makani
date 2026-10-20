@@ -128,8 +128,7 @@ class EnsembleTrainer(Trainer):
 
         # init preprocessor and model
         with Timer() as timer:
-            self.multistep = self.params.n_future > 0
-            self.model = model_registry.get_model(self.params, multistep=self.multistep).to(self.device)
+            self.model = model_registry.get_model(self.params).to(self.device)
             self.preprocessor = self.model.preprocessor
         self.timers["model init"] = timer.time
 
@@ -666,7 +665,6 @@ class EnsembleTrainer(Trainer):
         # start the timer
         valid_start = time.time()
 
-        # create list of states for noised inputs:
         with torch.inference_mode():
             with torch.no_grad():
 

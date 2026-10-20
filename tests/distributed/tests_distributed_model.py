@@ -43,7 +43,7 @@ from .distributed_helpers import (
     sync_and_barrier,
     teardown_comms,
 )
-from ..testutils import disable_tf32, set_seed, compare_tensors
+from ..testutils import disable_tf32, set_seed, compare_tensors, single_step_rollout
 
 
 def _count_distributed_modules(model):
@@ -125,20 +125,20 @@ class TestDistributedModel(unittest.TestCase):
     def _checkpoint_path(self, name):
         return os.path.join(self.tmpdir, f"{name}_{self.id().split('.')[-1]}.pt")
 
-    def _build_serial_reference(self, multistep):
+    def _build_serial_reference(self):
         """Build the serial model and save its checkpoint, on every rank alike."""
         # the checkpoint gathers over the model group when it is distributed, so
         # saving the serial model is serial too, and only rank 0 writes
         checkpoint_path = self._checkpoint_path("serial")
         with comm.serial():
-            model = model_registry.get_model(self.params, multistep=multistep).to(self.device)
+            model = model_registry.get_model(self.params).to(self.device)
             if self.world_rank == 0:
                 driver.Driver.save_checkpoint(checkpoint_path=checkpoint_path, model=model, checkpoint_mode="flexible")
         sync_and_barrier()
         return model, checkpoint_path
 
-    def _build_distributed(self, multistep, checkpoint_path=None, hooks=False):
-        model = model_registry.get_model(self.params, multistep=multistep).to(self.device)
+    def _build_distributed(self, checkpoint_path=None, hooks=False):
+        model = model_registry.get_model(self.params).to(self.device)
         if hooks:
             model = init_gradient_reduction_hooks(
                 model,
@@ -196,11 +196,11 @@ class TestDistributedModel(unittest.TestCase):
         # fix seed
         set_seed(333)
 
-        model, checkpoint_path = self._build_serial_reference(multistep=False)
+        model, checkpoint_path = self._build_serial_reference()
         with comm.serial():
             state_dict_full = checkpoint_helpers.gather_model_state_dict(model, grads=False)
 
-        model_dist = self._build_distributed(multistep=False, checkpoint_path=checkpoint_path)
+        model_dist = self._build_distributed(checkpoint_path=checkpoint_path)
 
         # compare parameters
         state_dict_gather_full = checkpoint_helpers.gather_model_state_dict(model_dist, grads=False)
@@ -225,12 +225,12 @@ class TestDistributedModel(unittest.TestCase):
         self.params.nettype = nettype
 
         with comm.serial():
-            model = model_registry.get_model(self.params, multistep=False)
+            model = model_registry.get_model(self.params)
         self.assertEqual(_count_distributed_modules(model), 0)
 
         # without model parallelism the distributed build is serial as well, and there is nothing to contrast
         if comm.get_size("model") > 1:
-            model_dist = model_registry.get_model(self.params, multistep=False)
+            model_dist = model_registry.get_model(self.params)
             self.assertGreater(_count_distributed_modules(model_dist), 0)
 
     @parameterized.expand(
@@ -253,8 +253,7 @@ class TestDistributedModel(unittest.TestCase):
         # fix seed
         set_seed(333)
 
-        multistep = self.params.n_future > 0
-        model, checkpoint_path = self._build_serial_reference(multistep=multistep)
+        model, checkpoint_path = self._build_serial_reference()
 
         inp_shape = (
             self.params.batch_size,
@@ -268,7 +267,7 @@ class TestDistributedModel(unittest.TestCase):
         inp_full.requires_grad = True
 
         # forward pass and save
-        out_full = model(inp_full.unsqueeze(1)).flatten(1, 2).clone()
+        out_full = model(single_step_rollout(inp_full.unsqueeze(1))).flatten(1, 2).clone()
         loss_full = torch.sum(out_full)
 
         # perform backward pass
@@ -283,12 +282,12 @@ class TestDistributedModel(unittest.TestCase):
         del model
 
         # create model, this times distributed
-        model_dist = self._build_distributed(multistep=multistep, checkpoint_path=checkpoint_path, hooks=True)
+        model_dist = self._build_distributed(checkpoint_path=checkpoint_path, hooks=True)
 
         # split input
         inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
         inp_local.requires_grad = True
-        out_local = model_dist(inp_local.unsqueeze(1)).flatten(1, 2)
+        out_local = model_dist(single_step_rollout(inp_local.unsqueeze(1))).flatten(1, 2)
         loss_dist = reduce_from_parallel_region(torch.sum(out_local), "model")
         loss_dist.backward()
         igrad_local = inp_local.grad.clone()
@@ -378,7 +377,7 @@ class TestDistributedModel(unittest.TestCase):
         set_seed(333)
 
         # create model, this times distributed
-        model_dist = self._build_distributed(multistep=False, hooks=True)
+        model_dist = self._build_distributed(hooks=True)
 
         # get loss object
         self.params.losses = [{"type": "l2", "channel_weights": "constant"}]
@@ -398,7 +397,7 @@ class TestDistributedModel(unittest.TestCase):
 
         # perform a single forward:
         model_dist.zero_grad(set_to_none=True)
-        out_single_local = model_dist(inp_local.unsqueeze(1)).flatten(1, 2)
+        out_single_local = model_dist(single_step_rollout(inp_local.unsqueeze(1))).flatten(1, 2)
         loss = loss_obj(out_single_local, tar_local)
         # backward pass
         loss.backward()
@@ -418,7 +417,7 @@ class TestDistributedModel(unittest.TestCase):
 
         # step 1
         with model_dist.no_sync():
-            out_double_local = model_dist(inp_local_tmp.unsqueeze(1)).flatten(1, 2)
+            out_double_local = model_dist(single_step_rollout(inp_local_tmp.unsqueeze(1))).flatten(1, 2)
             loss = loss_obj(out_double_local, tar_local_tmp) / 2.0
         loss.backward()
 
@@ -427,7 +426,7 @@ class TestDistributedModel(unittest.TestCase):
         tar_local_tmp = tar_local_split[1].detach().clone()
 
         # step 2
-        out = model_dist(inp_local_tmp.unsqueeze(1)).flatten(1, 2)
+        out = model_dist(single_step_rollout(inp_local_tmp.unsqueeze(1))).flatten(1, 2)
         loss = loss_obj(out, tar_local_tmp) / 2.0
         loss.backward()
         out_double_local = torch.cat([out_double_local, out], dim=0)

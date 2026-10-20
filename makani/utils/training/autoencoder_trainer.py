@@ -114,8 +114,7 @@ class AutoencoderTrainer(Driver):
             save_model_package(self.params)
 
         # init preprocessor and model
-        self.multistep = self.params.n_future > 0
-        self.model = model_registry.get_model(self.params, multistep=self.multistep).to(self.device)
+        self.model = model_registry.get_model(self.params).to(self.device)
         self.preprocessor = self.model.preprocessor
 
         # print aux channel names:

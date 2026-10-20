@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Dict, NamedTuple, Optional, Tuple, Union
 
 
@@ -24,7 +25,7 @@ from makani.utils.grids import GridQuadrature, grid_to_quadrature_rule
 from makani.mpu.mappings import copy_to_parallel_region
 
 from makani.models.preprocessor_helpers import get_bias_correction, get_static_features
-from makani.utils.dataloaders.batch import INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES, ZENITH
+from makani.utils.dataloaders.batch import ZENITH
 
 
 @torch.compiler.disable
@@ -45,7 +46,8 @@ class HistoryStats(NamedTuple):
     Normalization statistics of one history window.
 
     ``mean`` and ``std`` are ``(B, 1, C, 1, 1)``, so that they broadcast over the
-    time and grid dimensions; the ``"timediff"`` mode fills ``diff_mean`` and
+    time and grid dimensions, or zeros and ones of shape ``(1, 1, 1, 1, 1)`` in
+    the ``"none"`` mode; the ``"timediff"`` mode fills ``diff_mean`` and
     ``diff_var`` instead.
     """
 
@@ -55,60 +57,108 @@ class HistoryStats(NamedTuple):
     diff_var: Optional[torch.Tensor] = None
 
 
+@dataclass(frozen=True)
+class NoiseState:
+    r"""
+    A snapshot of the input noise, to continue its sequence in another rollout.
+
+    Holds the state tensor of the noise module, detached, and the states of its
+    generators, so that the continued sequence is the one an uninterrupted
+    rollout would have drawn. See
+    :meth:`~makani.utils.dataloaders.rollout.Rollout.noise_state`.
+    """
+
+    tensor: torch.Tensor
+    rng_cpu: Optional[torch.Tensor]
+    rng_gpu: Optional[torch.Tensor]
+
+    @property
+    def batch_size(self) -> int:
+        """The batch the state was taken at."""
+        return self.tensor.shape[0]
+
+
 class _NoiseSource:
     """
     The input noise of a preprocessor, as :class:`~makani.utils.dataloaders.rollout.Rollout` drives it.
 
     Sizes the noise state to the batch of the rollout, with the guard of
     :meth:`Preprocessor2D.update_internal_state` against resizing stateful
-    noise in the middle of a sequence.
+    noise in the middle of a sequence. ``version`` counts the changes of the
+    noise state, so a rollout can tell whether the shared noise module has been
+    advanced by someone else since its last step.
     """
 
     def __init__(self, preprocessor, batch_size=None):
         self.preprocessor = preprocessor
         self.batch_size = batch_size
 
+    @property
+    def version(self) -> int:
+        """Counts the changes of the noise state, by any caller."""
+        return self.preprocessor._noise_version
+
     def update(self, replace_state=False):
+        """Replace the state at the batch of the rollout, or take one autoregressive step."""
         self.preprocessor.update_internal_state(replace_state=replace_state, batch_size=self.batch_size)
 
     def __call__(self):
+        """The noise sample of the current state."""
         # eagerly: the noise is complex-valued and cannot be inductor-compiled, see _run_eager
         return _run_eager(self.preprocessor.input_noise)
+
+    def get_state(self) -> NoiseState:
+        """A detached snapshot of the state and the generators."""
+        pp = self.preprocessor
+        rng_cpu, rng_gpu = pp.get_internal_state(tensor=False)
+        return NoiseState(tensor=pp.get_internal_state(tensor=True), rng_cpu=rng_cpu, rng_gpu=rng_gpu)
+
+    def set_state(self, state: NoiseState):
+        """Restore a snapshot; raises ``ValueError`` if it was taken at another batch than the rollout's."""
+        if (self.batch_size is not None) and (state.batch_size != self.batch_size):
+            raise ValueError(
+                f"The noise state was taken at batch {state.batch_size}, the rollout runs at batch {self.batch_size}"
+            )
+        pp = self.preprocessor
+        pp.set_internal_state(state.tensor)
+        pp.set_internal_state((state.rng_cpu, state.rng_gpu))
 
 
 class Preprocessor2D(nn.Module):
     r"""
-    Input/output plumbing that surrounds the model in a rollout.
+    Input/output plumbing that surrounds the model in one step of a rollout.
 
-    Sits between the dataloader and the network and owns everything that is not
-    the model itself: history handling, dynamic and static features, noise
-    injection, bias correction, and the normalization of the history window.
+    Sits between the data and the network and owns everything that is not the
+    model itself: dynamic and static features, noise injection, bias
+    correction, and the normalization of the history window.
 
     Everything here works on tensors with an explicit time axis,
     ``(B, T, C, H, W)``. The time steps are folded into the channels in exactly
     one place, :meth:`pack_model_input`, right before the network, which still
-    takes a single flat channel stack. Folding and unfolding in between is what
-    the history handling used to get wrong.
+    takes a single flat channel stack.
+
+    The preprocessor keeps no state between steps: the input window, its
+    dynamic features and the noise sample of a step come from a
+    :class:`~makani.utils.dataloaders.rollout.Rollout`, which also slides the
+    window forward, and the history statistics of a step are returned to the
+    caller rather than stored. The one stateful part is the noise module, which
+    the rollout drives through :meth:`noise_source`.
 
     The main responsibilities are:
 
-    * **History.** Inputs carry ``n_history + 1`` time steps;
-      :meth:`append_history` slides the window forward by one step during an
-      autoregressive rollout.
     * **Dynamic features.** Quantities the model consumes but does not
       predict, such as the solar zenith angle. Which ones the model takes is
       fixed by the configuration (:attr:`dynamic_features`); their values come
-      with every batch (:meth:`cache_dynamic_features`) and are appended to the
-      input (:meth:`append_dynamic_features`). They are carried over from the
-      target to the input at each rollout step, since the model cannot generate
-      them itself.
+      with the step and are appended to the input (:meth:`assemble_input`).
     * **Static features.** Time-invariant fields such as orography and the
       land-sea mask, appended to every packed input.
     * **Noise.** Optional stochastic perturbation of the input, either
       concatenated as extra channels or added to selected channels, for
       ensemble forecasting.
+    * **History normalization.** Normalization of the input window with its
+      own statistics (:meth:`compute_history_stats`), undone on the prediction.
     * **Bias correction.** An optional additive correction applied to the
-      model input.
+      model output.
 
     Parameters
     ----------
@@ -116,14 +166,13 @@ class Preprocessor2D(nn.Module):
         Configuration object. Relevant keys include the image shape and
         resampled shape, ``n_history``, ``history_normalization_mode``,
         ``input_noise``, and the static-feature and bias-correction settings.
-
-    See Also
-    --------
-    get_preprocessor : factory that constructs this from a config.
     """
 
     def __init__(self, params):
         super().__init__()
+
+        # counts the changes of the noise state, see _NoiseSource.version
+        self._noise_version = 0
 
         # image shape — must be set first; used by quadrature and noise constructors below
         self.img_shape = [params.img_shape_x, params.img_shape_y]
@@ -157,18 +206,10 @@ class Preprocessor2D(nn.Module):
                 distributed=True,
             )
 
-        self.history_mean = None
-        self.history_std = None
-        self.history_diff_mean = None
-        self.history_diff_var = None
         self.history_eps = 1e-6
 
         # the dynamic features the model takes, in the order their channels are appended
         self.dynamic_features = [ZENITH] if params.get("add_zenith", False) else []
-
-        # their values for the current batch, per mode, so that evaluation does not clobber
-        # an in-flight training step: {mode: {"input" | "target": {name: (B, T, C_f, H, W)}}}
-        self._dynamic_cache = {mode: {"input": {}, "target": {}} for mode in ("train", "eval")}
 
         # get bias correction
         bias = get_bias_correction(params)
@@ -372,113 +413,13 @@ class Preprocessor2D(nn.Module):
 
         return x
 
-    def append_history(self, x, pred, step, update_state=True):
-        r"""
-        Slide the history window forward by one autoregressive step.
-
-        Drops the oldest time step from ``x`` and appends the new prediction
-        ``pred``, producing the input for the next step of the rollout.
-
-        This also advances the cached dynamic features: quantities such as the
-        solar zenith angle are known in advance but not predicted by the model,
-        so the target's value for this step has to move into the input window,
-        or the next step would be conditioned on stale values. Whether the train
-        or eval cache is updated follows the module's training mode.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Current input window, shape ``(B, n_history + 1, C, H, W)``.
-        pred : torch.Tensor
-            Newly predicted step, shape ``(B, 1, C, H, W)``.
-        step : int
-            Index of the current rollout step, which selects the target step of
-            the dynamic features. Steps beyond the cached range leave them
-            untouched.
-        update_state : bool, optional
-            If ``False``, only shift the history and leave the dynamic features
-            as they are. By default ``True``.
-
-        Returns
-        -------
-        torch.Tensor
-            The next input window, same shape as ``x``.
-        """
-        self._check_time_axis(x, "append_history")
-        self._check_time_axis(pred, "append_history")
-
-        if update_state:
-            cache = self._dynamic_cache[self._mode()]
-            for name in self.dynamic_features:
-                target = cache["target"].get(name, None)
-                if (target is None) or (step >= target.shape[1]):
-                    continue
-                window = cache["input"][name]
-                window.copy_(torch.cat([window[:, 1:], target[:, step : step + 1]], dim=1))
-
-        return torch.cat([x[:, 1:], pred], dim=1)
-
-    def append_dynamic_features(self, x):
-        r"""
-        Append the dynamic features of the current batch, and the input noise.
-
-        The channels are appended in a fixed order along the channel axis:
-        ``[x | dynamic features, in the order of dynamic_features | noise]``.
-        In ``perturb`` mode the noise is added to the selected channels instead
-        of appended. Which cache is read follows the module's training mode.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input of shape ``(B, n_history + 1, C, H, W)``.
-
-        Returns
-        -------
-        torch.Tensor
-            Input with the appended channels, ``(B, n_history + 1, C', H, W)``.
-
-        Raises
-        ------
-        RuntimeError
-            If a dynamic feature the model takes was not cached for this batch.
-        """
-        self._check_time_axis(x, "append_dynamic_features")
-
-        cache = self._dynamic_cache[self._mode()]["input"]
-        for name in self.dynamic_features:
-            if name not in cache:
-                raise RuntimeError(
-                    f"append_dynamic_features: the model takes the dynamic feature '{name}', but none is "
-                    f"cached for this batch. Call cache_dynamic_features with the batch first."
-                )
-
-        noise = None
-        if hasattr(self, "input_noise"):
-            # run the noise module eagerly: it is complex-valued (SHT) and cannot be inductor-
-            # compiled; the method-level disable on its forward is not honored through the
-            # nn.Module call, so break at the call site. See _run_eager.
-            noise = _run_eager(self.input_noise)
-            torch._check(
-                noise.shape[0] == x.shape[0],
-                lambda: (
-                    f"append_dynamic_features: batch mismatch between input_noise state "
-                    f"({noise.shape[0]}) and input ({x.shape[0]}). "
-                    f"Did you call update_internal_state(batch_size=...) at a different "
-                    f"batch than the current forward pass?"
-                ),
-            )
-
-        return self.assemble_input(x, cache, noise)
-
     def assemble_input(self, x, dynamic_features: Dict[str, torch.Tensor], noise: Optional[torch.Tensor] = None):
         r"""
-        Append given dynamic features and noise to the input.
+        Append the dynamic features and the noise to the input.
 
-        The stateless counterpart of :meth:`append_dynamic_features`: the
-        features and the noise sample are passed in, as a
-        :class:`~makani.utils.dataloaders.rollout.RolloutStep` carries them,
-        rather than read from the caches and the noise module. The channels are
-        appended in the same fixed order,
+        The features and the noise sample are passed in, as a
+        :class:`~makani.utils.dataloaders.rollout.RolloutStep` carries them.
+        The channels are appended in a fixed order,
         ``[x | dynamic features, in the order of dynamic_features | noise]``;
         in ``perturb`` mode the noise is added to the selected channels instead.
 
@@ -559,13 +500,17 @@ class Preprocessor2D(nn.Module):
         batch_size : int, optional
             The batch of the rollout. The noise state is resized to it when the
             rollout replaces the state at its first step; continuing a sequence
-            at another batch raises, see :meth:`update_internal_state`. ``None``
-            leaves the state at its current size.
+            at another batch raises, see :meth:`update_internal_state`, and so
+            does restoring a :class:`NoiseState` taken at another batch.
+            ``None`` leaves the state at its current size.
 
         Returns
         -------
         object or None
-            ``None`` if no input noise is configured.
+            The source, with ``update(replace_state)``, a call for the sample,
+            ``get_state()`` and ``set_state(state)`` for a :class:`NoiseState`,
+            and the ``version`` of the noise state. ``None`` if no input noise
+            is configured.
         """
         if not hasattr(self, "input_noise"):
             return None
@@ -600,7 +545,7 @@ class Preprocessor2D(nn.Module):
         -------
         HistoryStats
             The statistics, to pass to :meth:`history_normalize` and
-            :meth:`history_denormalize`. Nothing is stored on the module.
+            :meth:`history_denormalize`.
         """
         self._check_time_axis(x, "compute_history_stats")
 
@@ -639,69 +584,23 @@ class Preprocessor2D(nn.Module):
         # copy to parallel region
         return HistoryStats(mean=copy_to_parallel_region(mean, "spatial"), std=copy_to_parallel_region(std, "spatial"))
 
-    def history_compute_stats(self, x):
-        r"""
-        Compute and store the normalization statistics for a history window.
-
-        The stateful counterpart of :meth:`compute_history_stats`: the
-        statistics are stored on the module, where :meth:`history_normalize`
-        and :meth:`history_denormalize` find them when called without
-        ``stats``. Must be called before those, and re-called whenever the batch
-        size changes.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            History window of shape ``(B, n_history + 1, C, H, W)``.
-
-        Returns
-        -------
-        None
-            Results are stored on the module as ``history_mean`` /
-            ``history_std``, of shape ``(B, 1, C, 1, 1)`` so that they broadcast
-            over the time and grid dimensions (or ``history_diff_mean`` /
-            ``history_diff_var`` in ``"timediff"`` mode).
-        """
-        stats = self.compute_history_stats(x)
-
-        if self.history_normalization_mode == "timediff":
-            self.history_diff_mean = stats.diff_mean
-            self.history_diff_var = stats.diff_var
-        else:
-            self.history_mean = stats.mean
-            self.history_std = stats.std
-
-        return
-
-    def _check_history_stats(self, x, caller: str, stats: Optional[HistoryStats] = None):
-        """
-        Controlled-fail validation for history normalization paths.
-
-        - Raises RuntimeError if stats haven't been computed yet (caller forgot
-          history_compute_stats before normalize/denormalize).
-        - Raises ValueError if the input batch doesn't match the stats batch,
-          which in the mean/exponential modes is the only shape dim that isn't a
-          broadcast singleton. Common cause: stats were computed on one batch and
-          normalize/denormalize is being invoked on a differently-sized input
-          without a fresh history_compute_stats call.
-        """
-        mean = self.history_mean if stats is None else stats.mean
-        if mean is None or (self.history_std if stats is None else stats.std) is None:
-            raise RuntimeError(
-                f"{caller}: history_mean / history_std are None. "
-                f"Call history_compute_stats(x) before {caller} (mode='{self.history_normalization_mode}')."
+    def _check_history_stats(self, x, caller: str, stats: HistoryStats):
+        # the batch is the only dimension of the statistics that is not a broadcast singleton
+        if (stats.mean is None) or (stats.std is None):
+            raise ValueError(
+                f"{caller}: the statistics have no mean and std; compute them with compute_history_stats "
+                f"in the same mode ('{self.history_normalization_mode}')"
             )
-        stats_batch = mean.shape[0]
+        stats_batch = stats.mean.shape[0]
         torch._check(
             stats_batch == x.shape[0],
             lambda: (
-                f"{caller}: batch mismatch between input ({x.shape[0]}) and cached "
-                f"history stats ({stats_batch}). Did you forget to call "
-                f"history_compute_stats on the current input before {caller}?"
+                f"{caller}: batch mismatch between input ({x.shape[0]}) and history stats ({stats_batch}). "
+                f"Were they computed on another window?"
             ),
         )
 
-    def history_normalize(self, x, target=False, stats: Optional[HistoryStats] = None):
+    def history_normalize(self, x, stats: HistoryStats, target=False):
         r"""
         Normalize a tensor with the history statistics.
 
@@ -712,24 +611,17 @@ class Preprocessor2D(nn.Module):
         ----------
         x : torch.Tensor
             Tensor of shape ``(B, T, C, H, W)``.
+        stats : HistoryStats
+            The statistics, from :meth:`compute_history_stats`.
         target : bool, optional
             If ``True``, ``x`` holds only the predicted channels, which lead
             the input channels the statistics were computed on, so only those
             statistics are used. By default ``False``.
-        stats : HistoryStats, optional
-            The statistics, from :meth:`compute_history_stats`. By default the
-            ones stored by :meth:`history_compute_stats`.
 
         Returns
         -------
         torch.Tensor
             Normalized tensor with the same shape as ``x``.
-
-        Raises
-        ------
-        RuntimeError
-            If no ``stats`` are given and :meth:`history_compute_stats` has not
-            been called yet.
         """
         if self.history_normalization_mode in ["none", "timediff"]:
             return x
@@ -741,7 +633,7 @@ class Preprocessor2D(nn.Module):
 
         return (x - mean) / std
 
-    def history_denormalize(self, xn, target=False, stats: Optional[HistoryStats] = None):
+    def history_denormalize(self, xn, stats: HistoryStats, target=False):
         r"""
         Undo :meth:`history_normalize`.
 
@@ -751,23 +643,16 @@ class Preprocessor2D(nn.Module):
         ----------
         xn : torch.Tensor
             Normalized tensor of shape ``(B, T, C, H, W)``.
+        stats : HistoryStats
+            The statistics, from :meth:`compute_history_stats`.
         target : bool, optional
             If ``True``, ``xn`` holds only the predicted channels, see
             :meth:`history_normalize`. By default ``False``.
-        stats : HistoryStats, optional
-            The statistics, from :meth:`compute_history_stats`. By default the
-            ones stored by :meth:`history_compute_stats`.
 
         Returns
         -------
         torch.Tensor
             Denormalized tensor with the same shape as ``xn``.
-
-        Raises
-        ------
-        RuntimeError
-            If no ``stats`` are given and :meth:`history_compute_stats` has not
-            been called yet.
         """
         if self.history_normalization_mode in ["none", "timediff"]:
             return xn
@@ -779,81 +664,13 @@ class Preprocessor2D(nn.Module):
 
         return xn * std + mean
 
-    def _history_stats(self, x, target, stats=None):
+    def _history_stats(self, x, target, stats):
         # (B, 1, C, 1, 1), broadcast over time and grid
-        mean, std = (self.history_mean, self.history_std) if stats is None else (stats.mean, stats.std)
+        mean, std = stats.mean, stats.std
         if target:
             num_channels = x.shape[2]
             return mean[:, :, :num_channels], std[:, :, :num_channels]
         return mean, std
-
-    def _mode(self):
-        return "train" if self.training else "eval"
-
-    def cache_dynamic_features(self, batch):
-        r"""
-        Cache the dynamic features of a batch.
-
-        Stores the features the model consumes but does not predict, so that
-        :meth:`append_dynamic_features` and :meth:`append_history` can draw on
-        them during the rollout. Separate train and eval caches are kept,
-        selected by the module's training mode, so that evaluation does not
-        clobber the state of an in-flight training step.
-
-        The batch has to carry exactly the features the model takes,
-        :attr:`dynamic_features`: a missing one would leave the model without
-        an input it was built for, and an extra one would be silently ignored.
-
-        Parameters
-        ----------
-        batch : dict
-            A batch as the loaders emit it, see :mod:`makani.utils.dataloaders.batch`;
-            only the dynamic features are read. Without target features, as in
-            inference, the target cache is cleared.
-
-        Raises
-        ------
-        ValueError
-            If the features of the batch are not the ones the model takes, or
-            a feature has no time axis.
-        """
-        cache = self._dynamic_cache[self._mode()]
-
-        self._store_features(cache["input"], batch.get(INPUT_DYNAMIC_FEATURES, {}), "input")
-
-        target = batch.get(TARGET_DYNAMIC_FEATURES, None)
-        if target is None:
-            cache["target"].clear()
-        else:
-            self._store_features(cache["target"], target, "target")
-
-    def _store_features(self, cache, features, side):
-        expected = set(self.dynamic_features)
-        if set(features) != expected:
-            raise ValueError(
-                f"cache_dynamic_features: the model takes the {side} dynamic features {sorted(expected)}, "
-                f"the batch carries {sorted(features)}"
-            )
-
-        for name, feature in features.items():
-            if feature.dim() != 5:
-                raise ValueError(
-                    f"cache_dynamic_features: {side} feature '{name}' needs a time axis, (B, T, C, H, W), "
-                    f"got shape {tuple(feature.shape)}"
-                )
-            if (side == "input") and (feature.shape[1] != self.n_history + 1):
-                raise ValueError(
-                    f"cache_dynamic_features: input feature '{name}' has {feature.shape[1]} time steps, "
-                    f"the input window n_history + 1 = {self.n_history + 1}"
-                )
-
-            # plain tensors rather than registered buffers: per-step scratch from the dataloader,
-            # which must not end up in the state dict. Reuse the memory when the shape allows.
-            current = cache.get(name, None)
-            if (current is not None) and (current.shape == feature.shape):
-                current.copy_(feature)
-            else:
-                cache[name] = feature.clone()
 
     def get_base_seed(self, default=333):
         r"""
@@ -921,6 +738,7 @@ class Preprocessor2D(nn.Module):
             self.input_noise.set_rng(seed)
             if reset:
                 self.input_noise.reset()
+            self._noise_version += 1
         return
 
     def get_internal_state(self, tensor=False):
@@ -976,6 +794,7 @@ class Preprocessor2D(nn.Module):
                 self.input_noise.set_tensor_state(state)
             else:
                 self.input_noise.set_rng_state(*state)
+            self._noise_version += 1
 
         return
 
@@ -1014,9 +833,10 @@ class Preprocessor2D(nn.Module):
         noise redraw from scratch every step, so for them a resize destroys
         nothing.
 
-        This matches what every caller already does: the ensemble trainer and the
-        inferencer resize only when priming an episode, always with
-        ``replace_state=True``, and then roll forward at a fixed batch.
+        This matches how a :class:`~makani.utils.dataloaders.rollout.Rollout`
+        drives the noise through :meth:`noise_source`: the state is resized only
+        when it is replaced at the first step, and then rolled forward at a
+        fixed batch.
         """
         if hasattr(self, "input_noise"):
             current_batch = self.input_noise.state.shape[0]
@@ -1035,6 +855,7 @@ class Preprocessor2D(nn.Module):
                     f"new batch size, or keep the batch size fixed for the whole rollout."
                 )
             self.input_noise.update(replace_state=replace_state, batch_size=batch_size)
+            self._noise_version += 1
         return
 
     def get_static_features(self):
@@ -1052,36 +873,17 @@ class Preprocessor2D(nn.Module):
         else:
             return None
 
-    def get_dynamic_features(self):
-        r"""
-        Return copies of the cached dynamic features.
-
-        Which cache is read follows the module's training mode.
-
-        Returns
-        -------
-        inp : dict
-            Input features by name, each ``(B, n_history + 1, C_f, H, W)``.
-        tar : dict
-            Target features by name, empty if the batch had no target.
-        """
-        cache = self._dynamic_cache[self._mode()]
-        inp = {name: feature.clone() for name, feature in cache["input"].items()}
-        tar = {name: feature.clone() for name, feature in cache["target"].items()}
-
-        return inp, tar
-
     def stack_dynamic_features(self, features):
         r"""
         Stack dynamic features along the channel axis, in the order the model takes them.
 
         For models that pack their input themselves rather than through
-        :meth:`append_dynamic_features`.
+        :meth:`assemble_input`.
 
         Parameters
         ----------
         features : dict
-            Features by name, as :meth:`get_dynamic_features` returns them.
+            Features by name, as a batch or a rollout step carries them.
 
         Returns
         -------
@@ -1112,24 +914,3 @@ class Preprocessor2D(nn.Module):
         if hasattr(self, "bias_correction"):
             inp = inp - self.bias_correction
         return inp
-
-
-def get_preprocessor(params):
-    r"""
-    Construct the preprocessor for a given configuration.
-
-    Indirection point for callers, so that selecting a different preprocessor
-    implementation stays a change in one place rather than at every call site.
-    Currently always returns :class:`Preprocessor2D`.
-
-    Parameters
-    ----------
-    params : ParamsBase
-        Configuration object, forwarded to the preprocessor.
-
-    Returns
-    -------
-    Preprocessor2D
-        The configured preprocessor.
-    """
-    return Preprocessor2D(params)

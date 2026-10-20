@@ -165,24 +165,24 @@ class BaseNoiseS2(nn.Module):
                 persistent=False,
             )
 
-    def _detach_state(self):
+    def _set_state(self, state):
         """
-        Cut the state loose from the autograd graph before it is overwritten in place.
+        Replace the state by a new tensor, never writing into the current one.
 
-        Learnable stateful noise keeps its state in the graph during a rollout, see
-        :meth:`DiffusionNoiseS2.update`; writing into that tensor in place would corrupt the
-        backward of the steps that used it.
+        The current state may still be in the autograd graph, as for learnable stateful noise
+        during a rollout, see :meth:`DiffusionNoiseS2.update`, or be an inference tensor, if it
+        was written in inference mode, as in validation or inference. Writing into it in place
+        would corrupt the backward of the steps that used it, or fail outside inference mode.
         """
-        if self.state.grad_fn is not None:
-            self._buffers["state"] = self.state.detach().clone()
+        self._buffers["state"] = state
 
     def is_stateful(self):
         r"""
         Whether the noise carries state across calls.
 
         Callers use this to decide whether the noise module must be
-        checkpointed, reset between rollouts, or kept in sync across ensemble
-        members. Must be overridden by subclasses.
+        checkpointed, may be resized mid-sequence, or kept in sync across
+        ensemble members. Must be overridden by subclasses.
 
         Returns
         -------
@@ -236,21 +236,20 @@ class BaseNoiseS2(nn.Module):
         r"""
         Zero the internal state, optionally resizing it.
 
-        Call this between rollouts so a new forecast does not inherit the noise
-        trajectory of the previous one.
+        Not needed between rollouts driven by a
+        :class:`~makani.utils.dataloaders.rollout.Rollout`, which replaces the
+        state at its first step.
 
         Parameters
         ----------
         batch_size : int, optional
             New batch size. If given and different from the current one, the
-            state buffer is reallocated; otherwise the existing buffer is
-            zeroed in place.
+            state is reallocated at that size.
         """
         if batch_size is not None:
             self._ensure_state(batch_size)
-        self._detach_state()
         with torch.no_grad():
-            self.state.zero_()
+            self._set_state(torch.zeros_like(self.state))
 
     def update(self, replace_state=False, batch_size=None):
         r"""
@@ -283,7 +282,7 @@ class BaseNoiseS2(nn.Module):
             if self.reflect:
                 newstate = -newstate
 
-            self.state.copy_(newstate)
+        self._set_state(newstate)
 
         return
 
@@ -366,9 +365,9 @@ class BaseNoiseS2(nn.Module):
         """
         # Validate the state layout (everything beyond the batch dim) matches this
         # noise module's expected suffix BEFORE touching `self.state`. Only the batch
-        # dim may differ — it is auto-resized via `_ensure_state`. Any other
+        # dim may differ, the state takes the batch of the new one. Any other
         # difference raises `ValueError` up-front with a useful message instead of
-        # silently mutating the state into a bad shape and failing at `copy_()`.
+        # silently installing a state of the wrong layout.
         expected_suffix = tuple(self._state_shape_suffix)
         actual_suffix = tuple(newstate.shape[1:]) if newstate.dim() >= 1 else tuple(newstate.shape)
         if actual_suffix != expected_suffix:
@@ -378,11 +377,9 @@ class BaseNoiseS2(nn.Module):
                 f"(full newstate.shape={tuple(newstate.shape)}, "
                 f"current state.shape={tuple(self.state.shape)})."
             )
-        if tuple(newstate.shape) != tuple(self.state.shape):
-            self._ensure_state(newstate.shape[0])
-        self._detach_state()
+        # a copy on the device and in the dtype of the state, so that the caller can keep using its tensor
         with torch.no_grad():
-            self.state.copy_(newstate)
+            self._set_state(newstate.detach().to(device=self.state.device, dtype=self.state.dtype).clone())
         return
 
 
@@ -830,7 +827,8 @@ class DiffusionNoiseS2(BaseNoiseS2):
         -------
         bool
             Always ``True``: each step is correlated with the previous one, so
-            the state must be checkpointed and reset between rollouts.
+            the state must be checkpointed, and replaced or restored at the
+            start of a rollout.
         """
         return True
 
@@ -920,16 +918,11 @@ class DiffusionNoiseS2(BaseNoiseS2):
                     if self.num_time_steps > 1:
                         newstate = torch.einsum("ctr,brclmu->btclmu", self.discount, newstate).contiguous()
 
-        if newstate.requires_grad:
-            # the state is the tensor of the recurrence, not a copy of it, so that the graph reaches phi
-            # and sigma_l. A rollout has to replace the state at its first step: continuing it from a
-            # previous rollout would chain into the graph of that rollout, which is gone after its backward
-            self._buffers["state"] = newstate
-        else:
-            # shape matches self.state after _ensure_state above
-            self._detach_state()
-            with torch.no_grad():
-                self.state.copy_(newstate)
+        # if the noise is learnable, the state is the tensor of the recurrence, so that the graph reaches phi
+        # and sigma_l. A rollout has to replace the state at its first step, or restore a detached snapshot
+        # (Rollout(noise_state=...)): continuing the live state of a previous rollout would chain into the
+        # graph of that rollout, which is gone after its backward
+        self._set_state(newstate)
 
         return
 
@@ -1113,7 +1106,7 @@ class DummyNoiseS2(BaseNoiseS2):
                 else:
                     newstate.normal_(mean=0.0, std=1.0, generator=self.rng_cpu)
 
-            self.state.copy_(newstate)
+        self._set_state(newstate)
 
         return
 
