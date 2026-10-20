@@ -28,6 +28,12 @@ sees, so this module records it, using the code as it was before the change:
 * ``stepper/...``: what ``MultiStepWrapper`` packs for the model in the first
   and second step of a rollout (zenith angle, concatenated noise, static grid
   features), plus the rollout output.
+* ``model_package/...``: the same for the external inference API,
+  ``ModelWrapper`` around a ``SingleStepWrapper``: what the model gets in two
+  consecutive calls, the first replacing the noise state and the second
+  continuing it, and in ``encode_process``, plus the outputs. The inputs are in
+  physical units, so the package's own normalization and its zenith angle,
+  computed from the valid times, are part of it.
 
 Each entry is stored as the legacy tuple, one array per item. The reference
 was recorded while the loaders still returned that tuple; now that they emit
@@ -42,6 +48,7 @@ it only on purpose, when the batch content is meant to change::
 
 import os
 import copy
+import datetime
 import tempfile
 
 import numpy as np
@@ -51,7 +58,8 @@ from torch.utils.data import default_collate
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.batch import to_legacy_tuple, INPUT, TARGET
 from makani.models.noise import DummyNoiseS2
-from makani.models.stepper import MultiStepWrapper
+from makani.models.stepper import MultiStepWrapper, SingleStepWrapper
+from makani.models.model_package import ModelWrapper
 from makani.utils.dataloaders.rollout import Rollout
 
 from .testutils import get_default_parameters, init_hdf5_dataset, H5_PATH
@@ -84,6 +92,9 @@ DUMMY_CASES = [(0, 0, False), (1, 1, True)]
 
 # (n_history, add_zenith); the rollout always has two steps
 STEPPER_CASES = [(n_history, add_zenith) for n_history in (0, 1) for add_zenith in (False, True)]
+
+# (n_history, add_zenith); two calls in a row and one encode_process
+MODEL_PACKAGE_CASES = STEPPER_CASES
 
 
 def case_name(*parts):
@@ -230,6 +241,10 @@ class _Probe(torch.nn.Module):
         self.inputs.append(x.detach().clone())
         return 0.5 * x[:, : self.num_out_channels] + 0.25
 
+    def encode_process(self, x):
+        self.inputs.append(x.detach().clone())
+        return 0.75 * x[:, : self.num_out_channels]
+
 
 def _capture_stepper(paths, result):
     for n_history, add_zenith in STEPPER_CASES:
@@ -264,6 +279,63 @@ def _capture_stepper(paths, result):
         )
 
 
+def _valid_times(n_members, n_steps, shift_hours=0):
+    # one time per member and history step, member-major, as the package takes them
+    base = datetime.datetime(2020, 6, 21, 12, tzinfo=datetime.timezone.utc)
+    return np.array(
+        [
+            base + datetime.timedelta(hours=24 * member + 6 * step + shift_hours)
+            for member in range(n_members)
+            for step in range(n_steps)
+        ]
+    )
+
+
+def _capture_model_package(paths, result):
+    for n_history, add_zenith in MODEL_PACKAGE_CASES:
+        # the calls feed the prediction back as input, which needs matching channels
+        params = _params(paths, n_history, n_future=0, add_zenith=add_zenith, out_channels=IN_CHANNELS)
+        batch = _multifiles_batch(copy.deepcopy(params), "train")
+
+        params.img_shape_x, params.img_shape_y = IMG_SHAPE
+        params.img_shape_x_resampled, params.img_shape_y_resampled = IMG_SHAPE
+        params.add_grid = True
+        params.input_noise = {"type": "dummy", "mode": "concatenate", "n_channels": 1}
+
+        probe = _Probe(len(IN_CHANNELS))
+        stepper = SingleStepWrapper(params, lambda: probe)
+        stepper.preprocessor.input_noise = _PatternNoise(
+            img_shape=list(IMG_SHAPE),
+            batch_size=params.batch_size,
+            num_channels=1,
+            num_time_steps=n_history + 1,
+        )
+        package = ModelWrapper(stepper, params)
+        package.eval()
+
+        # the package takes the history flat in the channels, in physical units
+        x = batch[INPUT].flatten(1, 2)
+        num_members, num_steps = batch[INPUT].shape[:2]
+        num_channels = len(IN_CHANNELS)
+
+        with torch.no_grad():
+            times = _valid_times(num_members, num_steps)
+            out_first = package(x, times, normalized_data=False, replace_state=True)
+
+            # the next call slides the window by the prediction, 6 hours on
+            x = torch.cat([x[:, num_channels:], out_first], dim=1)
+            times = _valid_times(num_members, num_steps, shift_hours=6)
+            out_second = package(x, times, normalized_data=False, replace_state=False)
+
+            latent = package.encode_process(x, times, normalized_data=False, replace_state=False)
+
+        _store(
+            result,
+            f"model_package/{case_name(n_history, add_zenith)}",
+            (*probe.inputs, out_first, out_second, latent),
+        )
+
+
 def compute_reference():
     """Capture every entry of the reference from the code as it is now.
 
@@ -278,5 +350,6 @@ def compute_reference():
         _capture_multifiles(paths, result)
         _capture_dummy(result)
         _capture_stepper(paths, result)
+        _capture_model_package(paths, result)
 
     return result

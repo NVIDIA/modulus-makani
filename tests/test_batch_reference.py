@@ -68,6 +68,9 @@ class TestBatchReference(unittest.TestCase):
     def test_stepper_packing(self):
         self._check_group("stepper")
 
+    def test_model_package_packing(self):
+        self._check_group("model_package")
+
 
 if __name__ == "__main__":
     unittest.main()
