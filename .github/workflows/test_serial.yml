@@ -38,8 +38,9 @@ jobs:
         # All git dependencies are pinned to immutable commit SHAs rather than branches
         # or tags, so that a force-push or a repointed tag upstream cannot change what
         # runs in CI. Bump these deliberately.
-        # torch-harmonics v0.9.3.
-        python -m pip install --no-build-isolation git+https://github.com/NVIDIA/torch-harmonics.git@2028c7768e5ca3ad5a82e1d6bd8c304aa703754f
+        # torch-harmonics v0.9.3 plus the DISCO and zero-width halo fixes for 0.9.4 (branch
+        # tkurth/disco-fixes-0.9.4); move to the v0.9.4 tag once it is cut.
+        python -m pip install --no-build-isolation git+https://github.com/NVIDIA/torch-harmonics.git@0e370d6865c4955cbca9aff9f5a947df7f3cf4f5
         # Freeze whatever torch version TH just compiled against. Strip the
         # local label (+cpu) so the constraint matches any build of that
         # public version.

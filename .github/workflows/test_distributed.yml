@@ -36,9 +36,10 @@ jobs:
         python -m pip install --upgrade pip setuptools wheel
         python -m pip install torch==2.12.1 --extra-index-url https://download.pytorch.org/whl/cpu
         python -m pip install setuptools_scm
-        # torch-harmonics v0.9.3, the same SHA as in tests.yml
+        # torch-harmonics v0.9.3 plus the DISCO and zero-width halo fixes for 0.9.4 (branch
+        # tkurth/disco-fixes-0.9.4), the same SHA as in test_serial.yml
         python -m pip wheel --no-build-isolation --no-deps -w dist \
-          git+https://github.com/NVIDIA/torch-harmonics.git@2028c7768e5ca3ad5a82e1d6bd8c304aa703754f
+          git+https://github.com/NVIDIA/torch-harmonics.git@0e370d6865c4955cbca9aff9f5a947df7f3cf4f5
 
     - uses: actions/upload-artifact@v4
       with:

@@ -81,7 +81,7 @@ RUN pip install --ignore-installed "git+https://github.com/NVIDIA/mlperf-common.
 # physicsnemo (SHA of tag v1.3.0)
 RUN pip install git+https://github.com/NVIDIA/physicsnemo.git@14e0874847ffb56b35abf7708a1665e71605999c
 
-# torch-harmonics (SHA of tag v0.9.3)
+# torch-harmonics: v0.9.3 plus the DISCO and zero-width halo fixes for 0.9.4 (branch tkurth/disco-fixes-0.9.4)
 RUN pip install setuptools_scm
 # torch-harmonics gates the CUDA build on this variable; without it BUILD_CUDA falls back
 # to torch.cuda.is_available(), which is False inside docker build (no GPU on the builder),
@@ -90,7 +90,7 @@ ENV TORCH_HARMONICS_BUILD_CUDA_EXTENSION=1
 ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.7 9.0a 10.0a+PTX"
 RUN cd /opt && git clone https://github.com/NVIDIA/torch-harmonics.git && \
     cd torch-harmonics && \
-    git checkout 2028c7768e5ca3ad5a82e1d6bd8c304aa703754f && \
+    git checkout 0e370d6865c4955cbca9aff9f5a947df7f3cf4f5 && \
     pip install --no-build-isolation -e .
 
 # copy source code
