@@ -34,7 +34,9 @@ from ..test_dataloader import init_dataset_params, get_sample
 from .distributed_helpers import _init_grid, _gather_helper, reduce_success, sync_and_barrier, teardown_comms
 
 
-_have_dali = importlib.util.find_spec("nvidia.dali") is not None
+# find_spec of a submodule imports its parent, and raises rather than return None when the parent
+# itself is missing, as the nvidia namespace package is without any NVIDIA wheels installed
+_have_dali = importlib.util.find_spec("nvidia") is not None and importlib.util.find_spec("nvidia.dali") is not None
 
 
 class _TinyModel(nn.Module):

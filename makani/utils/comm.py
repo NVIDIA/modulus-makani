@@ -16,6 +16,7 @@
 import contextlib
 import math
 
+import torch
 import torch.distributed as dist
 
 # we are using the distributed manager from physicsnemo
@@ -28,6 +29,34 @@ _COMM_ROOTS = {}
 
 # nesting depth of serial(); while positive, the group queries report a single process
 _SERIAL_DEPTH = 0
+
+
+def _initialize_manager():
+    """
+    ``DistributedManager.initialize()``, which also works without CUDA.
+
+    physicsnemo hands its device to ``init_process_group`` as ``device_id``, and on a machine
+    without CUDA that device is the CPU, which torch rejects with a ValueError (physicsnemo
+    only falls back for the TypeError of torch versions before ``device_id`` existed). There
+    the CPU device is dropped on its way in; with CUDA nothing changes.
+    """
+    if torch.cuda.is_available():
+        DistributedManager.initialize()
+        return
+
+    init_process_group = dist.init_process_group
+
+    def init_process_group_without_cpu_device(*args, device_id=None, **kwargs):
+        if (device_id is not None) and (torch.device(device_id).type == "cpu"):
+            device_id = None
+        return init_process_group(*args, device_id=device_id, **kwargs)
+
+    # physicsnemo looks the function up on torch.distributed when it calls it
+    dist.init_process_group = init_process_group_without_cpu_device
+    try:
+        DistributedManager.initialize()
+    finally:
+        dist.init_process_group = init_process_group
 
 
 def _group_queries_active() -> bool:
@@ -204,7 +233,7 @@ def init(
         raise RuntimeError("comm.init() cannot be called inside comm.serial()")
 
     # call basic init first
-    DistributedManager.initialize()
+    _initialize_manager()
 
     # extract manager object
     global _DM

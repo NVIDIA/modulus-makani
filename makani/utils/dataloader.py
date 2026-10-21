@@ -212,7 +212,8 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
 
     else:
         # only this branch needs DALI; the synthetic one above does not
-        if importlib.util.find_spec("nvidia.dali") is None:
+        # find_spec raises rather than return None when the nvidia namespace package itself is missing
+        if importlib.util.find_spec("nvidia") is None or importlib.util.find_spec("nvidia.dali") is None:
             raise ImportError("Setting multifiles to False requires nvidia-dali, but module was not found.")
 
         from makani.utils.dataloaders.dali_dataloader import DaliDataloader
