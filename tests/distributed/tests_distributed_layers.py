@@ -252,12 +252,13 @@ class TestDistributedLayers(unittest.TestCase):
                 )
 
     # the DISCO convolutions of SNO with scale_factor=8 on a 36 x 72 grid: the encoder onto the internal
-    # 4 x 9 grid, the local convolution of the blocks there, whose support covers most of the sphere,
-    # and the convolution of the decoder on the output grid
+    # 4 x 9 grid and the convolution of the decoder on the output grid. The local convolution of the
+    # blocks runs on a 16 x 33 grid instead of 4 x 9: its support would cover most of the sphere there,
+    # so with 4 polar ranks each holding a single latitude, the halo would reach past a neighbour
     @parameterized.expand(
         [
             [36, 72, 4, 9, "equiangular", "legendre-gauss", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
-            [4, 9, 4, 9, "legendre-gauss", "legendre-gauss", (3, 3), math.sqrt(2.0) * math.pi / 3.0, 4, 8, 1e-4],
+            [16, 33, 16, 33, "legendre-gauss", "legendre-gauss", (3, 3), math.sqrt(2.0) * math.pi / 15.0, 4, 8, 1e-4],
             [36, 72, 36, 72, "equiangular", "equiangular", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
         ],
         skip_on_empty=True,
