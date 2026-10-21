@@ -23,7 +23,7 @@ interpolation can have the first without the second. These tests check both
 directly, for both source kinds, rather than just checking the output is
 finite or reasonable-looking.
 
-The distributed operator (``tests/distributed/tests_distributed_remap.py``)
+The distributed operator (``tests/distributed/test_distributed_remap.py``)
 is checked against *this* serial one, not against these properties directly;
 if the distributed and serial outputs agree exactly (as that suite checks),
 whatever holds here holds there too. So this is where a regression in the

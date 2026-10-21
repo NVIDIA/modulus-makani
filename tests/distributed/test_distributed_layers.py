@@ -69,12 +69,14 @@ class TestDistributedLayers(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [180, 360, 256, 512, 32, 8, 1e-3],
-            [181, 360, 181, 360, 1, 10, 1e-3],
-            [180, 360, 128, 256, 32, 8, 1e-4],
-            [181, 360, 91, 180, 1, 10, 1e-4],
-            [128, 256, 256, 512, 32, 8, 1e-4],
-            [91, 180, 181, 360, 1, 10, 1e-4],
+            # even and odd latitudes, the same grid and up- and downsampling, at most 128 longitudes
+            # so that the CPU runners of the CI hold every rank's serial reference
+            [48, 96, 64, 128, 32, 8, 1e-3],
+            [49, 96, 49, 96, 1, 10, 1e-3],
+            [48, 96, 32, 64, 32, 8, 1e-4],
+            [49, 96, 25, 48, 1, 10, 1e-4],
+            [32, 64, 64, 128, 32, 8, 1e-4],
+            [25, 48, 49, 96, 1, 10, 1e-4],
             # the three filters of SFNO with scale_factor=8 on a 36 x 72 grid: truncated modes,
             # mixed grid types and an internal grid too small to split evenly
             [36, 72, 4, 9, 4, 8, 1e-4, "equiangular", "legendre-gauss", 4, 5],
@@ -156,7 +158,11 @@ class TestDistributedLayers(unittest.TestCase):
             spect_conv_dist.module.weight.copy_(weight)
             spect_conv_dist.module.bias.copy_(spect_conv_local.bias)
 
-        # input
+        # every rank draws the same input only from the same generator state: the distributed
+        # weights were initialized on each rank's share of the degrees, which differ in size when
+        # lmax does not split evenly. On the GPU the input comes from the CUDA generator, which the
+        # initialization on the CPU leaves alone, on the CPU both come from the same one
+        set_seed(333)
         inp_full = torch.randn((B, C, Hi, Wi), dtype=torch.float32, device=self.device)
 
         #############################################################
@@ -339,9 +345,13 @@ class TestDistributedLayers(unittest.TestCase):
             )
 
         with self.subTest(desc="weight gradients"):
+            # a weight gradient sums over the whole sphere, which the ranks split differently, so its
+            # rounding error follows the gradient's scale, not the entry: e.g. 1.5e-4 at an entry of
+            # 0.08 next to entries of 43. The absolute tolerance follows the largest entry
+            wgrad_atol = tol * max(1.0, wgrad_full.abs().max().item())
             self.assertTrue(
                 reduce_success(
-                    compare_tensors("weight gradients", wgrad_local, wgrad_full, tol, tol, verbose=verbose),
+                    compare_tensors("weight gradients", wgrad_local, wgrad_full, wgrad_atol, tol, verbose=verbose),
                     self.device,
                 )
             )
@@ -541,6 +551,10 @@ class TestDistributedLayers(unittest.TestCase):
             def layer_dist(x):
                 return spectral_dist(x)[0]
 
+        # the same inputs on every rank, however much of the generator the distributed initialization
+        # used, see test_distributed_spectral_conv
+        set_seed(333)
+
         # B=4 first, so that a failure at B=8 is not mistaken for one of the first call
         for call, batch_size in enumerate([4, 8, 4]):
             inp_full = torch.randn((batch_size, C_in, nlat_in, nlon_in), dtype=torch.float32, device=self.device)
@@ -592,10 +606,10 @@ class TestDistributedLayers(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [256, 512, 32, 8, True, 1e-4],
-            [181, 360, 1, 10, True, 1e-4],
-            [256, 512, 32, 8, False, 1e-4],
-            [181, 360, 1, 10, False, 1e-4],
+            [64, 128, 32, 8, True, 1e-4],
+            [65, 128, 1, 10, True, 1e-4],
+            [64, 128, 32, 8, False, 1e-4],
+            [65, 128, 1, 10, False, 1e-4],
         ],
         skip_on_empty=True,
     )
@@ -741,10 +755,10 @@ class TestDistributedLayers(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [181, 360, 1, 4, "equiangular", True, 1e-4],
-            [181, 360, 1, 4, "equiangular", False, 1e-4],
-            [180, 360, 1, 10, "legendre-gauss", True, 1e-4],
-            [180, 360, 1, 10, "legendre-gauss", False, 1e-4],
+            [65, 128, 1, 4, "equiangular", True, 1e-4],
+            [65, 128, 1, 4, "equiangular", False, 1e-4],
+            [64, 128, 1, 10, "legendre-gauss", True, 1e-4],
+            [64, 128, 1, 10, "legendre-gauss", False, 1e-4],
         ],
         skip_on_empty=True,
     )

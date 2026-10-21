@@ -59,7 +59,9 @@ _TRAINING_KEYS = {INPUT, TARGET, INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES
 _INFERENCE_KEYS = {INPUT, INPUT_DYNAMIC_FEATURES, INPUT_TIMESTAMP}
 
 _multifiles_params = [True]
-_have_dali = importlib.util.find_spec("nvidia.dali") is not None
+# find_spec of a submodule imports its parent, and raises rather than return None when the parent
+# itself is missing, as the nvidia namespace package is without any NVIDIA wheels installed
+_have_dali = importlib.util.find_spec("nvidia") is not None and importlib.util.find_spec("nvidia.dali") is not None
 
 if _have_dali:
     _multifiles_params.append(False)

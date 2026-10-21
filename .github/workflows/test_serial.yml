@@ -1,0 +1,81 @@
+name: Run serial tests
+
+# The serial suite on CPU, everything except the distributed tests, which test_distributed.yml
+# runs on process grids. tests.yml calls it on every push and pull request. It can also be run
+# on demand.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# a new push supersedes the running job
+concurrency:
+  # not github.workflow: when called from tests.yml, that is the caller's name
+  group: serial-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip setuptools wheel
+        # Install torch first, then build torch-harmonics against it. Anything
+        # after this step must respect the torch version that TH was compiled
+        # with, otherwise the prebuilt _C.so will hit ABI-mismatch import errors.
+        python -m pip install torch==2.12.1 --extra-index-url https://download.pytorch.org/whl/cpu
+        python -m pip install setuptools_scm
+        # All git dependencies are pinned to immutable commit SHAs rather than branches
+        # or tags, so that a force-push or a repointed tag upstream cannot change what
+        # runs in CI. Bump these deliberately.
+        # torch-harmonics v0.9.3 plus the DISCO and zero-width halo fixes for 0.9.4 (branch
+        # tkurth/disco-fixes-0.9.4); move to the v0.9.4 tag once it is cut.
+        python -m pip install --no-build-isolation git+https://github.com/NVIDIA/torch-harmonics.git@0e370d6865c4955cbca9aff9f5a947df7f3cf4f5
+        # Freeze whatever torch version TH just compiled against. Strip the
+        # local label (+cpu) so the constraint matches any build of that
+        # public version.
+        TH_TORCH=$(python -c "import torch; print(torch.__version__.split('+')[0])")
+        echo "torch_harmonics was built against torch ${TH_TORCH}"
+        echo "torch==${TH_TORCH}" > "${GITHUB_WORKSPACE}/constraints.txt"
+        cat "${GITHUB_WORKSPACE}/constraints.txt"
+        # Make the constraint visible to later workflow steps so physicsnemo
+        # or any transitive dep can't silently upgrade torch and break TH's _C.so.
+        echo "PIP_CONSTRAINT=${GITHUB_WORKSPACE}/constraints.txt" >> "$GITHUB_ENV"
+        # Pin physicsnemo before installing the package so the `nvidia-physicsnemo>=1.1.1`
+        # dep in pyproject.toml resolves to this build rather than whatever PyPI offers.
+        # This is the SHA of tag v1.3.0.
+        python -m pip install git+https://github.com/NVIDIA/physicsnemo.git@14e0874847ffb56b35abf7708a1665e71605999c
+    - name: Install package
+      run: |
+        python -m pip install -e .[test,vis]
+    - name: Install optional test dependencies
+      run: |
+        # WeatherBench2 is not on PyPI — install from source with --no-deps to
+        # avoid pulling a numpy version that breaks the stack.
+        # Note: NVIDIA DALI has no CPU-only wheel and requires CUDA runtime, so
+        # DALI tests are skipped on this runner (guarded by skipUnless(_have_dali)).
+        # weatherbench2 main as of 2026-08-04. Third-party repo, so the SHA pin matters
+        # more here than for the NVIDIA-owned dependencies above.
+        python -m pip install --no-deps git+https://github.com/google-research/weatherbench2.git@95c36d547b22abc2d191451a580b0b194fde67ef
+    - name: Test with pytest
+      env:
+        # a distinct name, so the coverage job can combine it with the distributed suite's
+        COVERAGE_FILE: .coverage.serial
+      run: |
+        python -m pytest -ra ./tests --ignore=tests/distributed --cov=makani --cov-report=term-missing
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: coverage-serial
+        path: .coverage.serial
+        include-hidden-files: true  # the data file is .coverage.serial

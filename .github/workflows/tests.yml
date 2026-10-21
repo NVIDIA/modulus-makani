@@ -1,60 +1,117 @@
-name: tests
+name: Tests
 
 on:
   push:
   pull_request:
   workflow_dispatch:
 
+# read-only by default; only publish-coverage gets write access, to push the badge data with
+# the workflow's own token
+permissions:
+  contents: read
+
 jobs:
-  build:
+  # The serial suite, on every push and pull request.
+  serial:
+    uses: ./.github/workflows/test_serial.yml
 
+  # The distributed suite: on pull requests, and once per push to main, so the coverage below
+  # covers both suites. Not on plain branch pushes -- up to 16 ranks per grid is heavy.
+  distributed:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/test_distributed.yml
+
+  # Combine the serial and distributed coverage and report it in the job summary -- on a pull
+  # request together with the coverage of the lines it changes -- and prepare the badge.
+  coverage:
+    name: Coverage
+    needs: [serial, distributed]
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v4
+    - uses: actions/checkout@v5
       with:
-        python-version: '3.12'
-    - name: Install dependencies
+        fetch-depth: 0  # diff-cover compares against the base branch
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: coverage-*
+        path: covdata
+        merge-multiple: true
+
+    - name: Combine serial and distributed coverage
       run: |
-        python -m pip install --upgrade pip setuptools wheel
-        # Install torch first, then build torch-harmonics against it. Anything
-        # after this step must respect the torch version that TH was compiled
-        # with, otherwise the prebuilt _C.so will hit ABI-mismatch import errors.
-        python -m pip install torch==2.9.1 --extra-index-url https://download.pytorch.org/whl/cpu
-        python -m pip install setuptools_scm
-        # All git dependencies are pinned to immutable commit SHAs rather than branches
-        # or tags, so that a force-push or a repointed tag upstream cannot change what
-        # runs in CI. Bump these deliberately.
-        # torch-harmonics v0.9.3.
-        python -m pip install --no-build-isolation git+https://github.com/NVIDIA/torch-harmonics.git@2028c7768e5ca3ad5a82e1d6bd8c304aa703754f
-        # Freeze whatever torch version TH just compiled against. Strip the
-        # local label (+cpu) so the constraint matches any build of that
-        # public version.
-        TH_TORCH=$(python -c "import torch; print(torch.__version__.split('+')[0])")
-        echo "torch_harmonics was built against torch ${TH_TORCH}"
-        echo "torch==${TH_TORCH}" > "${GITHUB_WORKSPACE}/constraints.txt"
-        cat "${GITHUB_WORKSPACE}/constraints.txt"
-        # Make the constraint visible to later workflow steps so physicsnemo
-        # or any transitive dep can't silently upgrade torch and break TH's _C.so.
-        echo "PIP_CONSTRAINT=${GITHUB_WORKSPACE}/constraints.txt" >> "$GITHUB_ENV"
-        # Pin physicsnemo before installing the package so the `nvidia-physicsnemo>=1.1.1`
-        # dep in pyproject.toml resolves to this build rather than whatever PyPI offers.
-        # This is the SHA of tag v1.3.0.
-        python -m pip install git+https://github.com/NVIDIA/physicsnemo.git@14e0874847ffb56b35abf7708a1665e71605999c
-    - name: Install package
+        python -m pip install coverage diff-cover
+        # the [tool.coverage] settings in pyproject.toml apply here as in the test jobs
+        python -m coverage combine covdata
+        # to a file first, so an error shows in the log instead of vanishing into the summary
+        python -m coverage report --format=markdown > coverage.md
+        python -m coverage json -o coverage.json
+        python -m coverage xml -o coverage.xml
+        COV=$(python -c "import json; print(json.load(open('coverage.json'))['totals']['percent_covered_display'])")
+        echo "Total coverage (serial + distributed): ${COV}%"
+        { echo "## Coverage: ${COV}%"; echo; echo "<details><summary>Per file</summary>"; echo; cat coverage.md; echo; echo "</details>"; } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Coverage of the changed lines
+      if: github.event_name == 'pull_request'
+      env:
+        BASE_REF: ${{ github.base_ref }}
       run: |
-        python -m pip install -e .[test,vis]
-    - name: Install optional test dependencies
+        diff-cover coverage.xml --compare-branch="origin/${BASE_REF}" --markdown-report diff-cover.md
+        { echo "## Coverage of the lines this pull request changes"; echo; cat diff-cover.md; } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Write the badge
+      if: github.event_name == 'push'
       run: |
-        # WeatherBench2 is not on PyPI — install from source with --no-deps to
-        # avoid pulling a numpy version that breaks the stack.
-        # Note: NVIDIA DALI has no CPU-only wheel and requires CUDA runtime, so
-        # DALI tests are skipped on this runner (guarded by skipUnless(_have_dali)).
-        # weatherbench2 main as of 2026-08-04. Third-party repo, so the SHA pin matters
-        # more here than for the NVIDIA-owned dependencies above.
-        python -m pip install --no-deps git+https://github.com/google-research/weatherbench2.git@95c36d547b22abc2d191451a580b0b194fde67ef
-    - name: Test with pytest
+        mkdir -p badge
+        python - <<'PY'
+        import json
+        cov = json.load(open("coverage.json"))["totals"]["percent_covered"]
+        color = "brightgreen" if cov >= 90 else "green" if cov >= 75 else "yellow" if cov >= 60 else "red"
+        # a shields.io endpoint badge, see https://shields.io/badges/endpoint-badge
+        json.dump({"schemaVersion": 1, "label": "coverage", "message": f"{cov:.0f}%", "color": color}, open("badge/badge.json", "w"))
+        PY
+        { echo "# Coverage of makani"; echo; echo "Serial and distributed test suites combined, at $GITHUB_SHA."; echo "Written by the coverage job of tests.yml; do not edit."; echo; cat coverage.md; } > badge/README.md
+
+    - uses: actions/upload-artifact@v4
+      if: github.event_name == 'push'
+      with:
+        name: badge
+        path: badge/
+
+  # Publish the badge on main: force-push it, as a single commit without history, to the
+  # coverage-data branch, which the README badge reads. Uses only the workflow's own token,
+  # in a job that runs no code from the repository.
+  publish-coverage:
+    name: Publish coverage badge
+    needs: coverage
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # push the coverage-data branch
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: badge
+        path: badge
+
+    - name: Push to the coverage-data branch
+      working-directory: badge
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
-        python -m pytest -ra ./tests --cov=makani --cov-report=term-missing
+        git init -q -b coverage-data
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add badge.json README.md
+        git commit -q -m "Coverage at ${GITHUB_SHA}"
+        # the token goes in a header for this one command only, never into .git/config
+        auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+        git -c http.extraheader="AUTHORIZATION: basic ${auth}" \
+          push --force "https://github.com/${GITHUB_REPOSITORY}.git" coverage-data

@@ -1,9 +1,9 @@
 # Changelog
 
-## 0.3.0
+## 0.3.0rc1
 
 **Breaking**
-- Python >= 3.11, torch >= 2.9.1, torch-harmonics >= 0.9.0, PhysicsNeMo >= 1.3.0 (1.x and 2.x), DALI 2.x (`nvidia-dali-cuda120`), zarr >= 3. Dropped numba, pynvml, progressbar2, jsbeautifier. New `test`, `data_process`, `legacy_data_process` extras.
+- Python >= 3.11, torch >= 2.12.1, torch-harmonics >= 0.9.0, PhysicsNeMo >= 1.3.0 (1.x and 2.x), DALI 2.x (`nvidia-dali-cuda120`), zarr >= 3. Dropped numba, pynvml, progressbar2, jsbeautifier. New `test`, `data_process`, `legacy_data_process` extras.
 - Dataloaders emit dict batches (`input`, `target`, `*_dynamic_features`, `*_timestamp`; `(B, T, C, *grid)`). Timestamps are always present, and `return_timestamp` is gone.
 - `Rollout` owns the multistep loop, and `StepWrapper` replaces `SingleStepWrapper`/`MultiStepWrapper`. The preprocessor is stateless between steps. `multistep` in `get_model`/`load_model_package` has no effect and warns, and `get_model` no longer accepts other extra arguments. `continue_noise` is replaced by `Rollout(noise_state=...)`.
 - DALI dataloader state format 2 (timestamps are pipeline outputs, on the GPU): a dataloader state saved before is refused on resume, or skipped with `strict_restore: False`.

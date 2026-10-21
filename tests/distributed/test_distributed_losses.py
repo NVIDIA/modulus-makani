@@ -130,15 +130,15 @@ class TestDistributedLoss(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [128, 256, 32, 8, "naive", False, 1e-6],
-            [128, 256, 32, 8, "naive", True, 1e-6],
-            [129, 256, 32, 8, "naive", True, 1e-6],
-            [129, 256, 32, 8, "clenshaw-curtiss", False, 1e-6],
-            [129, 256, 32, 8, "clenshaw-curtiss", True, 1e-6],
-            [129, 256, 32, 8, "legendre-gauss", False, 1e-6],
-            [129, 256, 32, 8, "legendre-gauss", True, 1e-6],
-            [129, 256, 32, 8, "weatherbench2", False, 1e-6],
-            [129, 256, 32, 8, "weatherbench2", True, 1e-6],
+            [64, 128, 32, 8, "naive", False, 1e-6],
+            [64, 128, 32, 8, "naive", True, 1e-6],
+            [65, 128, 32, 8, "naive", True, 1e-6],
+            [65, 128, 32, 8, "clenshaw-curtiss", False, 1e-6],
+            [65, 128, 32, 8, "clenshaw-curtiss", True, 1e-6],
+            [65, 128, 32, 8, "legendre-gauss", False, 1e-6],
+            [65, 128, 32, 8, "legendre-gauss", True, 1e-6],
+            [65, 128, 32, 8, "weatherbench2", False, 1e-6],
+            [65, 128, 32, 8, "weatherbench2", True, 1e-6],
         ],
         skip_on_empty=True,
     )
@@ -196,16 +196,16 @@ class TestDistributedLoss(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [128, 256, 32, 8, 4, "cdf", 1e-5],
-            [129, 256, 1, 10, 4, "cdf", 1e-5],
-            [128, 256, 32, 8, 4, "cdf", 1e-5],
-            [129, 256, 1, 10, 4, "cdf", 1e-5],
-            [128, 256, 32, 8, 4, "skillspread", 1e-5],
-            [129, 256, 1, 10, 4, "skillspread", 1e-5],
-            [128, 256, 32, 8, 4, "gauss", 1e-5],
-            [129, 256, 1, 10, 4, "gauss", 1e-5],
-            [128, 256, 32, 8, 4, "nll", 1e-5],
-            [129, 256, 1, 10, 4, "nll", 1e-5],
+            [64, 128, 32, 8, 4, "cdf", 1e-5],
+            [65, 128, 1, 10, 4, "cdf", 1e-5],
+            [64, 128, 32, 8, 4, "cdf", 1e-5],
+            [65, 128, 1, 10, 4, "cdf", 1e-5],
+            [64, 128, 32, 8, 4, "skillspread", 1e-5],
+            [65, 128, 1, 10, 4, "skillspread", 1e-5],
+            [64, 128, 32, 8, 4, "gauss", 1e-5],
+            [65, 128, 1, 10, 4, "gauss", 1e-5],
+            [64, 128, 32, 8, 4, "nll", 1e-5],
+            [65, 128, 1, 10, 4, "nll", 1e-5],
         ],
         skip_on_empty=True,
     )
@@ -349,12 +349,12 @@ class TestDistributedLoss(unittest.TestCase):
             # SpectralCRPSLoss enforces (absolute=False) ⇒ (crps_type == "skillspread")
             # because cdf requires sorting and sorting complex spectral coefficients
             # only makes sense after abs(). So "cdf" rows must have absolute=True.
-            [128, 256, 32, 8, 4, "cdf", True, 1e-4],
-            [129, 256, 1, 10, 4, "cdf", True, 1e-4],
-            [128, 256, 32, 8, 4, "skillspread", False, 1e-4],
-            [129, 256, 1, 10, 4, "skillspread", False, 1e-4],
-            [128, 256, 32, 8, 4, "skillspread", True, 1e-4],
-            [129, 256, 1, 10, 4, "skillspread", True, 5e-4],
+            [64, 128, 32, 8, 4, "cdf", True, 1e-4],
+            [65, 128, 1, 10, 4, "cdf", True, 1e-4],
+            [64, 128, 32, 8, 4, "skillspread", False, 1e-4],
+            [65, 128, 1, 10, 4, "skillspread", False, 1e-4],
+            [64, 128, 32, 8, 4, "skillspread", True, 1e-4],
+            [65, 128, 1, 10, 4, "skillspread", True, 5e-4],
         ],
         skip_on_empty=True,
     )
@@ -470,8 +470,8 @@ class TestDistributedLoss(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [128, 256, 8, 3, 4, 1e-4],
-            [129, 256, 2, 5, 4, 1e-4],
+            [64, 128, 8, 3, 4, 1e-4],
+            [65, 128, 2, 5, 4, 1e-4],
         ],
         skip_on_empty=True,
     )
@@ -582,8 +582,8 @@ class TestDistributedLoss(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [128, 256, 8, 13, 4, 1e-4],
-            [129, 256, 2, 12, 4, 1e-4],
+            [64, 128, 8, 13, 4, 1e-4],
+            [65, 128, 2, 12, 4, 1e-4],
         ],
         skip_on_empty=True,
     )
@@ -690,8 +690,8 @@ class TestDistributedLoss(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [128, 256, 8, 13, 4, 1.0, 1.0, 1.0, 1.0, 1e-5],
-            [129, 256, 2, 12, 4, 0.8, 1.2, 0.5, 0.7, 1e-5],
+            [64, 128, 8, 13, 4, 1.0, 1.0, 1.0, 1.0, 1e-5],
+            [65, 128, 2, 12, 4, 0.8, 1.2, 0.5, 0.7, 1e-5],
         ],
         skip_on_empty=True,
     )
@@ -805,9 +805,9 @@ class TestDistributedLoss(unittest.TestCase):
     @parameterized.expand(
         [
             # nlat, nlon, batch, chans, ens, lmin, ens_coh_weight, tol
-            [128, 256, 8, 13, 4, 0, 0.0, 1e-4],
-            [129, 256, 2, 12, 4, 16, 0.0, 1e-4],
-            [129, 256, 2, 12, 4, 16, 0.5, 1e-4],
+            [64, 128, 8, 13, 4, 0, 0.0, 1e-4],
+            [65, 128, 2, 12, 4, 16, 0.0, 1e-4],
+            [65, 128, 2, 12, 4, 16, 0.5, 1e-4],
         ],
         skip_on_empty=True,
     )
@@ -930,8 +930,8 @@ class TestDistributedLoss(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [128, 256, 8, 13, 4, False, 1e-4],
-            [129, 256, 2, 12, 4, True, 1e-4],
+            [64, 128, 8, 13, 4, False, 1e-4],
+            [65, 128, 2, 12, 4, True, 1e-4],
         ],
         skip_on_empty=True,
     )

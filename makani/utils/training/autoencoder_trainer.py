@@ -42,7 +42,7 @@ from makani.utils import comm
 from makani.utils.precision import AutocastManager
 
 from makani.mpu.mappings import init_gradient_reduction_hooks
-from makani.mpu.helpers import sync_params, gather_uneven
+from makani.mpu.helpers import sync_params, gather_uneven, barrier
 
 # for counting model parameters
 from makani.models.helpers import count_parameters
@@ -129,7 +129,7 @@ class AutoencoderTrainer(Driver):
 
         # add a barrier here, just to make sure
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         # define process group for DDP, we might need to override that
         if dist.is_initialized() and not self.params.disable_ddp:
@@ -249,7 +249,7 @@ class AutoencoderTrainer(Driver):
 
         # wait till everybody is ready
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         # counting runs a reduction so we need to count on all ranks before printing on rank 0
         pcount, _, _ = count_parameters(self.model, self.device)
@@ -286,7 +286,7 @@ class AutoencoderTrainer(Driver):
 
         # perform a barrier here to make sure everybody is ready
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         try:
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -397,7 +397,7 @@ class AutoencoderTrainer(Driver):
 
             # wait for everybody
             if dist.is_initialized():
-                dist.barrier(device_ids=[self.device.index])
+                barrier(self.device)
 
             # end timer
             epoch_end = time.time()
@@ -597,7 +597,7 @@ class AutoencoderTrainer(Driver):
 
         # global sync is in order
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         # finalize timers
         train_end = time.perf_counter_ns()
@@ -615,7 +615,7 @@ class AutoencoderTrainer(Driver):
 
         # synchronize
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         # initialize metrics buffers
         self.metrics.zero_buffers()
@@ -702,7 +702,7 @@ class AutoencoderTrainer(Driver):
 
         # global sync is in order
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         # timer
         valid_time = time.time() - valid_start

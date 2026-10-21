@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools", "setuptools-scm"]
+# setuptools 77 reads the SPDX license expression and license-files of PEP 639
+requires = ["setuptools>=77", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -39,20 +40,21 @@ maintainers = [
 description = "Massively parallel training of machine-learning based weather and climate models"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE.txt", "makani/third_party/climt/LICENSE"]
 
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
 
 dynamic = ["version"]
 
 dependencies = [
-    "torch>=2.9.1",
+    "torch>=2.12.1",
     "numpy>=1.22.4",
     "h5py>=3.11.0",
     # Both 1.x and 2.x are supported; the API differences between them are
@@ -178,6 +180,9 @@ ignore = ["E711", "E712", "E722", "E741", "F841"]
 
 
 [tool.coverage.run]
+# record paths relative to the checkout, so the data files of the serial and the distributed
+# jobs, from different runners, combine in the coverage job of tests.yml
+relative_files = true
 omit = [
     "makani/ensemble.py",
     "makani/inference.py",

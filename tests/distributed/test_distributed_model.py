@@ -116,6 +116,19 @@ class TestDistributedModel(unittest.TestCase):
         # consistently — see set_image_shape for the rationale.
         set_image_shape(self.params, h=36, w=72)
 
+        # SNO and FCN3 process on a grid coarsened by scale_factor, where their local DISCO
+        # convolutions exchange latitude halos between polar ranks. The default of 8 leaves 4
+        # latitudes, a single one per rank at h=4; FCN3's halo is 4 rows on any grid, so its
+        # shards need at least 4 latitudes each, which 18 latitudes give at h=4
+        self.params.scale_factor = 2
+
+        # FCN3 encodes the variables of each pressure level and the surface variables with separate
+        # DISCO convolutions, whose channels are split across the azimuth ranks: 4 of each for w=4
+        channel_names = ["u10m", "v10m", "t2m", "msl", "u500", "v500", "z500", "t500"]
+        self.params.channel_names = channel_names
+        self.params.in_channels = self.params.out_channels = list(range(len(channel_names)))
+        self.params.N_in_channels = self.params.N_out_channels = len(channel_names)
+
         # also set the batch size for testing
         self.params.batch_size = 4
 
@@ -441,9 +454,20 @@ class TestDistributedModel(unittest.TestCase):
         with self.subTest(desc="output"):
             out_single_gather = self._gather_helper(out_single_local, hdim=-2, wdim=-1)
             out_double_gather = self._gather_helper(out_double_local, hdim=-2, wdim=-1)
+            # a batch of 8 and two of 4 take differently blocked kernels, which round differently:
+            # up to a few float32 ulps of the outputs, e.g. 6e-6 at 1.6, more than the 1e-6 the
+            # gradients are held to
+            out_tol = 1e-5
             self.assertTrue(
                 reduce_success(
-                    compare_tensors("output", out_double_gather, out_single_gather, atol, rtol, verbose=verbose),
+                    compare_tensors(
+                        "output",
+                        out_double_gather,
+                        out_single_gather,
+                        _scaled_atol(out_single_gather, out_tol),
+                        out_tol,
+                        verbose=verbose,
+                    ),
                     self.device,
                 )
             )

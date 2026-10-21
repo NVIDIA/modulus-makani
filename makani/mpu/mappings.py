@@ -452,8 +452,9 @@ def init_gradient_reduction_hooks(
         print("Setting up DDP communication hooks")
     model = DistributedDataParallel(
         model,
-        device_ids=[device],
-        output_device=device,
+        # DDP takes no device for a model on the CPU
+        device_ids=[device] if device.type == "cuda" else None,
+        output_device=device if device.type == "cuda" else None,
         bucket_cap_mb=reduction_size_mb,
         broadcast_buffers=broadcast_buffers,
         find_unused_parameters=find_unused_parameters,
@@ -487,7 +488,7 @@ def init_gradient_reduction_hooks(
             if reduction == "sum":
                 dist.all_reduce(coalesced, op=dist.ReduceOp.SUM, group=comm.get_group(group), async_op=False)
             elif reduction == "mean":
-                dist.all_reduce(coalesced, op=dist.ReduceOp.AVG, group=comm.get_group(group), async_op=False)
+                all_reduce_mean(coalesced, comm.get_group(group))
             else:
                 raise NotImplementedError(f"Error, reduction {reduction} not supported.")
 
@@ -540,3 +541,4 @@ def init_gradient_reduction_hooks(
 # deferred to avoid circular imports with makani.utils
 from makani.utils import comm
 from makani.models.helpers import count_parameters
+from makani.mpu.helpers import all_reduce_mean

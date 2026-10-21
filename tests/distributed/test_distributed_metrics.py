@@ -40,6 +40,7 @@ from .distributed_helpers import (
     set_image_shape,
     reduce_success,
     sync_and_barrier,
+    teardown_comms,
 )
 from ..testutils import disable_tf32, set_seed, compare_arrays
 
@@ -50,24 +51,33 @@ _metric_handler_params = [
 ]
 
 
+def _launcher_ranks():
+    """World and local rank from the launcher's environment, looked up in the order physicsnemo initializes from it."""
+    for rank_key, local_key in (
+        ("RANK", "LOCAL_RANK"),
+        ("SLURM_PROCID", "SLURM_LOCALID"),
+        ("OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_LOCAL_RANK"),
+    ):
+        if rank_key in os.environ:
+            rank = int(os.environ[rank_key])
+            return rank, int(os.environ.get(local_key, rank))
+    return 0, 0
+
+
 class TestDistributedMetricHandler(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls, path="/tmp"):
-        from mpi4py import MPI
-
-        cls.mpi_comm = MPI.COMM_WORLD.Dup()
-        cls.mpi_comm_rank = cls.mpi_comm.Get_rank()
-        cls.mpi_comm_size = cls.mpi_comm.Get_size()
+        # the serial reference runs before the comms are set up, so the ranks come from the launcher
+        rank, local_rank = _launcher_ranks()
 
         if torch.cuda.is_available():
-            if cls.mpi_comm_rank == 0:
+            if rank == 0:
                 print("Running test on GPU")
-            local_rank = cls.mpi_comm_rank % torch.cuda.device_count()
-            cls.device = torch.device(f"cuda:{local_rank}")
+            cls.device = torch.device(f"cuda:{local_rank % torch.cuda.device_count()}")
             torch.cuda.set_device(cls.device)
         else:
-            if cls.mpi_comm_rank == 0:
+            if rank == 0:
                 print("Running test on CPU")
             cls.device = torch.device("cpu")
         set_seed(333)
@@ -81,12 +91,8 @@ class TestDistributedMetricHandler(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        sync_and_barrier()
+        teardown_comms()
         cls.tmpdir.cleanup()
-        # Free the duplicated communicator. mpi_comm is an mpi4py Intracomm
-        # (returned by MPI.COMM_WORLD.Dup()), whose disposal API is Free(),
-        # not the previously-used (and non-existent) finalize().
-        cls.mpi_comm.Free()
 
     def _init_comms(self):
 
@@ -235,9 +241,6 @@ class TestDistributedMetricHandler(unittest.TestCase):
         # finalize
         logs_local = metric_handler_local.finalize()
 
-        # wait for everybody
-        self.mpi_comm.Barrier()
-
         # init comms
         self._init_comms()
 
@@ -349,7 +352,7 @@ class TestDistributedMetricHandler(unittest.TestCase):
             file_dist.close()
 
         # wait for everything to finish
-        self.mpi_comm.Barrier()
+        sync_and_barrier()
 
 
 if __name__ == "__main__":

@@ -34,7 +34,9 @@ from ..test_dataloader import init_dataset_params, get_sample
 from .distributed_helpers import _init_grid, _gather_helper, reduce_success, sync_and_barrier, teardown_comms
 
 
-_have_dali = importlib.util.find_spec("nvidia.dali") is not None
+# find_spec of a submodule imports its parent, and raises rather than return None when the parent
+# itself is missing, as the nvidia namespace package is without any NVIDIA wheels installed
+_have_dali = importlib.util.find_spec("nvidia") is not None and importlib.util.find_spec("nvidia.dali") is not None
 
 
 class _TinyModel(nn.Module):
@@ -66,10 +68,10 @@ class TestDistributedDataloaderCheckpoint(unittest.TestCase):
     Run with e.g.::
 
         # pure data parallel (B = 4)
-        mpirun -n 4 pytest tests/distributed/tests_distributed_dataloader_checkpoint.py
+        mpirun -n 4 pytest tests/distributed/test_distributed_dataloader_checkpoint.py
 
         # ensemble x batch data parallelism on top of a 2x2 spatial grid
-        GRID_H=2 GRID_W=2 GRID_E=2 mpirun -n 16 pytest tests/distributed/tests_distributed_dataloader_checkpoint.py
+        GRID_H=2 GRID_W=2 GRID_E=2 mpirun -n 16 pytest tests/distributed/test_distributed_dataloader_checkpoint.py
 
     With world_size=1 the tests still exercise the gather/scatter path, but the
     per-rank distinctness they are really after only shows up with B > 1.

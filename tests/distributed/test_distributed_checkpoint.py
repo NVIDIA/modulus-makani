@@ -89,12 +89,12 @@ class TestDistributedCheckpoint(unittest.TestCase):
     Run with e.g.::
 
         # pure spatial model parallel (H x W)
-        GRID_H=2 GRID_W=2 mpirun -n 4 pytest tests/distributed/tests_distributed_checkpoint.py
+        GRID_H=2 GRID_W=2 mpirun -n 4 pytest tests/distributed/test_distributed_checkpoint.py
 
         # spatial + ensemble + batch: model=H*W*M=4, data=E*B; with -n 16 and
         # GRID_E=2 the remaining factor (16/4/2 = 2) auto-fills the batch group,
         # so this exercises H x W x E x B = 2 x 2 x 2 x 2.
-        GRID_H=2 GRID_W=2 GRID_E=2 mpirun -n 16 pytest tests/distributed/tests_distributed_checkpoint.py
+        GRID_H=2 GRID_W=2 GRID_E=2 mpirun -n 16 pytest tests/distributed/test_distributed_checkpoint.py
 
     The flexible save gathers sharded params over the *model* group only and
     replicates the result across the data-parallel (ensemble/batch) groups, so
