@@ -601,7 +601,7 @@ class TestDistributedLayers(unittest.TestCase):
         ],
         skip_on_empty=True,
     )
-    def test_distributed_instance_norm_2d(self, nlat, nlon, batch_size, num_chan, affine, tol, verbose=False):
+    def test_distributed_instance_norm_2d(self, nlat, nlon, batch_size, num_chan, affine, tol, verbose=True):
         B, C, H, W = batch_size, num_chan, nlat, nlon
 
         set_seed(333)
