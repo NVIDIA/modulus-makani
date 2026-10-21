@@ -105,14 +105,21 @@ jobs:
         # device count. Each file gets a fresh set of ranks, so a failure in one cannot poison the
         # next, and the timeout turns a hang -- the way a rank-divergent collective fails -- into a
         # red mark instead of a stuck job.
+        #
+        # Every rank of every file writes its own coverage data file; the coverage job in
+        # tests.yml combines them across ranks and grids, and with the serial suite's.
         nranks=$((GRID_H * GRID_W * GRID_E))
+        grid="${GRID_H}x${GRID_W}x${GRID_E}"
         status=0
+        mkdir -p covdata
         for f in tests/distributed/tests_distributed_*.py; do
           echo "::group::$f"
+          name=$(basename "$f" .py)
           pids=()
           for r in $(seq 0 $((nranks - 1))); do
             RANK=$r WORLD_RANK=$r LOCAL_RANK=$r WORLD_SIZE=$nranks \
-              timeout 900 python -m pytest -s -ra -q "$f" > "rank$r.log" 2>&1 &
+              COVERAGE_FILE="$PWD/covdata/.coverage.$grid.$name.rank$r" \
+              timeout 900 python -m pytest -s -ra -q --cov=makani --cov-report= "$f" > "rank$r.log" 2>&1 &
             pids+=($!)
           done
           for i in "${!pids[@]}"; do
@@ -126,3 +133,10 @@ jobs:
           echo "::endgroup::"
         done
         exit $status
+
+    - uses: actions/upload-artifact@v4
+      if: ${{ !cancelled() }}
+      with:
+        name: coverage-distributed-${{ matrix.grid_h }}x${{ matrix.grid_w }}x${{ matrix.grid_e }}
+        path: covdata/
+        include-hidden-files: true  # the data files are .coverage.*

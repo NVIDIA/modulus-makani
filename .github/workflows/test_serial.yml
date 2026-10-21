@@ -66,5 +66,14 @@ jobs:
         # more here than for the NVIDIA-owned dependencies above.
         python -m pip install --no-deps git+https://github.com/google-research/weatherbench2.git@95c36d547b22abc2d191451a580b0b194fde67ef
     - name: Test with pytest
+      env:
+        # a distinct name, so the coverage job can combine it with the distributed suite's
+        COVERAGE_FILE: .coverage.serial
       run: |
         python -m pytest -ra ./tests --cov=makani --cov-report=term-missing
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: coverage-serial
+        path: .coverage.serial
+        include-hidden-files: true  # the data file is .coverage.serial

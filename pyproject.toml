@@ -178,6 +178,9 @@ ignore = ["E711", "E712", "E722", "E741", "F841"]
 
 
 [tool.coverage.run]
+# record paths relative to the checkout, so the data files of the serial and the distributed
+# jobs, from different runners, combine in the coverage job of tests.yml
+relative_files = true
 omit = [
     "makani/ensemble.py",
     "makani/inference.py",
