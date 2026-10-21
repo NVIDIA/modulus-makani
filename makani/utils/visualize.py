@@ -275,7 +275,8 @@ def visualize_field(
     indices it is applied to, after ``prediction`` and ``target`` have been
     unscaled with ``scale`` and ``bias``. Returns ``(tag, image)``.
     """
-    torch.cuda.nvtx.range_push("visualize_field")
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push("visualize_field")
 
     # look the op up in the registry; unknown ops are an error, never code to run
     channels = _check_plot_item({"op": op, "channels": channels})
@@ -304,7 +305,8 @@ def visualize_field(
     if progress is not None:
         image = _draw_progress_bar(image, progress)
 
-    torch.cuda.nvtx.range_pop()
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_pop()
 
     return tag, image
 
@@ -404,7 +406,8 @@ class VisualizationWrapper(object):
         return
 
     def finalize(self):
-        torch.cuda.nvtx.range_push("VisualizationWrapper:finalize")
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_push("VisualizationWrapper:finalize")
 
         results = {}
         for request in cf.as_completed(self.requests):
@@ -442,6 +445,7 @@ class VisualizationWrapper(object):
         # reset requests
         self.reset()
 
-        torch.cuda.nvtx.range_pop()
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_pop()
 
         return
