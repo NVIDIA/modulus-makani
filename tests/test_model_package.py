@@ -589,6 +589,8 @@ class TestLoadModelPackage(_ModelPackageTestBase):
         self.assertIsInstance(time_loop, Inference)
         self.assertEqual(list(time_loop.channel_names), self.params.data_channel_names)
         self.assertEqual(time_loop.n_history, self.params.n_history)
+        # the model step is dt data steps of dhours each
+        self.assertEqual(time_loop.time_step, dt.timedelta(hours=self.params.dt * self.params.dhours))
 
     @unittest.skipUnless(_have_earth2mip, "earth2mip is not installed")
     def test_load_time_loop_rejects_unequal_channels(self):

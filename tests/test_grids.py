@@ -428,6 +428,21 @@ class TestBandLimitMask(unittest.TestCase):
         expected = torch.where(keep.reshape(1, 1, nlat, 1), wave, torch.zeros_like(wave))
         self.assertTrue(compare_tensors(f"m={m}", mask(wave), expected, atol=1e-5, verbose=verbose))
 
+    @parameterized.expand([("sht", "legendre-gauss"), ("sht", "equiangular"), ("fft", "equiangular")])
+    def test_default_lmax_is_the_grid_bandlimit(self, mask_type, grid_type, verbose=False):
+        # without lmax, the transforms and the mask have to use the grid's band limit
+        from makani.utils.grids import compute_spherical_bandlimit
+
+        img_shape = (17, 32) if grid_type == "equiangular" else (16, 32)
+        field = torch.randn(2, 3, *img_shape)
+
+        default = BandLimitMask(img_shape, grid_type, type=mask_type)
+        explicit = BandLimitMask(
+            img_shape, grid_type, lmax=compute_spherical_bandlimit(img_shape, grid_type), type=mask_type
+        )
+        self.assertEqual(default.lmax, explicit.lmax)
+        self.assertTrue(compare_tensors("default lmax", default(field), explicit(field), verbose=verbose))
+
     def test_unknown_type_raises(self):
         with self.assertRaises(ValueError):
             BandLimitMask((16, 32), "equiangular", lmax=8, type="wavelet")

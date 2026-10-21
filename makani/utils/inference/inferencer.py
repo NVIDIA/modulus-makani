@@ -444,7 +444,7 @@ class Inferencer(Driver):
             # set bias to none since we only pass the differences
             bias_buffer = TemporalAverageBuffer(
                 num_rollout_steps=rollout_steps,
-                rollout_dt=self.params.dt,
+                rollout_dt=self.params.dt * dhours,
                 img_shape=img_shape,
                 local_shape=local_shape,
                 local_offset=local_offset,
@@ -464,7 +464,7 @@ class Inferencer(Driver):
             spectrum_channels = output_channels if output_channels else self.params.channel_names
             spectrum_buffer = SpectrumAverageBuffer(
                 num_rollout_steps=rollout_steps,
-                rollout_dt=self.params.dt,
+                rollout_dt=self.params.dt * dhours,
                 img_shape=img_shape,
                 ensemble_size=self.params.local_ensemble_size,
                 grid_type=self.params.model_grid_type,
@@ -484,7 +484,7 @@ class Inferencer(Driver):
             zonal_spectrum_channels = output_channels if output_channels else self.params.channel_names
             zonal_spectrum_buffer = ZonalSpectrumAverageBuffer(
                 num_rollout_steps=rollout_steps,
-                rollout_dt=self.params.dt,
+                rollout_dt=self.params.dt * dhours,
                 img_shape=img_shape,
                 ensemble_size=self.params.local_ensemble_size,
                 channel_names=self.params.channel_names,
@@ -548,7 +548,8 @@ class Inferencer(Driver):
         self._set_eval()
 
         # clear cache
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # initialize metrics buffers
         if metrics is not None:
@@ -848,10 +849,8 @@ class Inferencer(Driver):
         if dist.is_initialized():
             barrier(self.device)
 
-        try:
+        if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
-        except ValueError:
-            pass
 
         # parse string dates (if supplied) into datetimes; helper expects datetimes
         if start_date is not None:

@@ -45,8 +45,6 @@ _REQUIRED_KEYS = [
 
 # optimizers and schedulers Driver.get_optimizer and Driver.get_scheduler know, and the keys each scheduler reads
 _OPTIMIZERS = ["Adam", "AdamW", "SGD", "SIRFShampoo"]
-# configs that still name an optimizer the driver no longer knows; remove an entry once the config is updated
-_KNOWN_STALE_OPTIMIZERS = {"icml_models.yaml": "FusedAdam"}
 _SCHEDULER_KEYS = {
     None: [],
     "ReduceLROnPlateau": ["scheduler_factor", "scheduler_patience"],
@@ -97,8 +95,7 @@ class TestConfigs(unittest.TestCase):
                     if self.registered_models and ":" not in params.nettype:
                         self.assertIn(params.nettype, self.registered_models, f"{name} has an unknown nettype")
 
-                    if _KNOWN_STALE_OPTIMIZERS.get(os.path.basename(path)) != params.optimizer_type:
-                        self.assertIn(params.optimizer_type, _OPTIMIZERS, f"{name} has an unknown optimizer")
+                    self.assertIn(params.optimizer_type, _OPTIMIZERS, f"{name} has an unknown optimizer")
 
                     self.assertIn(params.scheduler, _SCHEDULER_KEYS, f"{name} has an unknown scheduler")
                     missing = [key for key in _SCHEDULER_KEYS[params.scheduler] if key not in params]

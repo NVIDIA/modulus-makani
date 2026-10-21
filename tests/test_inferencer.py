@@ -341,9 +341,14 @@ class TestInferencerScoring(_InferencerTestCase):
         sht = th.RealSHT(*raw.shape[-2:], grid=inferencer.params.model_grid_type)
         with h5.File(paths["spectrum"], "r") as hf:
             spectrum_mean, spectrum_std = hf["mean"][...], hf["std"][...]
+            spectrum_lead_times = hf["lead_time"][...]
         with h5.File(paths["zonal_spectrum"], "r") as hf:
             zonal_mean, zonal_std = hf["mean"][...], hf["std"][...]
+            zonal_lead_times = hf["lead_time"][...]
             lat = hf["lat"][...]
+        # every output file gives the lead times in hours, like the rollout file
+        self.assertTrue(np.allclose(spectrum_lead_times, rollout_lead_times[1:]), "spectrum lead times")
+        self.assertTrue(np.allclose(zonal_lead_times, rollout_lead_times[1:]), "zonal spectrum lead times")
         self.assertEqual(spectrum_mean.shape, (rollout_steps, len(channels), ensemble_size + 1, sht.lmax))
         nlat, nlon = raw.shape[-2:]
         self.assertEqual(zonal_mean.shape, (rollout_steps, len(channels), ensemble_size + 1, nlat, nlon // 2 + 1))
@@ -373,9 +378,13 @@ class TestInferencerScoring(_InferencerTestCase):
 
         with h5.File(paths["output"], "r") as hf:
             fields = hf["fields"][...]
+            rollout_lead_times = hf["lead_time"][...]
         with h5.File(paths["bias"], "r") as hf:
             bias_mean = hf["mean"][...]
+            bias_lead_times = hf["lead_time"][...]
         self.assertEqual(bias_mean.shape, (rollout_steps, raw.shape[1], *raw.shape[-2:]))
+        # lead times in hours, like the rollout file
+        self.assertTrue(np.allclose(bias_lead_times, rollout_lead_times[1:]), "bias lead times")
 
         # the mean error over the initial conditions per lead time, from the rollout file and the raw data
         for k in range(rollout_steps):

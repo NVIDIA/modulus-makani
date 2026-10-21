@@ -1970,17 +1970,18 @@ class TestCRPSLossExtended(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             fn(fc, obs)
 
-    # ------ gauss + ensemble_weights → NameError (line 292, known bug) ------
+    # ------ gauss + ensemble_weights ------
 
-    def test_gauss_with_ensemble_weights_raises_nameerror(self):
-        """Known bug: gauss branch references undefined `idx` when ensemble_weights is set."""
+    def test_gauss_with_ensemble_weights(self, verbose=False):
+        """A member of weight 2 counts like that member twice in the gaussian fit."""
         E = self._E
         ew = torch.ones(E)
-        fn = self._fn("gauss", ensemble_weights=ew)
+        ew[0] = 2.0
         fc = torch.randn(_BATCH, E, _NUM_CH, _IMG_H, _IMG_W)
         obs = torch.randn(_BATCH, _NUM_CH, _IMG_H, _IMG_W)
-        with self.assertRaises(NameError):
-            fn(fc, obs)
+        out = self._fn("gauss", ensemble_weights=ew)(fc, obs)
+        expected = self._fn("gauss")(torch.cat([fc[:, :1], fc], dim=1), obs)
+        self.assertTrue(compare_tensors("weighted gauss", out, expected, atol=1e-5, verbose=verbose))
 
     # ------ unknown crps_type raises ValueError (line 299) ------
 
@@ -4245,6 +4246,28 @@ class TestTransformedCRPSVariants(unittest.TestCase):
         out_none = fn(fc, obs)
         out_ones = fn(fc, obs, spatial_weights=torch.ones_like(obs))
         self.assertTrue(compare_tensors(f"{crps_type} weights", out_ones, out_none, atol=1e-6, verbose=verbose))
+
+    @parameterized.expand([(GradientCRPSLoss,), (VortDivCRPSLoss,)])
+    def test_gauss_with_ensemble_weights(self, cls, verbose=False):
+        # a member of weight 2 counts like that member twice in the gaussian fit
+        ew = torch.ones(self._E)
+        ew[0] = 2.0
+        nch = self._channels(cls)
+        fc = _rand_ensemble(self._E, channels=nch)
+        obs = _rand(channels=nch)
+        out = self._fn(cls, "gauss", ensemble_weights=ew)(fc, obs)
+        expected = self._fn(cls, "gauss")(torch.cat([fc[:, :1], fc], dim=1), obs)
+        self.assertTrue(compare_tensors("weighted gauss", out, expected, atol=1e-5, verbose=verbose))
+
+    def test_gradient_component_channel_weights(self):
+        # without absolute, every channel contributes two gradient components with half its weight each
+        fn = self._fn(GradientCRPSLoss, "skillspread", absolute=False)
+        chw = fn.compute_channel_weighting("constant")
+        base = self._fn(GradientCRPSLoss, "skillspread").compute_channel_weighting("constant")
+        self.assertIsInstance(chw, torch.Tensor)
+        self.assertEqual(chw.numel(), fn.n_channels)
+        self.assertTrue(torch.allclose(chw.reshape(-1, 2), (base / 2.0).unsqueeze(-1).expand(-1, 2)))
+        self.assertAlmostEqual(chw.sum().item(), 1.0, places=6)
 
     @parameterized.expand([(GradientCRPSLoss,), (VortDivCRPSLoss,)])
     def test_skillspread_rejects_ensemble_weights(self, cls):

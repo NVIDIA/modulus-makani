@@ -210,15 +210,19 @@ class BandLimitMask(torch.nn.Module):
                     polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
                     azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
                     thd.init(polar_group, azimuth_group)
-                self.forward_transform = DistributedRealSHT(*img_shape, lmax=lmax, mmax=lmax, grid=grid_type).float()
+                self.forward_transform = DistributedRealSHT(
+                    *img_shape, lmax=self.lmax, mmax=self.lmax, grid=grid_type
+                ).float()
                 self.inverse_transform = DistributedInverseRealSHT(
-                    *img_shape, lmax=lmax, mmax=lmax, grid=grid_type
+                    *img_shape, lmax=self.lmax, mmax=self.lmax, grid=grid_type
                 ).float()
             else:
                 from torch_harmonics import RealSHT, InverseRealSHT
 
-                self.forward_transform = RealSHT(*img_shape, lmax=lmax, mmax=lmax, grid=grid_type).float()
-                self.inverse_transform = InverseRealSHT(*img_shape, lmax=lmax, mmax=lmax, grid=grid_type).float()
+                self.forward_transform = RealSHT(*img_shape, lmax=self.lmax, mmax=self.lmax, grid=grid_type).float()
+                self.inverse_transform = InverseRealSHT(
+                    *img_shape, lmax=self.lmax, mmax=self.lmax, grid=grid_type
+                ).float()
 
         elif self.type == "fft":
 
@@ -236,13 +240,15 @@ class BandLimitMask(torch.nn.Module):
             if comm.get_size("spatial") > 1:
                 from makani.mpu.fft import DistributedRealFFT1, DistributedInverseRealFFT1
 
-                self.forward_transform = DistributedRealFFT1(img_shape[1], lmax=lmax, mmax=lmax).float()
-                self.inverse_transform = DistributedInverseRealFFT1(img_shape[1], lmax=lmax, mmax=lmax).float()
+                self.forward_transform = DistributedRealFFT1(img_shape[1], lmax=self.lmax, mmax=self.lmax).float()
+                self.inverse_transform = DistributedInverseRealFFT1(
+                    img_shape[1], lmax=self.lmax, mmax=self.lmax
+                ).float()
             else:
                 from makani.models.common.fft import RealFFT1, InverseRealFFT1
 
-                self.forward_transform = RealFFT1(img_shape[1], lmax=lmax, mmax=lmax).float()
-                self.inverse_transform = InverseRealFFT1(img_shape[1], lmax=lmax, mmax=lmax).float()
+                self.forward_transform = RealFFT1(img_shape[1], lmax=self.lmax, mmax=self.lmax).float()
+                self.inverse_transform = InverseRealFFT1(img_shape[1], lmax=self.lmax, mmax=self.lmax).float()
         else:
             raise ValueError(f"Unknown truncation type {self.type}")
 

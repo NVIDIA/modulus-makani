@@ -167,7 +167,8 @@ if __name__ == "__main__":
     params["local_ensemble_size"] = params["ensemble_size"] // comm.get_size("ensemble")
 
     # set device
-    torch.cuda.set_device(comm.get_local_rank())
+    if torch.cuda.is_available():
+        torch.cuda.set_device(comm.get_local_rank())
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

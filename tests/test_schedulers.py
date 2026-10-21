@@ -130,7 +130,23 @@ class TestGetScheduler(unittest.TestCase):
             self.assertAlmostEqual(lr, expected)
 
     def test_no_scheduler(self):
-        self.assertIsNone(self.driver.get_scheduler(self.optimizer, _params("none")))
+        # None is what YParams makes of "None" in the yaml files
+        for name in [None, "None", "none"]:
+            with self.subTest(scheduler=name):
+                self.assertIsNone(self.driver.get_scheduler(self.optimizer, _params(name)))
+
+    def test_warmup_without_scheduler(self):
+        params = _params(None, lr_warmup_steps=2, lr_start=0.1)
+        scheduler = self.driver.get_scheduler(self.optimizer, params)
+        self.assertIsInstance(scheduler, lr_scheduler.LinearLR)
+        # linear from lr_start * lr to lr over the warmup steps, then constant
+        for lr, expected in zip(self._lrs(scheduler, 4), [0.1, 0.55, 1.0, 1.0, 1.0]):
+            self.assertAlmostEqual(lr, expected)
+
+    def test_unknown_scheduler_raises(self):
+        # a typo must not silently train without a scheduler
+        with self.assertRaises(ValueError):
+            self.driver.get_scheduler(self.optimizer, _params("CosineAnealingLR"))
 
 
 if __name__ == "__main__":

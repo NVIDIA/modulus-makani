@@ -20,6 +20,7 @@ import warnings
 from parameterized import parameterized, parameterized_class
 
 import torch
+import torch.nn as nn
 
 from makani.models import model_registry
 from makani.utils import checkpoint_helpers
@@ -397,6 +398,31 @@ class TestPanguShiftWindowMask(unittest.TestCase):
         self._check_common(mask)
         self.assertTrue((mask[0, 0] == 0).all())
         self.assertTrue((mask == -100.0).any())
+
+    def test_shifted_block_rolls_back(self):
+        # with the attention, the norms and the MLP made trivial, a shifted block returns its input plus the
+        # attention output; the roll back after the attention has to put every token back where it came from
+        from makani.models.networks.pangu import Transformer3DBlock
+
+        class _IdentityAttention(nn.Module):
+            def forward(self, x, mask=None):
+                return x
+
+        class _Zero(nn.Module):
+            def forward(self, x):
+                return torch.zeros_like(x)
+
+        resolution = (2, 12, 24)
+        block = Transformer3DBlock(
+            dim=4, input_resolution=resolution, num_heads=1, window_size=(2, 6, 12), shift_size=(1, 3, 6)
+        )
+        self.assertTrue(block.roll)
+        block.norm1 = nn.Identity()
+        block.attn = _IdentityAttention()
+        block.mlp = _Zero()
+
+        x = torch.randn(2, resolution[0] * resolution[1] * resolution[2], 4)
+        self.assertTrue(torch.equal(block(x), 2 * x))
 
 
 if __name__ == "__main__":

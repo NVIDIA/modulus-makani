@@ -1079,6 +1079,21 @@ class TemporalAverageBuffer(MeanStdBuffer):
         return
 
 
+def _real_order_weights(nlon: int, m_offset: int, m_local: int) -> torch.Tensor:
+    r"""
+    Weights of the orders ``m_offset, ..., m_offset + m_local - 1`` in the power spectrum of a real field
+    on ``nlon`` equidistant longitudes. An order m > 0 stands for itself and its conjugate -m, so it
+    counts twice. The orders 0 and, for an even ``nlon``, the Nyquist order nlon/2 are their own
+    conjugates and count once; otherwise the spectrum does not sum to the field's energy.
+    """
+    ms = torch.arange(m_offset, m_offset + m_local)
+    weights = torch.full((m_local,), 2.0)
+    weights[ms == 0] = 1.0
+    if nlon % 2 == 0:
+        weights[ms == nlon // 2] = 1.0
+    return weights
+
+
 class SpectrumAverageBuffer(MeanStdBuffer):
     r"""
     SpectrumAverageBuffer class handles the recording of spatial data during inference. Performs Welford reduction on the fly during inference
@@ -1132,11 +1147,18 @@ class SpectrumAverageBuffer(MeanStdBuffer):
             # compute loffset
             offsets = [0] + np.cumsum(self.sht.l_shapes).tolist()
             self.lmax_offset = offsets[comm.get_rank("h")]
+            # the orders are split over w
+            self.mmax_local = self.sht.m_shapes[comm.get_rank("w")]
+            self.mmax_offset = sum(self.sht.m_shapes[: comm.get_rank("w")])
+            self.reduce_orders = comm.get_size("w") > 1
         else:
             self.sht = th.RealSHT(*img_shape, grid=grid_type)
             self.lmax = self.sht.lmax
             self.lmax_local = self.lmax
             self.lmax_offset = 0
+            self.mmax_local = self.sht.mmax
+            self.mmax_offset = 0
+            self.reduce_orders = False
 
         # determine parameter size
         self.ensemble_size = ensemble_size
@@ -1160,6 +1182,9 @@ class SpectrumAverageBuffer(MeanStdBuffer):
         # move sht to device
         self.sht = self.sht.to(self.device)
 
+        # weights of the local orders in the power spectrum
+        self.m_weights = _real_order_weights(img_shape[1], self.mmax_offset, self.mmax_local).to(self.device)
+
         # reshape bias and scale
         self.bias = self.bias.reshape(1, 1, -1, 1, 1)
         self.scale = self.scale.reshape(1, 1, -1, 1, 1)
@@ -1179,20 +1204,15 @@ class SpectrumAverageBuffer(MeanStdBuffer):
             with amp.autocast(device_type=datap.device.type, enabled=False):
                 sdatap = self.sht(datap.to(torch.float32))
 
-                # compute power spectrum:
-                sdatap = torch.square(torch.abs(sdatap))
+                # compute power spectrum, with every order weighted by its multiplicity
+                sdatap = self.m_weights * torch.square(torch.abs(sdatap))
 
-                # be w-distributed aware:
-                if comm.get_rank("w") == 0:
-                    sdatap[..., 1:] *= 2.0
-                else:
-                    sdatap[...] *= 2.0
-
-                # local sum over w
+                # local sum over the orders
                 spect = torch.sum(sdatap, dim=-1)
 
-                # do distributed sum over w
-                spect = reduce_from_parallel_region(spect, "w")
+                # sum over the orders held by the other w ranks
+                if self.reduce_orders:
+                    spect = reduce_from_parallel_region(spect, "w")
 
             # convert back precision
             spect = spect.to(dtype=dtype)
@@ -1411,6 +1431,9 @@ class ZonalSpectrumAverageBuffer(MeanStdBuffer):
         # reshape:
         self.lat_weights = torch.reshape(self.lat_weights, (1, 1, 1, -1, 1))
 
+        # weights of the local orders in the power spectrum
+        self.m_weights = _real_order_weights(img_shape[1], self.mmax_offset, self.mmax_local).to(self.device)
+
     def update(self, data, targ, idt):
         """update local buffers"""
 
@@ -1426,14 +1449,8 @@ class ZonalSpectrumAverageBuffer(MeanStdBuffer):
             with amp.autocast(device_type=datap.device.type, enabled=False):
                 sdatap = self.rfft(datap.to(torch.float32), norm="forward")
 
-                # compute power spectrum:
-                spect = self.lat_weights * torch.square(torch.abs(sdatap))
-
-                # be w-distributed aware:
-                if comm.get_rank("w") == 0:
-                    spect[..., 1:] *= 2.0
-                else:
-                    spect[...] *= 2.0
+                # compute power spectrum, with every order weighted by its multiplicity
+                spect = self.lat_weights * self.m_weights * torch.square(torch.abs(sdatap))
 
             # convert back precision
             spect = spect.to(dtype=dtype)
