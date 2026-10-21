@@ -1310,11 +1310,13 @@ class TestInferenceLookup(unittest.TestCase):
                     dataset.get_sample_at_time(time)
 
     def test_length_leaves_room_for_the_window(self):
-        # the last samples cannot start a full window: history, and the target steps if there are any
+        # the last samples cannot start a full window: the history and the future steps, and the
+        # first target step only with targets. Without targets the future steps are still held back,
+        # in both datasets alike, so the inferencer sees the same initial conditions in either
         for return_target in [True, False]:
             with self.subTest(return_target=return_target):
                 dataset = self._make(return_target=return_target)
-                n_steps = self._N_HISTORY + (self._N_FUTURE + 1 if return_target else 0)
+                n_steps = self._N_HISTORY + self._N_FUTURE + (1 if return_target else 0)
                 self.assertEqual(len(dataset), dataset.n_samples_total - self._DT * n_steps)
 
     def test_a_sample_looked_up_by_time_starts_at_that_time(self):
@@ -1659,6 +1661,8 @@ class TestLoaderParity(unittest.TestCase):
         params.enable_synthetic_data = loader == "dummy"
         params.img_shape_x = IMG_SIZE_H
         params.img_shape_y = IMG_SIZE_W
+        # without files to count, the dummy loader needs its number of samples
+        params.n_train_samples = params.n_eval_samples = 16
         params.num_train = self.num_train
         params.num_valid = self.num_valid
         params.io_grid = [1, 1, 1]

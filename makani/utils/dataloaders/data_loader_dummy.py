@@ -179,7 +179,7 @@ class DummyLoader(object):
 
         # perform a sanity check here
         if (self.n_samples_per_epoch == 0) or (self.n_samples_per_epoch is None):
-            raise RuntimeError("You have noit specified a valid number of samples per epoch.")
+            raise RuntimeError("You have not specified a valid number of samples per epoch.")
 
         # determine local read size:
         # sanitize the crops first
