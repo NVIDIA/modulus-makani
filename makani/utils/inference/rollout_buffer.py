@@ -853,7 +853,6 @@ class MeanStdBuffer(DataBuffer):
         )
 
         # rollout buffer on CPU has dimensions num_rollout_steps x num_channels x nlat x nlon
-        pin_memory = self.device.type == "cuda"
         local_buffer_size = (self.num_rollout_steps, self.num_channels, *variable_shape)
         self.running_mean = torch.zeros(local_buffer_size, dtype=torch.float32, device=self.device)
         self.running_var = torch.zeros(local_buffer_size, dtype=torch.float32, device=self.device)

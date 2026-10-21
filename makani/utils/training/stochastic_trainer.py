@@ -198,21 +198,7 @@ class StochasticTrainer(Driver):
                 static_graph=False,
             )
 
-        # lets get one sample from the dataloader:
-        # set to train just to be safe
-        self._set_train()
-        # get sample and map to gpu
-        iterator = iter(self.train_dataloader)
-        data = next(iterator)
-        batch = batch_to_device(data, self.device)
-        # the interpolant takes the time steps folded into the channels
-        inp = self.preprocessor.flatten_history(batch[INPUT])
-        tar = self.preprocessor.flatten_history(batch[TARGET])
-        # get shapes
-        inp_shape = inp.shape
-        tar_shape = tar.shape
-
-        self._compile_model(inp_shape)
+        self._compile_model()
 
         # visualization wrapper: only world-rank 0 renders/logs; other ranks get None.
         out_bias, out_scale = self.train_dataloader.get_output_normalization()
@@ -288,7 +274,7 @@ class StochasticTrainer(Driver):
             self.logger.info("Number of trainable model parameters: {}".format(pcount))
 
     # jit stuff
-    def _compile_model(self, inp_shape):
+    def _compile_model(self):
 
         if self.params.jit_mode == "inductor":
             self.model = torch.compile(self.model)
@@ -707,7 +693,7 @@ class StochasticTrainer(Driver):
                             pred_gather = self.metrics._gather_input(pred_gather)
                             targ_gather = self.metrics._gather_input(targ_gather)
 
-                            self._visualize_step(pred_gather, targ_gather, eval_steps, idt)
+                            self._visualize_step(pred_gather, targ_gather, eval_steps, idt, rollout.n_steps)
 
                         # log the loss
                         progress_bar.set_postfix({"loss": loss.item()})

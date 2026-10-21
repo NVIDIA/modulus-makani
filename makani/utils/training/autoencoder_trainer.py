@@ -182,21 +182,7 @@ class AutoencoderTrainer(Driver):
                 static_graph=False,
             )
 
-        # lets get one sample from the dataloader:
-        # set to train just to be safe
-        self._set_train()
-        # get sample and map to gpu
-        iterator = iter(self.train_dataloader)
-        data = next(iterator)
-        batch = batch_to_device(data, self.device)
-        # the autoencoder takes the time steps folded into the channels
-        inp = self.preprocessor.flatten_history(batch[INPUT])
-        tar = self.preprocessor.flatten_history(batch[TARGET])
-        # get shapes
-        inp_shape = inp.shape
-        tar_shape = tar.shape
-
-        self._compile_model(inp_shape)
+        self._compile_model()
 
         out_bias, out_scale = self.train_dataloader.get_output_normalization()
         self._setup_visualizer(out_bias, out_scale)
@@ -271,7 +257,7 @@ class AutoencoderTrainer(Driver):
             self.logger.info("Number of trainable model parameters: {}".format(pcount))
 
     # jit compilation is currently disabled
-    def _compile_model(self, inp_shape):
+    def _compile_model(self):
         self.model_train = self.model
         self.model_eval = self.model
 

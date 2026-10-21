@@ -35,7 +35,7 @@ so a rollout works for lat/lon and mesh batches alike.
 
 An ensemble is rolled out as one batch: with ``ensemble_size=E`` the members
 are folded into the batch dimension of everything the model sees, ``(B, ...)``
-to ``(B * E, ...)``, member-major within each sample, see
+to ``(B * E, ...)``, batch-major: the members of each sample are adjacent, see
 :func:`makani.utils.functions.expand_ensemble`. The targets stay at ``B``, and
 :meth:`Rollout.unfold` brings the predictions to ``(B, E, ...)`` for the losses::
 
@@ -55,7 +55,7 @@ an inference run reads one step at a time. They are handed to
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -85,8 +85,9 @@ class RolloutStep:
     index : int
         The step, counted from 0.
     input : torch.Tensor
-        The window to predict from, ``(B, n_history + 1, C, *grid)``, in
-        physical units. From step 1 on, its latest steps are predictions.
+        The window to predict from, ``(B, n_history + 1, C, *grid)``, in the
+        space of the data, as the dataloader emits it. From step 1 on, its
+        latest steps are predictions.
     input_dynamic_features : dict
         The dynamic features over that window, name to ``(B, n_history + 1, C_f, *grid)``.
     input_timestamp : torch.Tensor
@@ -164,7 +165,7 @@ class Rollout:
         self,
         batch: Batch,
         n_steps: Optional[int] = None,
-        noise_source: Optional[Callable[[], torch.Tensor]] = None,
+        noise_source: Optional[Any] = None,
         noise_state: Optional[Any] = None,
         ensemble_size: int = 1,
     ):
@@ -344,8 +345,9 @@ class Rollout:
         ----------
         pred : torch.Tensor
             The prediction of the current step, ``(B * ensemble_size, 1, C, *grid)``,
-            in physical units, with any number of channels at the last step. It
-            is used as it is, so detach it first for push-forward training.
+            in the space of the data, with any number of channels at the last
+            step. It is used as it is, so detach it first for push-forward
+            training.
         dynamic_features : dict, optional
             Only for a batch without targets: the dynamic features at the
             predicted time, name to ``(B, 1, C_f, *grid)`` at the batch of the
@@ -360,9 +362,10 @@ class Rollout:
             If no step is waiting for its prediction.
         ValueError
             If the prediction does not have the shape of one step of the window,
-            or, at the last step, another batch, number of steps or grid; if features or a timestamp are given for a batch with targets, or
-            are missing, have other names or more than one step for a batch
-            without targets.
+            or, at the last step, another batch, number of steps or grid; if
+            features or a timestamp are given for a batch with targets, or are
+            missing, have other names or more than one step for a batch without
+            targets.
         """
         if not self._pending:
             raise RuntimeError("advance() needs a step of the rollout to advance: ask for the next step first")

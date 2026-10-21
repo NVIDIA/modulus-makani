@@ -66,17 +66,21 @@ _INPUT_ZENITH = f"{INPUT_DYNAMIC_FEATURES}/{ZENITH}"
 _TARGET_ZENITH = f"{TARGET_DYNAMIC_FEATURES}/{ZENITH}"
 
 
-# bump whenever the layout of the dict returned by DaliDataloader.state_dict changes
-_DATALOADER_STATE_VERSION = 1
+# bump whenever the layout of the dict returned by DaliDataloader.state_dict changes, or the pipeline
+# whose checkpoint it carries does. 2: the pipeline always outputs the timestamps, as GPU tensors
+_DATALOADER_STATE_VERSION = 2
 
 
 class DaliDataloader(object):
     """Feeds batches to training, reading through a dataset backend.
 
-    Iterating yields the tensors named when the pipeline was built: the input and
-    target windows, followed by the zenith angles when those were asked for, and
-    the timestamps. Normalization and any grid conversion happen on the GPU, so what
-    comes out is ready for the model.
+    Iterating yields batch dicts, see :mod:`makani.utils.dataloaders.batch`, with
+    the zenith angle among the dynamic features when it was asked for. The pipeline
+    produces them as positional outputs, in the order of
+    :meth:`~makani.utils.dataloaders.sample_source.SampleSource.output_layout`, and
+    names them on the way out. Normalization happens in the pipeline, the grid
+    conversion right after it, both on the device, so what comes out is ready for
+    the model.
 
     Built from ``params``, which names the dataset and its layout, the channels,
     the window geometry and the decomposition. Set
@@ -95,11 +99,6 @@ class DaliDataloader(object):
             enable_checkpointing=self.enable_checkpointing,
             checkpoint=checkpoint,
         )
-
-        img_shape_x = self.data_shapes.img_shape_x
-        img_shape_y = self.data_shapes.img_shape_y
-        in_channels = self.in_channels
-        out_channels = self.out_channels
 
         # one layout per output of the source, in the order it returns them
         layout = self.extsource.output_layout()
@@ -135,6 +134,9 @@ class DaliDataloader(object):
                 if self.add_zenith:
                     izen = izen.gpu()
                     tzen = tzen.gpu()
+                # the timestamps too, so that the whole batch is on one device
+                itime = itime.gpu()
+                ttime = ttime.gpu()
 
             # normalize if requested
             if self.normalize:

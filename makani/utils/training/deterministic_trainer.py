@@ -215,20 +215,8 @@ class Trainer(Driver):
                 )
         self.timers["reduction hooks init"] = timer.time
 
-        # lets get one sample from the dataloader:
-        # set to train just to be safe
-        self._set_train()
-        # get sample and map to gpu
-        iterator = iter(self.train_dataloader)
-        data = next(iterator)
-        batch = batch_to_device(data, self.device)
-        inp, tar = batch[INPUT], batch[TARGET]
-        # get shapes
-        inp_shape = inp.shape
-        tar_shape = tar.shape
-
         with Timer() as timer:
-            self._compile_model(inp_shape)
+            self._compile_model()
         self.timers["compile model"] = timer.time
 
         # visualization wrapper: only world-rank 0 renders/logs; other ranks get None.
@@ -316,7 +304,7 @@ class Trainer(Driver):
         self._log_timers()
 
     # compile stuff
-    def _compile_model(self, inp_shape):
+    def _compile_model(self):
 
         if self.params.jit_mode == "inductor":
             # compile the step, not the rollout: the loop and the noise stay in Python, and the
@@ -337,10 +325,14 @@ class Trainer(Driver):
 
         return
 
-    def _loss(self, pred, tar, inp):
-        # the losses take the time steps folded into the channels
+    def _loss(self, pred, tar, inp, rollout=None):
+        # the losses take the time steps folded into the channels; given the rollout of an ensemble,
+        # the members are split out of the batch of the predictions, (B, E, ...), the targets stay at B
         flatten = self.preprocessor.flatten_history
-        return self.loss_obj(flatten(pred), flatten(tar), inp=flatten(inp))
+        pred = flatten(pred)
+        if rollout is not None:
+            pred = rollout.unfold(pred)
+        return self.loss_obj(pred, flatten(tar), inp=flatten(inp))
 
     def _rollout(self, batch, ensemble_size=1):
         # the rollout over all target steps of the batch, with the input noise of the model at the
@@ -707,10 +699,12 @@ class Trainer(Driver):
                     tar = batch[TARGET]
 
                     # the autoregressive rollout over all target steps, one prediction at a time
-                    steps = self._eval_steps(self._rollout(batch))
+                    rollout = self._rollout(batch)
+                    steps = self._eval_steps(rollout)
 
-                    # losses and metrics, one target step at a time
-                    for idt in range(tar.shape[1]):
+                    # losses and metrics, one step of the rollout at a time; next(steps) stays inside
+                    # the autocast below, so the model runs under it but the metrics do not
+                    for idt in range(rollout.n_steps):
 
                         with self.autocast():
                             # the losses and metrics take the channels of a single step
@@ -728,7 +722,7 @@ class Trainer(Driver):
                                 pred_gather = self.metrics._gather_input(pred_gather)
                                 targ_gather = self.metrics._gather_input(targ_gather)
 
-                                self._visualize_step(pred_gather, targ_gather, eval_steps, idt)
+                                self._visualize_step(pred_gather, targ_gather, eval_steps, idt, rollout.n_steps)
 
                         # log the loss
                         progress_bar.set_postfix({"loss": loss.item()})

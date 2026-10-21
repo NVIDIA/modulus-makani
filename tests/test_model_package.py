@@ -52,7 +52,7 @@ class _LeadingChannelsModel(nn.Module):
     """
     Dummy backbone returning ``scale`` times the leading ``n_out_chans`` channels.
 
-    The wrapper may append unpredicted (zenith) and static features, so we slice
+    The wrapper may append dynamic (zenith) and static features, so we slice
     from the FRONT -- those are the data channels of the oldest history step and
     are unaffected by whatever gets appended behind them.
     """

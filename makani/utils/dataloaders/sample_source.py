@@ -15,7 +15,8 @@
 
 """Turns a dataset into training samples.
 
-Given an index, produce one ``(input window, target window)`` pair: which
+Given an index, produce one sample, the input and target windows with their
+dynamic features and timestamps, see :meth:`SampleSource.__call__`: which
 samples exist, which one an index refers to, how the epoch is shuffled and
 sharded, and how a window of timesteps is assembled. Where the bytes come from
 is a :mod:`~makani.utils.dataloaders.backends` concern; this module never opens
@@ -91,9 +92,8 @@ class SampleSource(object):
         Whether to report what was found. Set on the ranks that log to screen, so
         one process describes the dataset instead of all of them.
     zenith_angle : bool
-        Append the cosine of the solar zenith angle for every timestep of the
-        window, computed on this rank's coordinates. The time of every timestep
-        of the window is always appended, last.
+        Also return the cosine of the solar zenith angle for every timestep of
+        the windows, computed on this rank's coordinates.
     lat_lon : tuple, optional
         Coordinates to use instead of those found in the files.
     dataset_name, timestamp_name : str
@@ -469,6 +469,24 @@ class SampleSource(object):
         The index is derived from the counters DALI supplies rather than from any
         state kept here, which is what lets a restarted pipeline land on the same
         sample; see the note on shuffling in the module docstring.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            The outputs of one sample, positional because DALI takes them so, in
+            the order of :meth:`output_layout`: the input window
+            ``(n_history + 1, C, H, W)`` and the target window
+            ``(n_future + 1, C, H, W)``; with ``zenith_angle``, the cosine of the
+            solar zenith angle over each window, ``(T, 1, H, W)``; and the
+            timestamps of each window in seconds since the epoch,
+            ``(n_history + 1,)`` and ``(n_future + 1,)``, float64. The DALI
+            loader names them as the keys of a batch, see
+            :mod:`makani.utils.dataloaders.batch`.
+
+        Raises
+        ------
+        StopIteration
+            At the end of the epoch.
         """
         global_sample_idx = sample_info.idx_in_epoch + sample_info.epoch_idx * self.num_samples_per_epoch_shard
         cycle_sample_idx = global_sample_idx % self.num_samples_per_cycle_shard

@@ -20,6 +20,7 @@ import importlib.util
 from importlib.metadata import entry_points
 
 import logging
+import warnings
 
 from typing import List, Union
 from functools import partial
@@ -132,9 +133,22 @@ def list_models() -> List[str]:
     return list(_model_registry.keys())
 
 
-def get_model(params: ParamsBase, use_stochastic_interpolation: bool = False, **kwargs) -> "torch.nn.Module":
+def warn_multistep_deprecated(multistep: bool):
+    """Warn that ``multistep`` no longer selects a wrapper, if a caller still asks for one."""
+    if multistep:
+        warnings.warn(
+            "multistep is deprecated and has no effect: the model wrapper serves single steps and rollouts, "
+            "and the number of steps comes from the Rollout",
+            FutureWarning,
+            stacklevel=3,
+        )
+
+
+def get_model(
+    params: ParamsBase, use_stochastic_interpolation: bool = False, multistep: bool = False
+) -> "torch.nn.Module":
     """
-    Convenience routine that constructs the model passing parameters and kwargs.
+    Convenience routine that constructs the model from the parameters.
     Unloads all the parameters in the params datastructure as a dict.
 
     Parameters
@@ -144,6 +158,10 @@ def get_model(params: ParamsBase, use_stochastic_interpolation: bool = False, **
     use_stochastic_interpolation : bool, optional
         Wrap the network in a :class:`StochasticInterpolantWrapper` instead of a
         :class:`~makani.models.stepper.StepWrapper`. By default ``False``.
+    multistep : bool, optional
+        Deprecated and without effect: the same wrapper serves single steps and
+        rollouts, and the number of steps comes from the
+        :class:`~makani.utils.dataloaders.rollout.Rollout`. ``True`` warns.
 
     Returns
     -------
@@ -157,6 +175,8 @@ def get_model(params: ParamsBase, use_stochastic_interpolation: bool = False, **
     KeyError
         If no model is registered under the provided name.
     """
+
+    warn_multistep_deprecated(multistep)
 
     # conditional import for constraints
     if hasattr(params, "constraints"):

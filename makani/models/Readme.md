@@ -12,19 +12,23 @@ makani
 │   ├── common                      # folder containing common features used in the neworks
 │   │   ├── activations.py          # complex activation functions
 │   │   ├── contractions.py         # einsum wrappers for complex contractions
-│   │   ├── factorizations.py       # tensor factorizations
 │   │   ├── layers.py               # common layers such as MLPs and wrappers for FFTs
 │   │   └── spectral_convolution.py # spectral convolution layers for (S)FNO architectures
 │   ├── networks                    # contains the actual architectures
 │   │   ├── afnonet_v2.py           # optimized AFNO
 │   │   ├── afnonet.py              # AFNO implementation
 │   │   ├── debug.py                # dummy network for debugging purposes
+│   │   ├── fourcastnet3.py         # FourCastNet 3
+│   │   ├── fourcastnet3_1.py       # FourCastNet 3.1
+│   │   ├── pangu.py                # implementation of Pangu-Weather
+│   │   ├── pangu_onnx.py           # Pangu-Weather from its ONNX export
 │   │   ├── sfnonet.py              # implementation of (S)FNO
+│   │   ├── snonet.py               # spherical neural operator (FourCastNet 2)
 │   │   └── vit.py                  # implementation of a VIT
 │   ├── helpers.py                  # helper functions
 │   ├── model_package.py            # model package implementation
 │   ├── model_registry.py           # model registry with get_model routine that takes care of wrapping the model
-│   ├── preprocessor.py             # implementation of preprocessor for dealing with unpredicted channels
+│   ├── preprocessor.py             # stateless preprocessor: dynamic and static features, input noise, history normalization
 │   ├── stepper.py                  # StepWrapper: binds a model to its preprocessor, runs a Rollout
 │   └── Readme.md                   # this file
 ...
@@ -53,4 +57,4 @@ using the path to the model file and the class name `ModelName`.
 
 ### Model packages
 
-Model packages are used for seamless inference outside of this repository. They define a flexible interfact which takes care of normalization, unpredicted channels etc. Model packages seemlessly integrate with [earth2mip](https://github.com/NVIDIA/earth2mip).
+Model packages are used for seamless inference outside of this repository. They define a flexible interface which takes care of normalization, dynamic features such as the cosine of the solar zenith angle, static features etc. Model packages seemlessly integrate with [earth2mip](https://github.com/NVIDIA/earth2mip).

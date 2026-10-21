@@ -571,7 +571,7 @@ class Inferencer(Driver):
 
         date_fn = np.vectorize(get_date_from_timestamp)
 
-        # now we need to reorganize the data tuples so that the loader first rolls out the first batch indices, then the next,
+        # now we need to reorganize the samples so that the loader first rolls out the first batch indices, then the next,
         # etc: generate batched list first:
         # use sorted index sampler, which does the trick
         sampler = SortedIndexSampler(indices, num_samples, batch_size, rollout_steps, self.params.dt)
@@ -616,9 +616,8 @@ class Inferencer(Driver):
             with torch.no_grad():
                 for token in tqdm(subset_dataloader, desc="Inference progress", disable=not self.log_to_screen):
 
-                    # effective idt and initial condition
+                    # the step within the rollout of the current initial condition
                     idte = idt % (rollout_steps + 1)
-                    ibatch = idt // (rollout_steps + 1)
 
                     if torch.cuda.is_available():
                         torch.cuda.nvtx.range_push(f"inference step {idt}, rollout step {idte}")
@@ -656,9 +655,10 @@ class Inferencer(Driver):
                         # episode start: a new initial condition. The rollout folds the ensemble
                         # dim into the batch dim, (B*E, ...) going into the model, and replaces
                         # the noise state at its first step; it evolves via AR updates after that.
-                        tinp = gtime
+                        # the initial condition is the latest step of the window, the steps before it are history
+                        tinp = gtime[:, -1]
 
-                        dates = date_fn(tinp.flatten().detach().cpu()).tolist()
+                        dates = date_fn(tinp.detach().cpu()).tolist()
                         datestring = ", ".join([d.strftime("%Y-%m-%dT%H:%M:%S") for d in dates])
                         print(f"inferencing dates: {datestring}")
 
@@ -666,8 +666,9 @@ class Inferencer(Driver):
                         rollout = Rollout(gbatch, n_steps=rollout_steps, noise_source=noise_source, ensemble_size=E)
 
                         if rollout_buffer is not None:
-                            inp_flat = self.preprocessor.flatten_history(expand_ensemble(gfield, E))
-                            rollout_buffer.update(rollout.unfold(inp_flat), tinp[:, 0], idt=idte)
+                            # every member starts from the same initial condition, (B, E, C, H, W)
+                            ic = rollout.unfold(expand_ensemble(gfield[:, -1], E))
+                            rollout_buffer.update(ic, tinp, idt=idte)
 
                     else:
                         # rollout step: the sample is the verification, its latest step is the
@@ -692,9 +693,9 @@ class Inferencer(Driver):
                             # split the ensemble back out, (B, E, ...), for metrics / loss / buffers
                             pred = rollout.unfold(self.preprocessor.flatten_history(pred_step))
 
-                            # set weight to None here, since I am not sure what to do for spectral components
-                            # in spectral CRPS
-                            loss = self.loss_obj(pred, targ, None)
+                            # no weight here, since it is not clear what it would be for the spectral
+                            # components in spectral CRPS
+                            loss = self.loss_obj(pred, targ)
 
                             if rollout_buffer is not None:
                                 rollout_buffer.update(pred, ttar[:, 0], idt=idte)

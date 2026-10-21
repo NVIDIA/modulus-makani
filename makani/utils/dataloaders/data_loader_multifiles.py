@@ -340,9 +340,9 @@ class MultifilesDataset(Dataset):
 
         if target:
             if not self.out_channels_is_sorted:
-                data = data[:, self.out_channels_unsort, :, :]
+                data = data[:, self.out_channels_unsort, ...]
         elif not self.in_channels_is_sorted:
-            data = data[:, self.in_channels_unsort, :, :]
+            data = data[:, self.in_channels_unsort, ...]
 
         if self.normalize:
             if target:

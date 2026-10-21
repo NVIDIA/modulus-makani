@@ -442,7 +442,7 @@ def _rollout(wrapper, batch, **kwargs):
 
 
 def _expand_batch(batch, ensemble_size):
-    """The batch with every sample repeated for each member, member-major, as the rollout folds it."""
+    """The batch with every sample repeated for each member, batch-major, as the rollout folds it."""
     return {
         key: (_expand_batch(value, ensemble_size) if isinstance(value, dict) else expand_ensemble(value, ensemble_size))
         for key, value in batch.items()

@@ -126,11 +126,12 @@ class DummyLoader(object):
                 dtype=torch.float32,
                 device=self.device,
             )
-            self.zen_tar_dummy = torch.zeros(
-                (self.batch_size, self.n_future + 1, 1, self.return_shape[0], self.return_shape[1]),
-                dtype=torch.float32,
-                device=self.device,
-            )
+            if self.return_target:
+                self.zen_tar_dummy = torch.zeros(
+                    (self.batch_size, self.n_future + 1, 1, self.return_shape[0], self.return_shape[1]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
 
         # grid types (lat_lon_local may be a list if auto-created; coerce to tensor)
         self.grid_converter = GridConverter(
@@ -247,8 +248,10 @@ class DummyLoader(object):
         logging.info(
             f"Number of examples: {self.n_samples_per_epoch}. Image Shape: {self.img_shape[0]} x {self.img_shape[1]} x {self.n_in_channels_local}"
         )
+        # the window counts its latest step too, as in the other loaders
         logging.info(
-            f"Including {self.dhours*self.dt*self.n_history} hours of past history in training at a frequency of {self.dhours*self.dt} hours"
+            f"Including {self.dhours * self.dt * (self.n_history + 1)} hours of past history in training at a "
+            f"frequency of {self.dhours * self.dt} hours"
         )
         logging.info("WARNING: using dummy data")
 
@@ -269,8 +272,8 @@ class DummyLoader(object):
         self.tar.uniform_()
 
         # the values are as meaningless as the payload; they are there because every batch has them
-        self.inp_time = torch.zeros((self.batch_size, self.n_history + 1), dtype=torch.float64)
-        self.tar_time = torch.ones((self.batch_size, self.n_future + 1), dtype=torch.float64)
+        self.inp_time = torch.zeros((self.batch_size, self.n_history + 1), dtype=torch.float64, device=self.device)
+        self.tar_time = torch.ones((self.batch_size, self.n_future + 1), dtype=torch.float64, device=self.device)
 
         self.in_bias = np.zeros((1, self.n_in_channels, 1, 1)).astype(np.float32)
         self.in_scale = np.ones((1, self.n_in_channels, 1, 1)).astype(np.float32)
@@ -372,7 +375,9 @@ class DummyInferenceDataset(DummyLoader, torch.utils.data.Dataset):
 
     def get_sample_at_index(self, global_idx, return_target=True):
         inp_time = self._timestamps_at(global_idx, 0, self.n_history + 1)
-        tar_time = self._timestamps_at(global_idx, self.n_history + 1, self.n_history + self.n_future + 2)
+        tar_time = None
+        if return_target:
+            tar_time = self._timestamps_at(global_idx, self.n_history + 1, self.n_history + self.n_future + 2)
 
         return make_batch(
             inp=self.sample_inp,

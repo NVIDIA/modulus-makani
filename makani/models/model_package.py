@@ -100,8 +100,10 @@ class ModelWrapper(torch.nn.Module):
     r"""
     Model wrapper to make inference simple outside of makani.
 
-    Presents a trained model as a plain callable that takes physical fields and
-    a valid time, so downstream consumers do not need makani's training
+    Presents a trained model as a plain callable that takes the fields, either
+    normalized by the dataset statistics (the default) or in physical units
+    (``normalized_data=False``), and a valid time, so downstream consumers do
+    not need makani's training
     machinery. The wrapper owns the pieces that would otherwise be the caller's
     problem: input and output normalization, the lat-lon grid definition, and
     the solar zenith angle channel, which has to be computed from the valid time
@@ -350,8 +352,6 @@ class ModelWrapper(torch.nn.Module):
             If the backbone does not implement ``encode_process`` (currently only
             FCN3 does).
         """
-        if not hasattr(self.model, "encode"):
-            raise NotImplementedError(f"{type(self.model).__name__} does not expose encode_process().")
         x, features, noise = self._step_inputs(x, time, normalized_data, replace_state)
         return self.model.encode(x, features, noise)
 
@@ -478,9 +478,11 @@ def load_model_package(package, pretrained=True, device="cpu", multistep=False):
     """
     Loads model package and return the wrapper which can be used for inference.
 
-    ``multistep`` is accepted for backward compatibility and has no effect: the
-    same wrapper serves single steps and rollouts.
+    ``multistep`` is deprecated and has no effect: the same wrapper serves
+    single steps and rollouts. ``True`` warns.
     """
+    model_registry.warn_multistep_deprecated(multistep)
+
     path = package.get("config.json")
     params = ParamsBase.from_json(path)
     # resampled shapes are set at runtime from the dataset during training and are

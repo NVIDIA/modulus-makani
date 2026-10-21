@@ -224,7 +224,6 @@ class TestTrainer(_TrainerTestCase):
         self.trainer.train()
 
         # check that a checkpoint file exists
-        checkpoint_dir = os.path.join(self.params.experiment_dir, "training_checkpoints")
         with self.subTest(desc="checkpoint files"):
             self.assertTrue(os.path.isfile(self.params.checkpoint_path.format(mp_rank=comm.get_rank("model"))))
             self.assertTrue(os.path.isfile(self.params.best_checkpoint_path.format(mp_rank=comm.get_rank("model"))))

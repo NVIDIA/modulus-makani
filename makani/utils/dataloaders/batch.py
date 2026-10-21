@@ -35,6 +35,8 @@ key                         content                                     shape
 ``grid`` is ``(H, W)`` for a lat/lon grid and ``(N_points,)`` for a mesh: the
 batch, time and channel dimensions always lead, the grid always trails, and
 the grid itself is described by the loader's ``DataShapes``, not by the shape.
+The mesh layout is the contract code consuming a batch is written against, but
+no loader emits it yet: they still assume a two dimensional raster.
 
 ``grid`` is always this rank's part of the grid, after cropping, spatial
 sharding and subsampling: ``(H_local, W_local)``, or the local points of a mesh

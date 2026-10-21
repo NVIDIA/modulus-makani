@@ -347,21 +347,23 @@ class BaseNoiseS2(nn.Module):
 
     def set_tensor_state(self, newstate):
         r"""
-        Overwrite the spectral state, resizing the batch dimension if needed.
+        Replace the spectral state, taking on the batch size of the new one.
+
+        The state becomes a detached copy of ``newstate``, on the device and
+        with the dtype of the current one, see :meth:`_set_state`: the caller's
+        tensor is never written to, nor kept.
 
         Parameters
         ----------
         newstate : torch.Tensor
             Replacement state. Everything beyond the batch dimension must match
-            the module's expected layout; only the batch size may differ, and
-            the buffer is reallocated to accommodate it.
+            the module's expected layout; only the batch size may differ.
 
         Raises
         ------
         ValueError
-            If the shape beyond the batch dimension does not match. Checked
-            up front so a mismatch reports the expected and actual layouts,
-            rather than failing later inside the copy.
+            If the shape beyond the batch dimension does not match, so that a
+            state of the wrong layout is never installed.
         """
         # Validate the state layout (everything beyond the batch dim) matches this
         # noise module's expected suffix BEFORE touching `self.state`. Only the batch

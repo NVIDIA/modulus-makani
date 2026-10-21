@@ -370,8 +370,9 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         pp = self._make_pp_with_noise()
         pp.update_internal_state()
         tensor_state = pp.get_internal_state(tensor=True)
-        # overwrite with zeros, then restore
-        pp.input_noise.state.zero_()
+        # zero the state, never writing into it, then restore
+        pp.input_noise.reset()
+        self.assertFalse(torch.equal(pp.get_internal_state(tensor=True), tensor_state))
         pp.set_internal_state(tensor_state)
         restored = pp.get_internal_state(tensor=True)
         self.assertTrue(compare_tensors("tensor state roundtrip", restored, tensor_state, verbose=verbose))

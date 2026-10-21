@@ -606,7 +606,7 @@ def init_wb2_zarr_dataset(
 
 
 def single_step_rollout(inp, dynamic_features=None, noise_source=None):
-    """A rollout over one step from the window ``inp``, ``(B, T, C, H, W)``, without targets.
+    """A rollout over one step from the window ``inp``, ``(B, T, C, *grid)``, without targets.
 
     For calling a wrapper through its ``forward``, e.g. under DDP, with a single step.
     """

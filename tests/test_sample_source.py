@@ -261,9 +261,8 @@ def _make_source(location, **overrides):
 def _ts_to_posix(t):
     """Normalise a timestamp to a POSIX float.
 
-    SampleSource._compute_timestamps() returns numpy float64 (seconds since epoch).
-    SampleSource._compute_timestamps_and_zenith_angle() returns datetime objects
-    (slices of self.timestamps).  This helper handles both.
+    The outputs of SampleSource carry numpy float64 (seconds since epoch); the
+    dataset's own timestamps may also be datetime objects. This helper handles both.
     """
     try:
         return float(t.timestamp())  # datetime path

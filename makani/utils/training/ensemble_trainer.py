@@ -211,23 +211,11 @@ class EnsembleTrainer(Trainer):
                 )
         self.timers["reduction hooks init"] = timer.time
 
-        # lets get one sample from the dataloader:
-        # set to train just to be safe
-        self._set_train()
-        # get sample and map to gpu
-        iterator = iter(self.train_dataloader)
-        data = next(iterator)
-        batch = batch_to_device(data, self.device)
-        inp, tar = batch[INPUT], batch[TARGET]
-        # get shapes
-        inp_shape = inp.shape
-        tar_shape = tar.shape
-
         with Timer() as timer:
-            self._compile_model(inp_shape)
+            self._compile_model()
         self.timers["compile model"] = timer.time
 
-        # visualization wrapper:
+        # visualization wrapper: only world-rank 0 renders/logs; other ranks get None.
         with Timer() as timer:
             out_bias, out_scale = self.train_dataloader.get_output_normalization()
             self._setup_visualizer(out_bias, out_scale)
@@ -486,22 +474,17 @@ class EnsembleTrainer(Trainer):
 
     def _ensemble_step(self, batch):
         """
-        Single forward of the rollout over the batch, with the ensemble folded into the batch dim.
+        The loss of a single forward of the rollout over the batch, with the ensemble folded into the batch dim.
 
         The rollout folds the members into the batch dim, (B*E, ...), for one forward per step and
         unfolds the predictions to (B, E, ...) for the loss; the targets stay at (B, ...). The noise
         is drawn at the folded batch, so each (batch, ensemble member) pair sees an independent sample.
         """
         rollout = self._rollout(batch, ensemble_size=self.params.local_ensemble_size)
-        pred_folded = self.model_train(rollout)
+        pred = self.model_train(rollout)
 
-        # the losses take the time steps folded into the channels, and the ensemble as dim 1
-        flatten = self.preprocessor.flatten_history
-        pred = rollout.unfold(flatten(pred_folded))
-
-        loss = self.loss_obj(pred, flatten(batch[TARGET]), inp=flatten(batch[INPUT]))
-
-        return pred, loss
+        # the losses take the ensemble as dim 1, even for a single local member
+        return self._loss(pred, batch[TARGET], batch[INPUT], rollout=rollout)
 
     def train_one_epoch(self, profiler=None):
         self.epoch += 1
@@ -526,7 +509,8 @@ class EnsembleTrainer(Trainer):
             train_steps += 1
             self.iters += 1
 
-            torch.cuda.nvtx.range_push(f"train step {train_steps}")
+            if torch.cuda.is_available():
+                torch.cuda.nvtx.range_push(f"train step {train_steps}")
             self.step_timer.begin_step()
 
             # map to device
@@ -546,10 +530,10 @@ class EnsembleTrainer(Trainer):
             with self.autocast():
 
                 if do_update:
-                    pred, loss = self._ensemble_step(batch)
+                    loss = self._ensemble_step(batch)
                 else:
                     with self.model_train.no_sync():
-                        pred, loss = self._ensemble_step(batch)
+                        loss = self._ensemble_step(batch)
                 loss = loss * loss_scaling_fact
 
             # stop on a non-finite loss before it reaches the weights, on all ranks together
@@ -611,7 +595,8 @@ class EnsembleTrainer(Trainer):
             progress_bar.set_postfix(**pbar_postfix)
 
             self.step_timer.end_step()
-            torch.cuda.nvtx.range_pop()
+            if torch.cuda.is_available():
+                torch.cuda.nvtx.range_pop()
 
             # profiler step
             if profiler is not None:
@@ -697,8 +682,9 @@ class EnsembleTrainer(Trainer):
                     # one prediction at a time, so that each lead time is released after its metrics
                     steps = self._eval_steps(rollout)
 
-                    # loop over lead times
-                    num_lead_times = tar.shape[1]
+                    # loop over the lead times of the rollout; next(steps) stays inside the autocast
+                    # below, so the model runs under it but the metrics do not
+                    num_lead_times = rollout.n_steps
                     for idt in range(num_lead_times):
 
                         targ = flatten(tar[:, idt : idt + 1])
@@ -707,7 +693,7 @@ class EnsembleTrainer(Trainer):
                             # split the ensemble back out, (B, E, ...), for the loss
                             pred = rollout.unfold(flatten(next(steps)))
 
-                            loss = self.loss_obj(pred, targ, None)
+                            loss = self.loss_obj(pred, targ)
 
                             # log the loss
                             progress_bar.set_postfix({"loss": loss.item()})

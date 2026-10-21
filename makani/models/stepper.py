@@ -51,11 +51,13 @@ class StepWrapper(nn.Module):
     r"""
     Bind a model to its preprocessor.
 
-    Wraps the network so callers can hand it data in physical units and get
-    predictions back in physical units, without having to replicate the
-    preprocessing pipeline at every call site. Each step performs: appending
-    the dynamic features and the noise, history normalization, packing the
-    input for the network, the model forward, bias correction, and
+    Wraps the network so callers can hand it data as the dataloader emits it
+    and get predictions back in the same space, without having to replicate
+    the preprocessing pipeline at every call site. That is the data space: the
+    fields normalized by the dataset statistics, which the dataloader already
+    applies and this wrapper never undoes. Each step performs: appending the
+    dynamic features and the noise, history normalization, packing the input
+    for the network, the model forward, bias correction, and the history
     denormalization of the output.
 
     ``forward`` takes a :class:`~makani.utils.dataloaders.rollout.Rollout` and
@@ -160,7 +162,7 @@ class StepWrapper(nn.Module):
         Parameters
         ----------
         inp : torch.Tensor
-            The window, ``(B, n_history + 1, C, H, W)``, in physical units.
+            The window, ``(B, n_history + 1, C, H, W)``, in data space.
         dynamic_features : dict
             The dynamic features over the window, name to ``(B, n_history + 1, C_f, H, W)``;
             empty if the model takes none.
@@ -171,7 +173,7 @@ class StepWrapper(nn.Module):
         Returns
         -------
         torch.Tensor
-            The prediction, ``(B, 1, C_out, H, W)``, in physical units.
+            The prediction, ``(B, 1, C_out, H, W)``, in data space.
         """
         return self._predict_window(inp, dynamic_features, noise)
 
@@ -219,7 +221,7 @@ class StepWrapper(nn.Module):
         Returns
         -------
         torch.Tensor
-            The prediction, ``(B * E, 1, C_out, H, W)``, in physical units, at
+            The prediction, ``(B * E, 1, C_out, H, W)``, in data space, at
             the batch of the rollout with its ``E`` ensemble members folded in.
         """
         return self._predict_window(step.input, step.input_dynamic_features, step.noise, use_checkpoint)
@@ -242,8 +244,8 @@ class StepWrapper(nn.Module):
         Returns
         -------
         torch.Tensor
-            The predictions, ``(B * E, n_steps, C_out, H, W)``, in physical
-            units, at the batch of the rollout with its ``E`` ensemble members
+            The predictions, ``(B * E, n_steps, C_out, H, W)``, in data
+            space, at the batch of the rollout with its ``E`` ensemble members
             folded in; :meth:`~makani.utils.dataloaders.rollout.Rollout.unfold`
             splits them out. Step ``k`` predicts target step ``k``.
 
@@ -274,9 +276,9 @@ class StepWrapper(nn.Module):
         Returns
         -------
         iterator of torch.Tensor
-            The prediction of each step, ``(B * E, 1, C_out, H, W)``, in
-            physical units, at the batch of the rollout with its ``E`` ensemble
-            members folded in.
+            The prediction of each step, ``(B * E, 1, C_out, H, W)``, in data
+            space, at the batch of the rollout with its ``E`` ensemble members
+            folded in.
 
         Raises
         ------
