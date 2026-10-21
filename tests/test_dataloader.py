@@ -25,12 +25,23 @@ from typing import Optional
 from parameterized import parameterized, parameterized_class
 
 import unittest
+from unittest import mock
 import torch
 import numpy as np
 import h5py as h5
 import zarr
 
 from makani.utils.dataloader import get_dataloader
+from makani.utils.dataloaders.data_helpers import get_data_normalization
+from makani.utils.dataloaders.batch import (
+    INPUT,
+    TARGET,
+    INPUT_DYNAMIC_FEATURES,
+    TARGET_DYNAMIC_FEATURES,
+    INPUT_TIMESTAMP,
+    TARGET_TIMESTAMP,
+    ZENITH,
+)
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from .testutils import (
@@ -43,6 +54,9 @@ from .testutils import (
     compare_arrays,
 )
 from .testutils import H5_PATH, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W, CHANNEL_NAMES
+
+_TRAINING_KEYS = {INPUT, TARGET, INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES, INPUT_TIMESTAMP, TARGET_TIMESTAMP}
+_INFERENCE_KEYS = {INPUT, INPUT_DYNAMIC_FEATURES, INPUT_TIMESTAMP}
 
 _multifiles_params = [True]
 _have_dali = importlib.util.find_spec("nvidia.dali") is not None
@@ -168,6 +182,12 @@ class DataLoaderBase:
             self.addCleanup(loader.close)
         return loader, dataset, sampler
 
+    def _assert_plain_batch(self, batch):
+        """A batch with a target and nothing optional, such as the zenith angle."""
+        self.assertEqual(set(batch), _TRAINING_KEYS)
+        self.assertEqual(batch[INPUT_DYNAMIC_FEATURES], {})
+        self.assertEqual(batch[TARGET_DYNAMIC_FEATURES], {})
+
     def _get_sample(self, path, idx):
         raise NotImplementedError
 
@@ -208,8 +228,8 @@ class DataLoaderBase:
         # do tests
         num_valid_steps = self.params.num_valid // self.params.batch_size
         for idt, token in enumerate(valid_loader):
-            self.assertEqual(len(token), 2)
-            inp, tar = token
+            self._assert_plain_batch(token)
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
             self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
@@ -229,7 +249,7 @@ class DataLoaderBase:
         # do tests
         for idt, token in enumerate(valid_loader):
             # get loader samples
-            inp, tar = token
+            inp, tar = token[INPUT], token[TARGET]
 
             # get test samples
             off = self.params.batch_size * idt
@@ -285,7 +305,7 @@ class DataLoaderBase:
             stds_b = stds.astype(np.float32)
 
             for idt, token in enumerate(valid_loader):
-                inp, tar = token
+                inp, tar = token[INPUT], token[TARGET]
 
                 off = params.batch_size * idt
                 inp_raw = np.stack(
@@ -333,8 +353,8 @@ class DataLoaderBase:
         )
 
         for idt, (token, token_flip) in enumerate(zip(valid_loader, valid_loader_flip)):
-            inp, tar = token
-            inp_flip, tar_flip = token_flip
+            inp, tar = token[INPUT], token[TARGET]
+            inp_flip, tar_flip = token_flip[INPUT], token_flip[TARGET]
 
             self.assertFalse(compare_tensors("inp vs flipped inp", inp, inp_flip))
             inp_flip_flip = torch.flip(inp_flip, dims=(2,))
@@ -359,8 +379,8 @@ class DataLoaderBase:
 
         # do tests
         for idt, token in enumerate(valid_loader):
-            self.assertEqual(len(token), 2)
-            inp, tar = token
+            self._assert_plain_batch(token)
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(
                 tuple(inp.shape),
@@ -386,8 +406,8 @@ class DataLoaderBase:
 
         # do tests
         for idt, token in enumerate(train_loader):
-            self.assertEqual(len(token), 2)
-            inp, tar = token
+            self._assert_plain_batch(token)
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
             self.assertEqual(
@@ -413,8 +433,8 @@ class DataLoaderBase:
 
         # do tests
         for idt, token in enumerate(valid_loader):
-            self.assertEqual(len(token), 2)
-            inp, tar = token
+            self._assert_plain_batch(token)
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W))
             self.assertEqual(
@@ -447,7 +467,7 @@ class DataLoaderBase:
         num_steps = 3
         for idt, token in enumerate(valid_loader):
             # get loader samples
-            inp, tar = token
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(tuple(inp.shape), (self.params.batch_size, 1, NUM_CHANNELS, range_x, range_y))
             self.assertEqual(tuple(tar.shape), (self.params.batch_size, 1, NUM_CHANNELS, range_x, range_y))
@@ -501,7 +521,7 @@ class DataLoaderBase:
         num_steps = 3
         for idt, token in enumerate(valid_loader):
             # get loader samples
-            inp, tar = token
+            inp, tar = token[INPUT], token[TARGET]
 
             self.assertEqual(
                 tuple(inp.shape),
@@ -580,7 +600,7 @@ class DataLoaderBase:
 
         fingerprints = []
         for token in loader:
-            inp = token[0]
+            inp = token[INPUT]
             for b in range(inp.shape[0]):
                 fingerprints.append(inp[b].cpu().numpy().tobytes())
 
@@ -649,7 +669,7 @@ class DataLoaderBase:
 
         fps = []
         for token in loader:
-            inp = token[0]
+            inp = token[INPUT]
             for b in range(inp.shape[0]):
                 fps.append(inp[b].cpu().numpy().tobytes())
 
@@ -701,7 +721,7 @@ class DataLoaderBase:
         def _collect_epoch():
             fps = []
             for token in loader:
-                inp = token[0]
+                inp = token[INPUT]
                 for b in range(inp.shape[0]):
                     fps.append(inp[b].cpu().numpy().tobytes())
             return fps
@@ -752,13 +772,13 @@ class DataLoaderBase:
             dali_device=self.dali_device,
         )
 
-        before = next(iter(loader))[0]
+        before = next(iter(loader))[INPUT]
 
         # round-trip the state through the loader, which tears the pipeline down and
         # builds a new one with a fresh worker pool
         self.assertTrue(loader.load_state_dict(loader.state_dict()))
 
-        after = next(iter(loader))[0]
+        after = next(iter(loader))[INPUT]
 
         self.assertEqual(tuple(after.shape), tuple(before.shape))
 
@@ -792,7 +812,7 @@ class DataLoaderBase:
         def _collect(iterator, num_steps):
             fps = []
             for _ in range(num_steps):
-                inp = next(iterator)[0]
+                inp = next(iterator)[INPUT]
                 for b in range(inp.shape[0]):
                     fps.append(inp[b].cpu().numpy().tobytes())
             return fps
@@ -906,14 +926,20 @@ class TestHDF5DataLoader(DataLoaderBase, unittest.TestCase):
         self._test_dali_checkpoint_mid_epoch_resume()
 
     @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
-    def test_dali_training_loader_ignores_return_timestamp_param(self):
-        # timestamps would land where the trainers expect the zenith angle
+    def test_dali_batch_carries_named_timestamps(self):
         self.params.multifiles = False
-        self.params.return_timestamp = True
+        self.params.n_future = 1
         train_loader, _, _ = self._get_dataloader(
             self.params, self.params.train_data_path, mode="train", device=self.device, dali_device=self.dali_device
         )
-        self.assertEqual(len(next(iter(train_loader))), 2)
+        batch = next(iter(train_loader))
+        self._assert_plain_batch(batch)
+        self.assertEqual(tuple(batch[INPUT_TIMESTAMP].shape), (self.params.batch_size, 1))
+        self.assertEqual(tuple(batch[TARGET_TIMESTAMP].shape), (self.params.batch_size, 2))
+        self.assertEqual(batch[INPUT_TIMESTAMP].dtype, torch.float64)
+        # the whole batch is on one device
+        self.assertEqual(batch[INPUT_TIMESTAMP].device, batch[INPUT].device)
+        self.assertEqual(batch[TARGET_TIMESTAMP].device, batch[INPUT].device)
 
     @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
     def test_dali_close_releases_the_pipeline(self):
@@ -1152,7 +1178,8 @@ class TestDummyLoader(unittest.TestCase):
         self.assertEqual(len(loader), 4)
         batches = list(loader)
         self.assertEqual(len(batches), 4)
-        for inp, tar in batches:
+        for batch in batches:
+            inp, tar = batch[INPUT], batch[TARGET]
             self.assertEqual(tuple(inp.shape), (self.batch_size, 1, len(self.in_channels), *self.img_shape))
             self.assertEqual(tuple(tar.shape), (self.batch_size, 1, len(self.out_channels), *self.img_shape))
             self.assertEqual(inp.dtype, torch.float32)
@@ -1160,40 +1187,47 @@ class TestDummyLoader(unittest.TestCase):
 
     def test_history_and_future_dimensions(self):
         loader = self._make_loader(n_history=2, n_future=3)
-        inp, tar = next(iter(loader))
+        batch = next(iter(loader))
+        inp, tar = batch[INPUT], batch[TARGET]
         self.assertEqual(inp.shape[1], 3)  # n_history + 1
         self.assertEqual(tar.shape[1], 4)  # n_future  + 1
 
-    def test_add_zenith_appends_zenith_tensors(self):
+    def test_add_zenith_adds_zenith_features(self):
         loader = self._make_loader(add_zenith=True)
         batch = next(iter(loader))
-        self.assertEqual(len(batch), 4)  # inp, tar, inp_zen, tar_zen
-        _, _, inp_zen, _ = batch
+        self.assertEqual(set(batch[INPUT_DYNAMIC_FEATURES]), {ZENITH})
+        self.assertEqual(set(batch[TARGET_DYNAMIC_FEATURES]), {ZENITH})
+        inp_zen = batch[INPUT_DYNAMIC_FEATURES][ZENITH]
         self.assertEqual(tuple(inp_zen.shape), (self.batch_size, 1, 1, *self.img_shape))
 
     def test_target_zenith_spans_the_target_window(self):
         # the target zenith used to be the input zenith tensor, n_history+1 steps long
         loader = self._make_loader(add_zenith=True, n_history=1, n_future=2)
-        _, _, inp_zen, tar_zen = next(iter(loader))
+        batch = next(iter(loader))
+        inp_zen = batch[INPUT_DYNAMIC_FEATURES][ZENITH]
+        tar_zen = batch[TARGET_DYNAMIC_FEATURES][ZENITH]
         self.assertEqual(tuple(inp_zen.shape), (self.batch_size, 2, 1, *self.img_shape))
         self.assertEqual(tuple(tar_zen.shape), (self.batch_size, 3, 1, *self.img_shape))
 
-    def test_return_timestamp_appends_time_tensors(self):
-        loader = self._make_loader(return_timestamp=True)
+    def test_batch_carries_timestamps(self):
+        loader = self._make_loader()
         batch = next(iter(loader))
-        self.assertEqual(len(batch), 4)  # inp, tar, inp_time, tar_time
-        _, _, inp_time, _ = batch
+        self.assertEqual(set(batch), _TRAINING_KEYS)
+        inp_time = batch[INPUT_TIMESTAMP]
         self.assertEqual(tuple(inp_time.shape), (self.batch_size, 1))
         self.assertEqual(inp_time.dtype, torch.float64)
+        # created on the device of the loader, like the rest of the batch
+        self.assertEqual(inp_time.device, batch[INPUT].device)
+        self.assertEqual(batch[TARGET_TIMESTAMP].device, batch[INPUT].device)
 
     def test_return_target_false_yields_input_only(self):
         loader = self._make_loader(return_target=False)
         batch = next(iter(loader))
-        self.assertEqual(len(batch), 1)  # inp only
+        self.assertEqual(set(batch), _INFERENCE_KEYS)
 
     def test_subsampling_factor_reduces_spatial_shape(self):
         loader = self._make_loader(subsampling_factor=2)
-        inp, _ = next(iter(loader))
+        inp = next(iter(loader))[INPUT]
         self.assertEqual(tuple(inp.shape[-2:]), (self.img_shape[0] // 2, self.img_shape[1] // 2))
 
     def test_normalization_helpers_return_neutral_stats(self):
@@ -1205,6 +1239,138 @@ class TestDummyLoader(unittest.TestCase):
         self.assertTrue((in_scale == 1).all())
         self.assertTrue((out_bias == 0).all())
         self.assertTrue((out_scale == 1).all())
+
+
+@parameterized_class(("kind",), [("dummy",), ("multifiles",)])
+class TestInferenceLookup(unittest.TestCase):
+    """
+    The lookup by time the inferencer drives an inference dataset with.
+
+    The inferencer picks its initial conditions by time and reads them by index,
+    so the synthetic dataset has to answer exactly as the multifiles one does:
+    the same index for a time, the same range, the same number of samples, and
+    the same window for a sample looked up by time, starting at that time.
+    """
+
+    _DT = 2
+    _N_HISTORY = 1
+    _N_FUTURE = 1
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.TemporaryDirectory()
+        cls.train_path, *_ = init_hdf5_dataset(cls.tmpdir.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmpdir.cleanup()
+
+    def _make(self, return_target=True):
+        kwargs = dict(
+            dt=self._DT,
+            in_channels=list(range(NUM_CHANNELS)),
+            out_channels=list(range(NUM_CHANNELS)),
+            n_history=self._N_HISTORY,
+            n_future=self._N_FUTURE,
+            return_target=return_target,
+            enable_logging=False,
+        )
+        if self.kind == "dummy":
+            from makani.utils.dataloaders.data_loader_dummy import DummyInferenceDataset
+
+            return DummyInferenceDataset(
+                location="/nonexistent", batch_size=1, dhours=6, img_shape=(8, 16), n_samples_per_epoch=40, **kwargs
+            )
+
+        from makani.utils.dataloaders.data_loader_multifiles import MultifilesDataset
+
+        return MultifilesDataset(location=self.train_path, **kwargs)
+
+    def test_index_and_time_round_trip(self):
+        dataset = self._make()
+        for idx in [0, 3, len(dataset) - 1]:
+            with self.subTest(idx=idx):
+                self.assertEqual(dataset.get_index_at_time(dataset.get_time_at_index(idx)), idx)
+                # as a timestamp in seconds, as the inferencer passes it too
+                self.assertEqual(dataset.get_index_at_time(dataset.get_time_at_index(idx).timestamp()), idx)
+
+    def test_a_time_between_samples_maps_to_the_earlier_one(self):
+        dataset = self._make()
+        time = dataset.get_time_at_index(3) + dt.timedelta(minutes=30)
+        self.assertEqual(dataset.get_index_at_time(time), 3)
+
+    def test_times_outside_the_dataset_are_refused(self):
+        dataset = self._make()
+        before = dataset.get_time_at_index(0) - dt.timedelta(hours=1)
+        after = dataset.get_time_at_index(dataset.n_samples_total - 1) + dt.timedelta(hours=1)
+        for time in [before, after]:
+            with self.subTest(time=time):
+                self.assertIsNone(dataset.get_index_at_time(time))
+                with self.assertRaises(IndexError):
+                    dataset.get_sample_at_time(time)
+
+    def test_length_leaves_room_for_the_window(self):
+        # the last samples cannot start a full window: the history and the future steps, and the
+        # first target step only with targets. Without targets the future steps are still held back,
+        # in both datasets alike, so the inferencer sees the same initial conditions in either
+        for return_target in [True, False]:
+            with self.subTest(return_target=return_target):
+                dataset = self._make(return_target=return_target)
+                n_steps = self._N_HISTORY + self._N_FUTURE + (1 if return_target else 0)
+                self.assertEqual(len(dataset), dataset.n_samples_total - self._DT * n_steps)
+
+    def test_a_sample_looked_up_by_time_starts_at_that_time(self):
+        dataset = self._make()
+        time = dataset.get_time_at_index(3)
+        step = self._DT * dataset.dhours * 3600.0
+
+        sample = dataset.get_sample_at_time(time)
+
+        start = time.timestamp()
+        expected_input = start + step * torch.arange(self._N_HISTORY + 1, dtype=torch.float64)
+        expected_target = start + step * torch.arange(
+            self._N_HISTORY + 1, self._N_HISTORY + self._N_FUTURE + 2, dtype=torch.float64
+        )
+        self.assertTrue(torch.equal(sample[INPUT_TIMESTAMP], expected_input))
+        self.assertTrue(torch.equal(sample[TARGET_TIMESTAMP], expected_target))
+
+
+def _without_dali(name, *args, **kwargs):
+    """``importlib.util.find_spec`` as on a system without DALI."""
+    if name == "nvidia.dali":
+        return None
+    return _find_spec(name, *args, **kwargs)
+
+
+_find_spec = importlib.util.find_spec
+
+
+class TestGetDataloaderWithoutDali(unittest.TestCase):
+    """Only the DALI path needs DALI; the synthetic loader used to be refused without it."""
+
+    def _params(self):
+        params = get_default_parameters()
+        params.multifiles = False
+        params.dhours = 6
+        params.batch_size = 2
+        params.n_train_samples = 4
+        return params
+
+    def test_synthetic_loader_does_not_need_dali(self):
+        from makani.utils.dataloaders.data_loader_dummy import DummyLoader
+
+        params = self._params()
+        params.enable_synthetic_data = True
+        with mock.patch("importlib.util.find_spec", side_effect=_without_dali):
+            loader, _, _ = get_dataloader(params, "/nonexistent", device=torch.device("cpu"), mode="train")
+        self.assertIsInstance(loader, DummyLoader)
+
+    def test_dali_loader_still_reports_missing_dali(self):
+        params = self._params()
+        params.enable_synthetic_data = False
+        with mock.patch("importlib.util.find_spec", side_effect=_without_dali):
+            with self.assertRaisesRegex(ImportError, "nvidia-dali"):
+                get_dataloader(params, "/nonexistent", device=torch.device("cpu"), mode="train")
 
 
 class TestMultifilesDataset(unittest.TestCase):
@@ -1272,7 +1438,8 @@ class TestMultifilesDataset(unittest.TestCase):
         """
         dataset = self._make(location=self.distinct_path, in_channels=[0, 1], out_channels=[3, 4], n_future=0)
 
-        inp, tar = dataset[0]
+        sample = dataset[0]
+        inp, tar = sample[INPUT], sample[TARGET]
 
         # channel c holds c + 1
         for name, values, constant in (
@@ -1290,7 +1457,8 @@ class TestMultifilesDataset(unittest.TestCase):
         # on the target side as well
         dataset = self._make(location=self.distinct_path, in_channels=[1, 0], out_channels=[4, 2])
 
-        inp, tar = dataset[0]
+        sample = dataset[0]
+        inp, tar = sample[INPUT], sample[TARGET]
 
         for name, values, constant in (
             ("inp c0", inp[:, 0], 2.0),
@@ -1309,9 +1477,9 @@ class TestMultifilesDataset(unittest.TestCase):
         Slicing adjacent ones instead gives times that drift from the data as
         soon as dt > 1, which reaches the model through the zenith angle.
         """
-        dataset = self._make(dt=2, n_history=1, return_timestamp=True, add_zenith=False)
+        dataset = self._make(dt=2, n_history=1, add_zenith=False)
 
-        _, _, inp_time, _ = dataset[0]
+        inp_time = dataset[0][INPUT_TIMESTAMP]
 
         dhours = dataset.dhours
         self.assertEqual(float(inp_time[1] - inp_time[0]), 2 * dhours * 3600.0)
@@ -1319,17 +1487,17 @@ class TestMultifilesDataset(unittest.TestCase):
     def test_timestamps_match_the_samples_they_came_from(self):
         # the stronger statement: the returned times are the dataset's own
         # times at the indices the data was read from
-        dataset = self._make(dt=3, n_history=1, return_timestamp=True, add_zenith=False)
+        dataset = self._make(dt=3, n_history=1, add_zenith=False)
 
-        _, _, inp_time, _ = dataset[5]
+        inp_time = dataset[5][INPUT_TIMESTAMP]
 
         expected = np.asarray([dataset.timestamps[5], dataset.timestamps[5 + 3]])
         self.assertTrue(compare_arrays("input timestamps", inp_time.numpy(), expected))
 
     def test_target_times_stride_by_dt(self):
-        dataset = self._make(dt=2, n_future=1, return_timestamp=True, add_zenith=False)
+        dataset = self._make(dt=2, n_future=1, add_zenith=False)
 
-        _, _, _, tar_time = dataset[0]
+        tar_time = dataset[0][TARGET_TIMESTAMP]
 
         self.assertEqual(float(tar_time[1] - tar_time[0]), 2 * dataset.dhours * 3600.0)
 
@@ -1338,15 +1506,21 @@ class TestMultifilesDataset(unittest.TestCase):
         # to drop its handles and reopen them on the other side
         import pickle
 
-        dataset = self._make()
+        dataset = self._make(add_zenith=True)
         before = dataset[3]
 
         revived = pickle.loads(pickle.dumps(dataset))
         after = revived[3]
 
-        for position, (original, restored) in enumerate(zip(before, after)):
-            with self.subTest(output=position):
-                self.assertTrue(compare_tensors(f"unpickled output {position}", restored, original))
+        self.assertEqual(set(after), set(before))
+        for key in (INPUT, TARGET, INPUT_TIMESTAMP, TARGET_TIMESTAMP):
+            with self.subTest(output=key):
+                self.assertTrue(compare_tensors(f"unpickled {key}", after[key], before[key]))
+        # the dynamic features too, which the revived dataset computes from its own coordinates
+        for side in (INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES):
+            self.assertEqual(set(after[side]), {ZENITH})
+            with self.subTest(output=side):
+                self.assertTrue(compare_tensors(f"unpickled {side}", after[side][ZENITH], before[side][ZENITH]))
 
     def test_reports_the_grid_the_files_carry(self):
         # the fixture writes its coordinates, so they should be what comes back
@@ -1404,7 +1578,7 @@ class TestMultifilesWb2(unittest.TestCase):
     def test_reads_the_same_values_as_the_store(self):
         dataset = self._make()
 
-        inp, _ = dataset[2]
+        inp = dataset[2][INPUT]
         expected = get_wb2_zarr_sample(self.train_path, 2)
 
         self.assertTrue(compare_arrays("wb2 through multifiles", inp[0].numpy(), expected, rtol=1e-5, atol=1e-6))
@@ -1415,6 +1589,225 @@ class TestMultifilesWb2(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self._make(channel_names=None)
         self.assertIn("channel_names", str(ctx.exception))
+
+
+def _parity_cases():
+    # loader, mode, n_history, n_future (target steps - 1, in eval mode via valid_autoreg_steps), zenith
+    cases = []
+    for loader in ["multifiles", "dummy"]:
+        for mode in ["train", "eval", "inference"]:
+            for n_history in [0, 2]:
+                for n_future in [0, 2]:
+                    for zenith in [False, True]:
+                        cases.append((loader, mode, n_history, n_future, zenith))
+    # every DALI loader starts a worker pool, so only a few representative cases; it has no inference mode
+    if _have_dali:
+        cases += [
+            ("dali", "eval", 0, 0, False),
+            ("dali", "eval", 2, 2, True),
+            ("dali", "eval", 0, 2, True),
+            ("dali", "train", 2, 0, True),
+        ]
+    return cases
+
+
+def _parity_name(func, num, param):
+    loader, mode, n_history, n_future, zenith = param.args
+    return f"{func.__name__}_{loader}_{mode}_h{n_history}_f{n_future}" + ("_zenith" if zenith else "")
+
+
+class TestLoaderParity(unittest.TestCase):
+    """
+    Every loader emits the same batch for the same configuration.
+
+    The other suites test each loader on its own, against the files. Here the
+    loaders are held to one contract, see :mod:`makani.utils.dataloaders.batch`:
+    the same keys and dynamic features, shapes, dtypes and one device; timestamps
+    that step by ``dt`` and a zenith angle that belongs to them; and, for DALI,
+    the same values as the multifiles dataset for the same window, matched by
+    time since the two count their samples differently (multifiles from the
+    first input step, DALI from the last).
+    """
+
+    @classmethod
+    def setUpClass(cls, path: Optional[str] = "/tmp"):
+        cls.tmpdir = tempfile.TemporaryDirectory(dir=path)
+        cls.train_path, cls.num_train, cls.valid_path, cls.num_valid, cls.stats_path, _, _ = init_hdf5_dataset(
+            cls.tmpdir.name
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmpdir.cleanup()
+
+    def setUp(self):
+        disable_tf32()
+
+    def _params(self, loader, mode, n_history, n_future, zenith):
+        params = init_dataset_params(
+            self.train_path,
+            self.valid_path,
+            self.stats_path,
+            batch_size=2,
+            n_history=n_history,
+            n_future=n_future,
+            normalization="zscore",
+            # DALI needs a worker, the torch loader is faster without one
+            num_data_workers=1 if loader == "dali" else 0,
+        )
+        params.valid_autoreg_steps = n_future
+        params.add_zenith = zenith
+        params.multifiles = loader == "multifiles"
+        params.enable_synthetic_data = loader == "dummy"
+        params.img_shape_x = IMG_SIZE_H
+        params.img_shape_y = IMG_SIZE_W
+        # without files to count, the dummy loader needs its number of samples
+        params.n_train_samples = params.n_eval_samples = 16
+        params.num_train = self.num_train
+        params.num_valid = self.num_valid
+        params.io_grid = [1, 1, 1]
+        params.io_rank = [0, 0, 0]
+        return params
+
+    def _batch(self, params, path, mode):
+        """The first batch of the loader; in inference mode, the first samples, collated as the inferencer does."""
+        from torch.utils.data import default_collate
+
+        dataloader, _, _ = get_dataloader(params, path, mode=mode, device=torch.device("cpu"))
+        if hasattr(dataloader, "close"):
+            self.addCleanup(dataloader.close)
+
+        if mode == "inference":
+            dataset = dataloader.dataset
+            return default_collate([dataset.get_sample_at_index(idx, return_target=False) for idx in range(2)])
+        return next(iter(dataloader))
+
+    def _reference(self, params, path):
+        """The multifiles dataset over the same files, with targets and zenith: the values to compare with."""
+        from makani.utils.dataloaders.data_loader_multifiles import MultifilesDataset
+
+        bias, scale = get_data_normalization(params)
+        return MultifilesDataset(
+            location=path,
+            dt=params.dt,
+            in_channels=params.in_channels,
+            out_channels=params.out_channels,
+            n_history=params.n_history,
+            n_future=params.valid_autoreg_steps,
+            add_zenith=True,
+            bias=bias,
+            scale=scale,
+            dataset_name=params.h5_path,
+            enable_logging=False,
+        )
+
+    def _assert_structure(self, batch, params, mode, n_history, n_future, zenith):
+        B = params.batch_size
+        grid = (IMG_SIZE_H, IMG_SIZE_W)
+        with_target = mode != "inference"
+        n_in, n_out = len(params.in_channels), len(params.out_channels)
+
+        self.assertEqual(set(batch), _TRAINING_KEYS if with_target else _INFERENCE_KEYS)
+
+        expected = {
+            INPUT: (B, n_history + 1, n_in, *grid),
+            INPUT_TIMESTAMP: (B, n_history + 1),
+        }
+        features = {INPUT_DYNAMIC_FEATURES: n_history + 1}
+        if with_target:
+            expected[TARGET] = (B, n_future + 1, n_out, *grid)
+            expected[TARGET_TIMESTAMP] = (B, n_future + 1)
+            features[TARGET_DYNAMIC_FEATURES] = n_future + 1
+
+        for key, shape in expected.items():
+            self.assertEqual(tuple(batch[key].shape), shape, key)
+            self.assertEqual(batch[key].dtype, torch.float64 if key.endswith("timestamp") else torch.float32, key)
+
+        for key, n_steps in features.items():
+            self.assertEqual(set(batch[key]), {ZENITH} if zenith else set(), key)
+            if zenith:
+                self.assertEqual(tuple(batch[key][ZENITH].shape), (B, n_steps, 1, *grid), key)
+                self.assertEqual(batch[key][ZENITH].dtype, torch.float32, key)
+
+        # the whole batch on one device
+        tensors = [batch[key] for key in expected] + [f for key in features for f in batch[key].values()]
+        self.assertEqual({t.device for t in tensors}, {batch[INPUT].device})
+
+    def _assert_times(self, batch, params, mode, zenith, reference):
+        step = params.dt * params.dhours * 3600.0
+        times = [batch[INPUT_TIMESTAMP].cpu()]
+        if mode != "inference":
+            times.append(batch[TARGET_TIMESTAMP].cpu())
+        window = torch.cat(times, dim=1)
+
+        # the input steps, then the target steps, dt apart
+        self.assertTrue(torch.all(torch.diff(window, dim=1) == step), "timestamps do not step by dt")
+
+        if not zenith:
+            return
+
+        # the zenith angle of every step belongs to that step's time
+        from makani.third_party.climt.zenith_angle_v2 import cos_zenith_angle
+        from makani.utils.dataloaders.data_helpers import get_date_from_timestamp
+
+        sides = [(INPUT_DYNAMIC_FEATURES, INPUT_TIMESTAMP)]
+        if mode != "inference":
+            sides.append((TARGET_DYNAMIC_FEATURES, TARGET_TIMESTAMP))
+        for features, timestamps in sides:
+            for b in range(batch[timestamps].shape[0]):
+                dates = np.array([get_date_from_timestamp(float(t)) for t in batch[timestamps][b].cpu()])
+                expected = cos_zenith_angle(dates, reference.lon_grid_local, reference.lat_grid_local)
+                actual = batch[features][ZENITH][b, :, 0].cpu().numpy()
+                self.assertTrue(
+                    compare_arrays(
+                        f"{features} zenith, sample {b}", actual, expected, atol=1e-5, rtol=0.0, shape_check=True
+                    )
+                )
+
+    def _assert_values_match_multifiles(self, batch, reference):
+        # the same window from the multifiles dataset, found by the time of its first input step
+        for b in range(batch[INPUT].shape[0]):
+            idx = reference.get_index_at_time(float(batch[INPUT_TIMESTAMP][b, 0]))
+            sample = reference.get_sample_at_index(idx)
+
+            with self.subTest(sample=b):
+                for key in [INPUT_TIMESTAMP, TARGET_TIMESTAMP]:
+                    self.assertTrue(torch.equal(batch[key][b].cpu(), sample[key]), key)
+                for key in [INPUT, TARGET]:
+                    self.assertTrue(
+                        compare_tensors(key, batch[key][b].cpu(), sample[key], atol=1e-5, rtol=1e-5, shape_check=True)
+                    )
+                for side in [INPUT_DYNAMIC_FEATURES, TARGET_DYNAMIC_FEATURES]:
+                    for name, feature in batch[side].items():
+                        self.assertTrue(
+                            compare_tensors(
+                                f"{side}/{name}",
+                                feature[b].cpu(),
+                                sample[side][name],
+                                atol=1e-5,
+                                rtol=0.0,
+                                shape_check=True,
+                            )
+                        )
+
+    @parameterized.expand(_parity_cases(), name_func=_parity_name)
+    def test_batch_follows_the_contract(self, loader, mode, n_history, n_future, zenith):
+        params = self._params(loader, mode, n_history, n_future, zenith)
+        path = params.train_data_path if mode == "train" else params.valid_data_path
+        batch = self._batch(params, path, mode)
+
+        self._assert_structure(batch, params, mode, n_history, n_future, zenith)
+
+        # the training dummy has placeholder times and zenith angles; its inference variant has real
+        # times, but placeholder zenith angles
+        if (loader == "dummy") and (mode != "inference"):
+            return
+        check_zenith = zenith and (loader != "dummy")
+        reference = self._reference(params, path) if (check_zenith or loader == "dali") else None
+        self._assert_times(batch, params, mode, check_zenith, reference)
+
+        if loader == "dali":
+            self._assert_values_match_multifiles(batch, reference)
 
 
 if __name__ == "__main__":

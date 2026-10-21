@@ -26,10 +26,11 @@ import torch
 
 from makani import Trainer, EnsembleTrainer, StochasticTrainer, AutoencoderTrainer
 from makani.utils import comm
+from makani.utils.dataloaders.batch import TARGET, batch_to_device
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from .testutils import disable_tf32, set_seed, get_default_parameters, init_hdf5_dataset
-from .testutils import H5_PATH, compare_tensors
+from .testutils import H5_PATH, compare_tensors, single_step_rollout
 
 
 def init_params(
@@ -118,7 +119,8 @@ def init_params(
     return params
 
 
-class TestTrainer(unittest.TestCase):
+class _TrainerTestCase(unittest.TestCase):
+    """The data, the experiment directory and the parameters the trainer tests share."""
 
     @classmethod
     def setUpClass(cls, path: Optional[str] = "/tmp"):
@@ -182,6 +184,9 @@ class TestTrainer(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
+
+class TestTrainer(_TrainerTestCase):
+
     test_parameters = [
         (Trainer, True, True, "cpu"),
         (EnsembleTrainer, True, True, "cpu"),
@@ -196,6 +201,18 @@ class TestTrainer(unittest.TestCase):
             (AutoencoderTrainer, False, False, "cuda"),
         ]
 
+    @staticmethod
+    def _forward(trainer, inp):
+        """The trained model on a flat input, with a flat output for the comparisons.
+
+        The StepWrapper takes a one-step rollout and returns the time axis
+        explicitly; the stochastic interpolant takes the time steps folded into
+        the channels.
+        """
+        if isinstance(trainer, StochasticTrainer):
+            return trainer.model(inp)
+        return trainer.model(single_step_rollout(inp.unsqueeze(1))).flatten(1, 2)
+
     @parameterized.expand(test_parameters, skip_on_empty=True)
     def test_trainer(self, trainer_handle, test_train, test_eval, devstring, verbose=False):
 
@@ -207,7 +224,6 @@ class TestTrainer(unittest.TestCase):
         self.trainer.train()
 
         # check that a checkpoint file exists
-        checkpoint_dir = os.path.join(self.params.experiment_dir, "training_checkpoints")
         with self.subTest(desc="checkpoint files"):
             self.assertTrue(os.path.isfile(self.params.checkpoint_path.format(mp_rank=comm.get_rank("model"))))
             self.assertTrue(os.path.isfile(self.params.best_checkpoint_path.format(mp_rank=comm.get_rank("model"))))
@@ -238,7 +254,7 @@ class TestTrainer(unittest.TestCase):
         inp.requires_grad = True
 
         # forward pass and remember the output
-        out_ref = self.trainer.model(inp)
+        out_ref = self._forward(self.trainer, inp)
         with self.subTest(desc="output shape"):
             self.assertEqual(out_ref.shape, out_shape)
 
@@ -254,23 +270,131 @@ class TestTrainer(unittest.TestCase):
         # test that the models produce the same results
         if test_eval:
             self.trainer_restored._set_eval()
-            out = self.trainer_restored.model(inp)
-            out_ref = self.trainer.model(inp)
+            out = self._forward(self.trainer_restored, inp)
+            out_ref = self._forward(self.trainer, inp)
             with self.subTest(desc="test output vs reference"):
                 self.assertTrue(compare_tensors("test output vs reference", out, out_ref, verbose=verbose))
 
         # redo this but in train mode
         if test_train:
             self.trainer._set_train()
-            out = self.trainer.model(inp)
+            out = self._forward(self.trainer, inp)
             with self.subTest(desc="train output vs reference roundtrip 1"):
                 self.assertTrue(compare_tensors("train output vs reference roundtrip 1", out, out_ref, verbose=verbose))
             out_ref = out
 
             self.trainer_restored._set_train()
-            out = self.trainer_restored.model(inp)
+            out = self._forward(self.trainer_restored, inp)
             with self.subTest(desc="train output vs reference roundtrip 2"):
                 self.assertTrue(compare_tensors("train output vs reference roundtrip 2", out, out_ref, verbose=verbose))
+
+
+class _RecordingMetrics:
+    """Stands in for the metrics handler of a trainer, and records what validation hands it."""
+
+    def __init__(self):
+        self.updates = []
+
+    def zero_buffers(self):
+        pass
+
+    def finalize(self):
+        return {}
+
+    def update(self, pred, targ, loss, idt):
+        self.updates.append((pred.clone(), targ.clone(), idt))
+
+
+class TestTrainerRollouts(_TrainerTestCase):
+    """
+    Training and validation over several steps.
+
+    Training runs end to end over a rollout of ``n_future + 1`` steps. The
+    validation over ``valid_autoreg_steps + 1`` lead times is then compared
+    with the rollout of the same batches through the trained model, with the
+    noise drawn from the same seed: the predictions handed to the metrics at
+    each lead time have to be the ones of that step, split into their ensemble
+    members, and the targets those of that step.
+    """
+
+    _NOISE = {"type": "diffusion", "mode": "concatenate", "n_channels": 1}
+    _VALID_STEPS = 2
+    _SEED = 1234
+
+    test_parameters = [
+        # trainer, n_future, push forward, input noise, ensemble size, zenith
+        (Trainer, 1, False, None, 1, False),
+        (Trainer, 1, True, None, 1, True),
+        (EnsembleTrainer, 1, False, _NOISE, 2, True),
+    ]
+
+    def _trainer(self, trainer_handle, n_future, push_forward, noise, ensemble_size, zenith):
+        params = self.params
+        params.n_future = n_future
+        params.valid_autoreg_steps = self._VALID_STEPS
+        params.multistep = {"push_forward": push_forward}
+        params.ensemble_size = params.local_ensemble_size = ensemble_size
+        params.add_zenith = zenith
+        if noise is not None:
+            params.input_noise = noise
+        return trainer_handle(params, 0, device=torch.device("cpu"))
+
+    @parameterized.expand(test_parameters, skip_on_empty=True)
+    def test_validation_matches_the_rollout(self, trainer_handle, n_future, push_forward, noise, E, zenith):
+        trainer = self._trainer(trainer_handle, n_future, push_forward, noise, E, zenith)
+        trainer.train()
+
+        pp = trainer.preprocessor
+        trainer.metrics = _RecordingMetrics()
+        pp.set_rng(reset=True, seed=self._SEED)
+        trainer.validate_one_epoch(trainer.epoch)
+        updates = trainer.metrics.updates
+
+        pp.set_rng(reset=True, seed=self._SEED)
+        trainer.model.eval()
+        n_steps = self._VALID_STEPS + 1
+        n_batches = 0
+        with torch.no_grad():
+            for data in trainer.valid_dataloader:
+                batch = batch_to_device(data, trainer.device)
+                rollout = trainer._rollout(batch, ensemble_size=E)
+                preds = trainer.model(rollout)
+
+                for k in range(n_steps):
+                    pred, targ, idt = updates[n_batches * n_steps + k]
+                    with self.subTest(batch=n_batches, step=k):
+                        self.assertEqual(idt, k)
+                        expected = pp.flatten_history(preds[:, k : k + 1])
+                        if trainer_handle is EnsembleTrainer:
+                            expected = rollout.unfold(expected)
+                        self.assertTrue(torch.equal(pred, expected), "predictions")
+                        self.assertTrue(torch.equal(targ, pp.flatten_history(batch[TARGET][:, k : k + 1])), "targets")
+                n_batches += 1
+
+        self.assertGreater(n_batches, 0)
+        self.assertEqual(len(updates), n_batches * n_steps)
+
+    def test_stochastic_validation_rolls_out(self):
+        # the interpolant trains on single steps, but validates over several, with the zenith angle
+        params = self.params
+        params.valid_autoreg_steps = self._VALID_STEPS
+        params.add_zenith = True
+        trainer = StochasticTrainer(params, 0, device=torch.device("cpu"))
+        trainer.train()
+
+        trainer.metrics = _RecordingMetrics()
+        trainer.validate_one_epoch(trainer.epoch)
+        updates = trainer.metrics.updates
+
+        n_steps = self._VALID_STEPS + 1
+        self.assertGreater(len(updates), 0)
+        self.assertEqual([idt for *_, idt in updates], list(range(n_steps)) * (len(updates) // n_steps))
+        for pred, targ, idt in updates:
+            with self.subTest(step=idt):
+                self.assertEqual(pred.shape[0], targ.shape[0])
+                self.assertEqual(pred.shape[1], params.local_ensemble_size)
+                self.assertEqual(tuple(pred.shape[2:]), tuple(targ.shape[1:]))
+                self.assertTrue(torch.isfinite(pred).all())
 
 
 if __name__ == "__main__":

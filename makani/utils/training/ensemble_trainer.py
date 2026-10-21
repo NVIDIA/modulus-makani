@@ -32,11 +32,11 @@ from makani.utils.profiling import Timer
 
 # makani depenedencies
 from makani.utils import LossHandler, MetricsHandler
-from makani.utils.functions import expand_ensemble
 from makani.utils.driver import Driver
 from makani.utils.training import Trainer
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
+from makani.utils.dataloaders.batch import batch_to_device, INPUT, TARGET
 from makani.utils.YParams import YParams
 
 # model registry
@@ -128,8 +128,7 @@ class EnsembleTrainer(Trainer):
 
         # init preprocessor and model
         with Timer() as timer:
-            self.multistep = self.params.n_future > 0
-            self.model = model_registry.get_model(self.params, multistep=self.multistep).to(self.device)
+            self.model = model_registry.get_model(self.params).to(self.device)
             self.preprocessor = self.model.preprocessor
         self.timers["model init"] = timer.time
 
@@ -212,27 +211,11 @@ class EnsembleTrainer(Trainer):
                 )
         self.timers["reduction hooks init"] = timer.time
 
-        # lets get one sample from the dataloader:
-        # set to train just to be safe
-        self._set_train()
-        # get sample and map to gpu
-        iterator = iter(self.train_dataloader)
-        data = next(iterator)
-        gdata = map(lambda x: x.to(self.device), data)
-        # extract unpredicted features
-        inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-        # flatten
-        inp = self.preprocessor.flatten_history(inp)
-        tar = self.preprocessor.flatten_history(tar)
-        # get shapes
-        inp_shape = inp.shape
-        tar_shape = tar.shape
-
         with Timer() as timer:
-            self._compile_model(inp_shape)
+            self._compile_model()
         self.timers["compile model"] = timer.time
 
-        # visualization wrapper:
+        # visualization wrapper: only world-rank 0 renders/logs; other ranks get None.
         with Timer() as timer:
             out_bias, out_scale = self.train_dataloader.get_output_normalization()
             self._setup_visualizer(out_bias, out_scale)
@@ -489,34 +472,19 @@ class EnsembleTrainer(Trainer):
 
         return
 
-    def _ensemble_step(self, inp: torch.Tensor, tar: torch.Tensor):
+    def _ensemble_step(self, batch):
         """
-        Single forward on a folded batch of size (B*E, ...).
+        The loss of a single forward of the rollout over the batch, with the ensemble folded into the batch dim.
 
-        The ensemble dim is carried explicitly as dim 1 through unsqueeze+repeat_interleave,
-        then flattened into dim 0 just for the model forward; the prediction reshapes back
-        to (B, E, ...) for the loss. Noise is drawn once at the folded batch so each
-        (batch, ensemble member) pair sees an independent sample.
+        The rollout folds the members into the batch dim, (B*E, ...), for one forward per step and
+        unfolds the predictions to (B, E, ...) for the loss; the targets stay at (B, ...). The noise
+        is drawn at the folded batch, so each (batch, ensemble member) pair sees an independent sample.
         """
-        E = self.params.local_ensemble_size
-        B = inp.shape[0]
+        rollout = self._rollout(batch, ensemble_size=self.params.local_ensemble_size)
+        pred = self.model_train(rollout)
 
-        # (B, C, H, W) -> (B*E, C, H, W) with ensemble dim folded into batch
-        # (E==1 short-circuits inside expand_ensemble, no allocation)
-        inp_flat = expand_ensemble(inp, E)
-
-        # pre-adjust the preprocessor's noise state to the folded batch; the model is then
-        # called with update_state=False so it consumes this fresh state directly.
-        self.preprocessor.update_internal_state(replace_state=True, batch_size=inp_flat.shape[0])
-
-        pred_flat = self.model_train(inp_flat, update_state=False)
-
-        # unflatten
-        pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
-
-        loss = self.loss_obj(pred, tar, inp=inp)
-
-        return pred, loss
+        # the losses take the ensemble as dim 1, even for a single local member
+        return self._loss(pred, batch[TARGET], batch[INPUT], rollout=rollout)
 
     def train_one_epoch(self, profiler=None):
         self.epoch += 1
@@ -541,29 +509,13 @@ class EnsembleTrainer(Trainer):
             train_steps += 1
             self.iters += 1
 
-            torch.cuda.nvtx.range_push(f"train step {train_steps}")
+            if torch.cuda.is_available():
+                torch.cuda.nvtx.range_push(f"train step {train_steps}")
             self.step_timer.begin_step()
 
-            # map to device; materialize to list so we can expand zenith features
-            gdata = [x.to(self.device) for x in data]
-
-            # When training with local_ensemble_size > 1 we fold the ensemble dim into the
-            # batch dim for a single forward pass. The cached unpredicted features (xz, yz)
-            # must therefore also carry an ensemble-expanded batch so shapes line up inside
-            # the preprocessor. x is expanded inside _ensemble_step (to preserve `inp.shape[0]`
-            # semantics below); y stays at its original batch since the loss expects (B, E, ...)
-            # pred vs (B, ...) target.
-            E = self.params.local_ensemble_size
-            if len(gdata) == 4:
-                gdata[2] = expand_ensemble(gdata[2], E)
-                gdata[3] = expand_ensemble(gdata[3], E)
-
-            # do preprocessing
-            inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-
-            # flatten the history
-            inp = self.preprocessor.flatten_history(inp)
-            tar = self.preprocessor.flatten_history(tar)
+            # map to device
+            batch = batch_to_device(data, self.device)
+            inp, tar = batch[INPUT], batch[TARGET]
 
             # assuming float32
             total_data_bytes += inp.nbytes + tar.nbytes
@@ -578,10 +530,10 @@ class EnsembleTrainer(Trainer):
             with self.autocast():
 
                 if do_update:
-                    pred, loss = self._ensemble_step(inp, tar)
+                    loss = self._ensemble_step(batch)
                 else:
                     with self.model_train.no_sync():
-                        pred, loss = self._ensemble_step(inp, tar)
+                        loss = self._ensemble_step(batch)
                 loss = loss * loss_scaling_fact
 
             # stop on a non-finite loss before it reaches the weights, on all ranks together
@@ -643,7 +595,8 @@ class EnsembleTrainer(Trainer):
             progress_bar.set_postfix(**pbar_postfix)
 
             self.step_timer.end_step()
-            torch.cuda.nvtx.range_pop()
+            if torch.cuda.is_available():
+                torch.cuda.nvtx.range_pop()
 
             # profiler step
             if profiler is not None:
@@ -697,7 +650,6 @@ class EnsembleTrainer(Trainer):
         # start the timer
         valid_start = time.time()
 
-        # create list of states for noised inputs:
         with torch.inference_mode():
             with torch.no_grad():
 
@@ -714,57 +666,34 @@ class EnsembleTrainer(Trainer):
                         torch.cuda.nvtx.range_push(f"eval step {eval_steps}")
                     self.step_timer.begin_step()
 
-                    # map to gpu; materialize to list so we can expand zenith features
-                    gdata = [x.to(self.device) for x in data]
+                    # map to gpu
+                    batch = batch_to_device(data, self.device)
 
-                    # When local_ensemble_size > 1, fold the ensemble dim into the batch dim
-                    # for a single forward pass per rollout step. The zenith features (xz, yz)
-                    # must be expanded so they line up with the folded-batch input; the target
-                    # (y) stays at the original batch — the loss expects (B, E, ...) pred against
-                    # (B, ...) target.
-                    E = self.params.local_ensemble_size
-                    if len(gdata) == 4:
-                        gdata[2] = expand_ensemble(gdata[2], E)
-                        gdata[3] = expand_ensemble(gdata[3], E)
+                    # the rollout folds the ensemble into the batch dim for a single forward
+                    # per step, (B*E, ...); the target stays at the original batch -- the loss
+                    # expects (B, E, ...) pred against (B, ...) target. The noise is replaced at
+                    # the first step and continued after it.
+                    tar = batch[TARGET]
+                    rollout = self._rollout(batch, ensemble_size=self.params.local_ensemble_size)
 
-                    # preprocess
-                    inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-                    inp = self.preprocessor.flatten_history(inp)
+                    # the losses and metrics take the channels of a single step
+                    flatten = self.preprocessor.flatten_history
 
-                    B = inp.shape[0]
+                    # one prediction at a time, so that each lead time is released after its metrics
+                    steps = self._eval_steps(rollout)
 
-                    # expand the input batch to (B*E, ...) for the folded-batch forward
-                    inp = expand_ensemble(inp, E)
+                    # loop over the lead times of the rollout; next(steps) stays inside the autocast
+                    # below, so the model runs under it but the metrics do not
+                    num_lead_times = rollout.n_steps
+                    for idt in range(num_lead_times):
 
-                    # split list of targets (stays at batch B)
-                    tarlist = torch.split(tar, 1, dim=1)
-
-                    # draw a fresh stationary noise state at the folded batch for this episode
-                    self.preprocessor.update_internal_state(replace_state=True, batch_size=inp.shape[0])
-
-                    # loop over lead times
-                    for idt, targ in enumerate(tarlist):
-
-                        # flatten history of the target
-                        targ = self.preprocessor.flatten_history(targ)
+                        targ = flatten(tar[:, idt : idt + 1])
 
                         with self.autocast():
-                            # single forward on the folded batch: at idt==0 the noise state was
-                            # just drawn fresh, so skip the stepper's internal update; for
-                            # subsequent steps run the standard AR update.
-                            pred_flat = self.model_eval(
-                                inp,
-                                update_state=(idt != 0),
-                                replace_state=False,
-                            )
+                            # split the ensemble back out, (B, E, ...), for the loss
+                            pred = rollout.unfold(flatten(next(steps)))
 
-                            # advance the input history / unpredicted features once per step
-                            inp = self.preprocessor.append_history(inp, pred_flat, idt, update_state=True)
-
-                            # reshape back to (B, E, ...) for the loss
-                            pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
-
-                            loss = self.loss_obj(pred, targ, None)
+                            loss = self.loss_obj(pred, targ)
 
                             # log the loss
                             progress_bar.set_postfix({"loss": loss.item()})
@@ -778,7 +707,7 @@ class EnsembleTrainer(Trainer):
                             pred_gather = self.metrics._gather_input(pred_gather)
                             targ_gather = self.metrics._gather_input(targ_gather)
 
-                            self._visualize_step(pred_gather, targ_gather, eval_steps, idt, len(tarlist))
+                            self._visualize_step(pred_gather, targ_gather, eval_steps, idt, num_lead_times)
 
                         # update metrics
                         self.metrics.update(pred, targ, loss, idt)

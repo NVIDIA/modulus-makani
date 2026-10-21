@@ -31,6 +31,7 @@ from torch_harmonics.distributed import compute_split_shapes
 
 # for grid conversion
 from makani.utils.dataloaders.data_shapes import DataShapes
+from makani.utils.dataloaders.batch import make_batch
 from makani.utils.grids import GridConverter
 
 # data helpers
@@ -69,7 +70,6 @@ class DummyLoader(object):
         longitudes: Optional[np.array] = None,
         data_grid_type: Optional[str] = "equiangular",
         model_grid_type: Optional[str] = "equiangular",
-        return_timestamp: Optional[bool] = False,
         return_target: Optional[bool] = True,
         dataset_name: Optional[str] = "fields",
         crop_size: Optional[Tuple[int, int]] = (None, None),
@@ -97,7 +97,6 @@ class DummyLoader(object):
         self.img_shape = img_shape
         self.device = device
         self.subsampling_factor = subsampling_factor
-        self.return_timestamp = return_timestamp
         self.return_target = return_target
         self.io_grid = io_grid[1:]
         self.io_rank = io_rank[1:]
@@ -127,11 +126,12 @@ class DummyLoader(object):
                 dtype=torch.float32,
                 device=self.device,
             )
-            self.zen_tar_dummy = torch.zeros(
-                (self.batch_size, self.n_future + 1, 1, self.return_shape[0], self.return_shape[1]),
-                dtype=torch.float32,
-                device=self.device,
-            )
+            if self.return_target:
+                self.zen_tar_dummy = torch.zeros(
+                    (self.batch_size, self.n_future + 1, 1, self.return_shape[0], self.return_shape[1]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
 
         # grid types (lat_lon_local may be a list if auto-created; coerce to tensor)
         self.grid_converter = GridConverter(
@@ -179,7 +179,7 @@ class DummyLoader(object):
 
         # perform a sanity check here
         if (self.n_samples_per_epoch == 0) or (self.n_samples_per_epoch is None):
-            raise RuntimeError("You have noit specified a valid number of samples per epoch.")
+            raise RuntimeError("You have not specified a valid number of samples per epoch.")
 
         # determine local read size:
         # sanitize the crops first
@@ -248,8 +248,10 @@ class DummyLoader(object):
         logging.info(
             f"Number of examples: {self.n_samples_per_epoch}. Image Shape: {self.img_shape[0]} x {self.img_shape[1]} x {self.n_in_channels_local}"
         )
+        # the window counts its latest step too, as in the other loaders
         logging.info(
-            f"Including {self.dhours*self.dt*self.n_history} hours of past history in training at a frequency of {self.dhours*self.dt} hours"
+            f"Including {self.dhours * self.dt * (self.n_history + 1)} hours of past history in training at a "
+            f"frequency of {self.dhours * self.dt} hours"
         )
         logging.info("WARNING: using dummy data")
 
@@ -269,10 +271,9 @@ class DummyLoader(object):
         self.inp.uniform_()
         self.tar.uniform_()
 
-        if self.return_timestamp:
-            self.inp_time = torch.zeros((self.batch_size, self.n_history + 1), dtype=torch.float64)
-            if self.return_target:
-                self.tar_time = torch.ones((self.batch_size, self.n_future + 1), dtype=torch.float64)
+        # the values are as meaningless as the payload; they are there because every batch has them
+        self.inp_time = torch.zeros((self.batch_size, self.n_history + 1), dtype=torch.float64, device=self.device)
+        self.tar_time = torch.ones((self.batch_size, self.n_future + 1), dtype=torch.float64, device=self.device)
 
         self.in_bias = np.zeros((1, self.n_in_channels, 1, 1)).astype(np.float32)
         self.in_scale = np.ones((1, self.n_in_channels, 1, 1)).astype(np.float32)
@@ -296,21 +297,14 @@ class DummyLoader(object):
         if self.sample_idx < self.n_samples_shard:
             self.sample_idx += 1
 
-            result = (self.inp,)
-            if self.return_target:
-                result += (self.tar,)
-
-            if self.add_zenith:
-                result += (self.zen_inp_dummy,)
-                if self.return_target:
-                    result += (self.zen_tar_dummy,)
-
-            if self.return_timestamp:
-                result += (self.inp_time,)
-                if self.return_target:
-                    result += (self.tar_time,)
-
-            return result
+            return make_batch(
+                inp=self.inp,
+                inp_timestamp=self.inp_time,
+                tar=self.tar if self.return_target else None,
+                tar_timestamp=self.tar_time if self.return_target else None,
+                inp_zenith=self.zen_inp_dummy if self.add_zenith else None,
+                tar_zenith=self.zen_tar_dummy if (self.add_zenith and self.return_target) else None,
+            )
         else:
             raise StopIteration()
 
@@ -380,23 +374,19 @@ class DummyInferenceDataset(DummyLoader, torch.utils.data.Dataset):
         return self.timestamps[global_idx + self.dt * offset_start : global_idx + self.dt * offset_end : self.dt]
 
     def get_sample_at_index(self, global_idx, return_target=True):
-        result = (self.sample_inp,)
+        inp_time = self._timestamps_at(global_idx, 0, self.n_history + 1)
+        tar_time = None
         if return_target:
-            result += (self.sample_tar,)
+            tar_time = self._timestamps_at(global_idx, self.n_history + 1, self.n_history + self.n_future + 2)
 
-        if self.add_zenith:
-            result += (self.sample_zen,)
-            if return_target:
-                result += (self.sample_zen_tar,)
-
-        if self.return_timestamp:
-            inp_time = self._timestamps_at(global_idx, 0, self.n_history + 1)
-            result += (torch.as_tensor(inp_time, dtype=torch.float64),)
-            if return_target:
-                tar_time = self._timestamps_at(global_idx, self.n_history + 1, self.n_history + self.n_future + 2)
-                result += (torch.as_tensor(tar_time, dtype=torch.float64),)
-
-        return result
+        return make_batch(
+            inp=self.sample_inp,
+            inp_timestamp=torch.as_tensor(inp_time, dtype=torch.float64),
+            tar=self.sample_tar if return_target else None,
+            tar_timestamp=torch.as_tensor(tar_time, dtype=torch.float64) if return_target else None,
+            inp_zenith=self.sample_zen if self.add_zenith else None,
+            tar_zenith=self.sample_zen_tar if (self.add_zenith and return_target) else None,
+        )
 
     def __getitem__(self, global_idx):
         return self.get_sample_at_index(global_idx, return_target=self.return_target)

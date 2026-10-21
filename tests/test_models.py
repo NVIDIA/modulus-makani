@@ -16,6 +16,7 @@
 import sys
 import os
 import unittest
+import warnings
 from parameterized import parameterized, parameterized_class
 
 import torch
@@ -25,7 +26,7 @@ from makani.utils import checkpoint_helpers
 from makani.utils import LossHandler
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from .testutils import disable_tf32, set_seed, get_default_parameters, compare_tensors
+from .testutils import disable_tf32, set_seed, get_default_parameters, compare_tensors, single_step_rollout
 
 _devices = [(torch.device("cpu"),)]
 if torch.cuda.is_available():
@@ -72,8 +73,7 @@ class TestModels(unittest.TestCase):
         if nettype == "DebugNet":
             return
 
-        multistep = self.params.n_future > 0
-        model = model_registry.get_model(self.params, multistep=multistep).to(self.device)
+        model = model_registry.get_model(self.params).to(self.device)
 
         inp_shape = (
             self.params.batch_size,
@@ -93,7 +93,7 @@ class TestModels(unittest.TestCase):
         inp.requires_grad = True
 
         # forward pass and check shapes
-        out = model(inp)
+        out = model(single_step_rollout(inp.unsqueeze(1))).squeeze(1)
         self.assertEqual(out.shape, out_shape)
 
         # backward pass and check gradients are not None
@@ -142,7 +142,7 @@ class TestModels(unittest.TestCase):
         loss_obj = LossHandler(self.params).to(self.device)
 
         # get model
-        model = model_registry.get_model(self.params, multistep=False).to(self.device)
+        model = model_registry.get_model(self.params).to(self.device)
 
         batch_size = self.params.batch_size * 2
         inp_shape = (batch_size, self.params.N_in_channels, self.params.img_shape_x, self.params.img_shape_y)
@@ -156,7 +156,7 @@ class TestModels(unittest.TestCase):
         # forward pass
         model.zero_grad(set_to_none=True)
 
-        out_single = model(inp)
+        out_single = model(single_step_rollout(inp.unsqueeze(1))).squeeze(1)
         loss = loss_obj(out_single, tar)
         # backward pass
         loss.backward()
@@ -177,7 +177,7 @@ class TestModels(unittest.TestCase):
         tar_tmp = tar_split[0].detach().clone()
 
         # step 1
-        out_double = model(inp_tmp)
+        out_double = model(single_step_rollout(inp_tmp.unsqueeze(1))).squeeze(1)
         loss = loss_obj(out_double, tar_tmp) / 2.0
         loss.backward()
         igrad_double = inp_tmp.grad.clone()
@@ -187,7 +187,7 @@ class TestModels(unittest.TestCase):
         tar_tmp = tar_split[1].detach().clone()
 
         # step 2
-        out = model(inp_tmp)
+        out = model(single_step_rollout(inp_tmp.unsqueeze(1))).squeeze(1)
         loss = loss_obj(out, tar_tmp) / 2.0
         loss.backward()
         out_double = torch.cat([out_double, out], dim=0)
@@ -219,6 +219,28 @@ class TestModels(unittest.TestCase):
                         self.assertTrue(
                             compare_tensors(f"weight gradient {key}", wgrad_double, wgrad_single, atol, rtol, verbose)
                         )
+
+
+class TestGetModelMultistep(unittest.TestCase):
+    """``multistep`` no longer selects a wrapper; asking for it warns rather than doing nothing silently."""
+
+    def setUp(self):
+        self.params = get_default_parameters()
+        self.params.nettype = "SFNO"
+
+    def test_multistep_warns(self):
+        with self.assertWarnsRegex(FutureWarning, "multistep is deprecated"):
+            model_registry.get_model(self.params, multistep=True)
+
+    def test_default_does_not_warn(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FutureWarning)
+            model_registry.get_model(self.params)
+            model_registry.get_model(self.params, multistep=False)
+
+    def test_unknown_arguments_are_refused(self):
+        with self.assertRaises(TypeError):
+            model_registry.get_model(self.params, multi_step=True)
 
 
 if __name__ == "__main__":

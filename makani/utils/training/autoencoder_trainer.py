@@ -31,6 +31,7 @@ from makani.utils import LossHandler, MetricsHandler
 from makani.utils.driver import Driver
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
+from makani.utils.dataloaders.batch import batch_to_device, INPUT, TARGET
 from makani.utils.YParams import YParams
 
 # model registry
@@ -113,8 +114,7 @@ class AutoencoderTrainer(Driver):
             save_model_package(self.params)
 
         # init preprocessor and model
-        self.multistep = self.params.n_future > 0
-        self.model = model_registry.get_model(self.params, multistep=self.multistep).to(self.device)
+        self.model = model_registry.get_model(self.params).to(self.device)
         self.preprocessor = self.model.preprocessor
 
         # print aux channel names:
@@ -182,23 +182,7 @@ class AutoencoderTrainer(Driver):
                 static_graph=False,
             )
 
-        # lets get one sample from the dataloader:
-        # set to train just to be safe
-        self._set_train()
-        # get sample and map to gpu
-        iterator = iter(self.train_dataloader)
-        data = next(iterator)
-        gdata = map(lambda x: x.to(self.device), data)
-        # extract unpredicted features
-        inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-        # flatten
-        inp = self.preprocessor.flatten_history(inp)
-        tar = self.preprocessor.flatten_history(tar)
-        # get shapes
-        inp_shape = inp.shape
-        tar_shape = tar.shape
-
-        self._compile_model(inp_shape)
+        self._compile_model()
 
         out_bias, out_scale = self.train_dataloader.get_output_normalization()
         self._setup_visualizer(out_bias, out_scale)
@@ -273,7 +257,7 @@ class AutoencoderTrainer(Driver):
             self.logger.info("Number of trainable model parameters: {}".format(pcount))
 
     # jit compilation is currently disabled
-    def _compile_model(self, inp_shape):
+    def _compile_model(self):
         self.model_train = self.model
         self.model_eval = self.model
 
@@ -511,13 +495,11 @@ class AutoencoderTrainer(Driver):
             self.iters += 1
 
             # map to device
-            gdata = map(lambda x: x.to(self.device), data)
+            batch = batch_to_device(data, self.device)
+            tar = batch[TARGET]
 
-            # do preprocessing
-            inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-
-            # flatten the history
-            inp = self.preprocessor.flatten_history(inp)
+            # the autoencoder takes the time steps folded into the channels
+            inp = self.preprocessor.flatten_history(batch[INPUT])
 
             # assuming float32
             total_data_bytes += inp.nbytes + tar.nbytes
@@ -661,14 +643,11 @@ class AutoencoderTrainer(Driver):
                     eval_steps += 1
 
                     # map to gpu
-                    gdata = map(lambda x: x.to(self.device), data)
+                    batch = batch_to_device(data, self.device)
 
-                    # preprocess
-                    inp, _ = self.preprocessor.cache_unpredicted_features(*gdata)
-                    inp = self.preprocessor.flatten_history(inp)
-
-                    # do autoregression
-                    inpt = inp
+                    # the autoencoder reconstructs its input, with the time steps folded into
+                    # the channels
+                    inpt = self.preprocessor.flatten_history(batch[INPUT])
 
                     # FW pass
                     with self.autocast():
@@ -707,9 +686,6 @@ class AutoencoderTrainer(Driver):
 
                     # put in the metrics handler
                     self.metrics.update(pred, inpt, loss, 0)
-
-                    # append history
-                    inpt = self.preprocessor.append_history(inpt, pred, 0)
 
                 # create final logs
                 logs = self.metrics.finalize()

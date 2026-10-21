@@ -964,7 +964,7 @@ class _IconFixture(unittest.TestCase):
         self.assertTrue(np.array_equal(np.isnan(got), np.isnan(want)), f"{msg}: fills are in different places")
 
         finite = ~np.isnan(want)
-        self.assertTrue(compare_arrays(msg, got[finite], want[finite], atol=1e-5, rtol=1e-5, verbose=True))
+        self.assertTrue(compare_arrays(msg, got[finite], want[finite], atol=1e-5, rtol=1e-5, verbose=False))
 
     @classmethod
     def setUpClass(cls):

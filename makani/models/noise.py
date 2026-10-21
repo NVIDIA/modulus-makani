@@ -165,13 +165,24 @@ class BaseNoiseS2(nn.Module):
                 persistent=False,
             )
 
+    def _set_state(self, state):
+        """
+        Replace the state by a new tensor, never writing into the current one.
+
+        The current state may still be in the autograd graph, as for learnable stateful noise
+        during a rollout, see :meth:`DiffusionNoiseS2.update`, or be an inference tensor, if it
+        was written in inference mode, as in validation or inference. Writing into it in place
+        would corrupt the backward of the steps that used it, or fail outside inference mode.
+        """
+        self._buffers["state"] = state
+
     def is_stateful(self):
         r"""
         Whether the noise carries state across calls.
 
         Callers use this to decide whether the noise module must be
-        checkpointed, reset between rollouts, or kept in sync across ensemble
-        members. Must be overridden by subclasses.
+        checkpointed, may be resized mid-sequence, or kept in sync across
+        ensemble members. Must be overridden by subclasses.
 
         Returns
         -------
@@ -225,20 +236,20 @@ class BaseNoiseS2(nn.Module):
         r"""
         Zero the internal state, optionally resizing it.
 
-        Call this between rollouts so a new forecast does not inherit the noise
-        trajectory of the previous one.
+        Not needed between rollouts driven by a
+        :class:`~makani.utils.dataloaders.rollout.Rollout`, which replaces the
+        state at its first step.
 
         Parameters
         ----------
         batch_size : int, optional
             New batch size. If given and different from the current one, the
-            state buffer is reallocated; otherwise the existing buffer is
-            zeroed in place.
+            state is reallocated at that size.
         """
         if batch_size is not None:
             self._ensure_state(batch_size)
         with torch.no_grad():
-            self.state.zero_()
+            self._set_state(torch.zeros_like(self.state))
 
     def update(self, replace_state=False, batch_size=None):
         r"""
@@ -271,7 +282,7 @@ class BaseNoiseS2(nn.Module):
             if self.reflect:
                 newstate = -newstate
 
-            self.state.copy_(newstate)
+        self._set_state(newstate)
 
         return
 
@@ -336,27 +347,29 @@ class BaseNoiseS2(nn.Module):
 
     def set_tensor_state(self, newstate):
         r"""
-        Overwrite the spectral state, resizing the batch dimension if needed.
+        Replace the spectral state, taking on the batch size of the new one.
+
+        The state becomes a detached copy of ``newstate``, on the device and
+        with the dtype of the current one, see :meth:`_set_state`: the caller's
+        tensor is never written to, nor kept.
 
         Parameters
         ----------
         newstate : torch.Tensor
             Replacement state. Everything beyond the batch dimension must match
-            the module's expected layout; only the batch size may differ, and
-            the buffer is reallocated to accommodate it.
+            the module's expected layout; only the batch size may differ.
 
         Raises
         ------
         ValueError
-            If the shape beyond the batch dimension does not match. Checked
-            up front so a mismatch reports the expected and actual layouts,
-            rather than failing later inside the copy.
+            If the shape beyond the batch dimension does not match, so that a
+            state of the wrong layout is never installed.
         """
         # Validate the state layout (everything beyond the batch dim) matches this
         # noise module's expected suffix BEFORE touching `self.state`. Only the batch
-        # dim may differ — it is auto-resized via `_ensure_state`. Any other
+        # dim may differ, the state takes the batch of the new one. Any other
         # difference raises `ValueError` up-front with a useful message instead of
-        # silently mutating the state into a bad shape and failing at `copy_()`.
+        # silently installing a state of the wrong layout.
         expected_suffix = tuple(self._state_shape_suffix)
         actual_suffix = tuple(newstate.shape[1:]) if newstate.dim() >= 1 else tuple(newstate.shape)
         if actual_suffix != expected_suffix:
@@ -366,10 +379,9 @@ class BaseNoiseS2(nn.Module):
                 f"(full newstate.shape={tuple(newstate.shape)}, "
                 f"current state.shape={tuple(self.state.shape)})."
             )
-        if tuple(newstate.shape) != tuple(self.state.shape):
-            self._ensure_state(newstate.shape[0])
+        # a copy on the device and in the dtype of the state, so that the caller can keep using its tensor
         with torch.no_grad():
-            self.state.copy_(newstate)
+            self._set_state(newstate.detach().to(device=self.state.device, dtype=self.state.dtype).clone())
         return
 
 
@@ -817,7 +829,8 @@ class DiffusionNoiseS2(BaseNoiseS2):
         -------
         bool
             Always ``True``: each step is correlated with the previous one, so
-            the state must be checkpointed and reset between rollouts.
+            the state must be checkpointed, and replaced or restored at the
+            start of a rollout.
         """
         return True
 
@@ -863,25 +876,29 @@ class DiffusionNoiseS2(BaseNoiseS2):
         if batch_size is not None:
             self._ensure_state(batch_size)
 
+        # the innovations are drawn without gradients
         with torch.no_grad():
-            with amp.autocast(device_type=self.state.device.type, enabled=False):
-                # draw either the full T-step history (replace) or a single step (AR)
-                if replace_state:
-                    eta_l = torch.empty_like(self.state)
-                else:
-                    B = self.state.shape[0]
-                    eta_l = torch.empty(
-                        (B, 1, self.num_channels, self.lmax_local, self.mmax_local, 2),
-                        dtype=self.state.dtype,
-                        device=self.state.device,
-                    )
-                if self.state.is_cuda:
-                    eta_l.normal_(mean=0.0, std=1.0, generator=self.rng_gpu)
-                else:
-                    eta_l.normal_(mean=0.0, std=1.0, generator=self.rng_cpu)
+            # draw either the full T-step history (replace) or a single step (AR)
+            if replace_state:
+                eta = torch.empty_like(self.state)
+            else:
+                B = self.state.shape[0]
+                eta = torch.empty(
+                    (B, 1, self.num_channels, self.lmax_local, self.mmax_local, 2),
+                    dtype=self.state.dtype,
+                    device=self.state.device,
+                )
+            if self.state.is_cuda:
+                eta.normal_(mean=0.0, std=1.0, generator=self.rng_gpu)
+            else:
+                eta.normal_(mean=0.0, std=1.0, generator=self.rng_cpu)
 
+        # the recurrence keeps its graph if the noise is learnable: phi and sigma_l enter the
+        # state only here, and get their gradients through it in the steps that use the state
+        with torch.set_grad_enabled(self.learnable and torch.is_grad_enabled()):
+            with amp.autocast(device_type=self.state.device.type, enabled=False):
                 # multiply by sigma
-                eta_l = self.sigma_l * eta_l
+                eta_l = self.sigma_l * eta
 
                 # reflect if required:
                 if self.reflect:
@@ -896,15 +913,18 @@ class DiffusionNoiseS2(BaseNoiseS2):
                     else:
                         newstate = self.phi * self.state + eta_l
                 else:
-                    newstate = eta_l
-                    # the very first element in the time history requires a different weighting to sample the stationary distribution
-                    newstate[:, 0, ...] = newstate[:, 0, ...] / torch.sqrt(1.0 - self.phi**2)
+                    # the very first element in the time history requires a different weighting to sample the
+                    # stationary distribution; out of place, so that the graph stays intact
+                    newstate = torch.cat([eta_l[:, :1] / torch.sqrt(1.0 - self.phi**2), eta_l[:, 1:]], dim=1)
                     # get the right history by multiplying with the discount matrix
                     if self.num_time_steps > 1:
                         newstate = torch.einsum("ctr,brclmu->btclmu", self.discount, newstate).contiguous()
 
-                # shape matches self.state after _ensure_state above
-                self.state.copy_(newstate)
+        # if the noise is learnable, the state is the tensor of the recurrence, so that the graph reaches phi
+        # and sigma_l. A rollout has to replace the state at its first step, or restore a detached snapshot
+        # (Rollout(noise_state=...)): continuing the live state of a previous rollout would chain into the
+        # graph of that rollout, which is gone after its backward
+        self._set_state(newstate)
 
         return
 
@@ -1088,7 +1108,7 @@ class DummyNoiseS2(BaseNoiseS2):
                 else:
                     newstate.normal_(mean=0.0, std=1.0, generator=self.rng_cpu)
 
-            self.state.copy_(newstate)
+        self._set_state(newstate)
 
         return
 

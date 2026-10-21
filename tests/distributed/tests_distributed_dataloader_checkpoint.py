@@ -27,6 +27,7 @@ import torch.distributed as dist
 from makani.utils import comm
 from makani.utils.driver import Driver
 from makani.utils.dataloader import get_dataloader
+from makani.utils.dataloaders.batch import INPUT
 
 from ..testutils import init_hdf5_dataset, compare_arrays
 from ..test_dataloader import init_dataset_params, get_sample
@@ -144,7 +145,7 @@ class TestDistributedDataloaderCheckpoint(unittest.TestCase):
         """Fingerprint the next ``num_steps`` batches of the loader."""
         fps = []
         for _ in range(num_steps):
-            inp = next(iterator)[0]
+            inp = next(iterator)[INPUT]
             for b in range(inp.shape[0]):
                 fps.append(inp[b].cpu().numpy().tobytes())
         return fps
@@ -345,7 +346,7 @@ class TestDistributedDataloaderCheckpoint(unittest.TestCase):
         # the normalization in the pipeline, so demanding bitwise equality would tie
         # the test to that being reproducible down to the last ulp.
         iterator = iter(restored_loader)
-        samples = [next(iterator)[0] for _ in range(num_compared)]
+        samples = [next(iterator)[INPUT] for _ in range(num_compared)]
         arrays = [np.squeeze(sample.cpu().numpy()) for sample in samples]
 
         # the shard is what the ranks are supposed to disagree on; without this the

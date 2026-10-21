@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from makani.models.preprocessor import Preprocessor2D
+from makani.utils.dataloaders.rollout import Rollout, RolloutStep
 
 
 def _assert_checkpoint_safe(module: nn.Module):
@@ -46,139 +49,35 @@ def _assert_checkpoint_safe(module: nn.Module):
         )
 
 
-class SingleStepWrapper(nn.Module):
+class StepWrapper(nn.Module):
     r"""
-    Bind a model to its preprocessor for a single forecast step.
+    Bind a model to its preprocessor.
 
-    Wraps the network so callers can hand it raw data and get a prediction back
-    in physical units, without having to replicate the preprocessing pipeline at
-    every call site. One ``forward`` performs: state update, appending
-    unpredicted and static features, history normalization, the model forward,
-    bias correction, and denormalization of the output.
+    Wraps the network so callers can hand it data as the dataloader emits it
+    and get predictions back in the same space, without having to replicate
+    the preprocessing pipeline at every call site. That is the data space: the
+    fields normalized by the dataset statistics, which the dataloader already
+    applies and this wrapper never undoes. Each step performs: appending the
+    dynamic features and the noise, history normalization, packing the input
+    for the network, the model forward, bias correction, and the history
+    denormalization of the output.
 
-    Parameters
-    ----------
-    params : ParamsBase
-        Configuration, forwarded to :class:`~makani.models.preprocessor.Preprocessor2D`.
-    model_handle : callable
-        Zero-argument factory returning the network to wrap.
+    ``forward`` takes a :class:`~makani.utils.dataloaders.rollout.Rollout` and
+    runs the model over all of its steps; :meth:`steps` hands out the
+    predictions one at a time instead, so that an evaluation can release each
+    one before the next, rather than keep all lead times. The rollout carries the input
+    window, the dynamic features and the noise sample of each step, so the
+    preprocessor keeps no state between steps, and the history statistics of a
+    step are passed from its normalization to its denormalization. Outside a
+    rollout, :meth:`predict` and :meth:`encode` take one window, its dynamic
+    features and its noise sample directly, e.g. for the model package.
 
-    See Also
-    --------
-    MultiStepWrapper : the autoregressive multi-step counterpart.
-    """
+    Input and output keep the time axis explicit; only the network itself sees
+    the time steps folded into its channels.
 
-    def __init__(self, params, model_handle):
-        super().__init__()
-        self.preprocessor = Preprocessor2D(params)
-        self.model = model_handle()
-
-    def _preprocess(self, inp, update_state=True, replace_state=True):
-        """Run the shared input pipeline for one step.
-
-        The stochastic state is sized to THIS call's batch. The noise module is
-        constructed with ``params.batch_size`` -- a training setting, and 1 for a
-        packaged model -- but inference legitimately drives it with other
-        batches, e.g. an ensemble pushing B*E members through as a single
-        batched forward. Without this, ``append_unpredicted_features`` rejects
-        the call with "batch mismatch between input_noise state (1) and input".
-        ``_ensure_state`` reallocates only when the batch actually changes, so
-        the steady-state cost is zero; the flip side is that changing the batch
-        mid-rollout discards a stateful noise module's history.
-        """
-        # update internal state
-        if update_state:
-            self.preprocessor.update_internal_state(replace_state=replace_state, batch_size=inp.shape[0])
-
-        # append unpredicted features
-        inpa = self.preprocessor.append_unpredicted_features(inp)
-
-        # now normalize
-        self.preprocessor.history_compute_stats(inpa)
-        inpan = self.preprocessor.history_normalize(inpa, target=False)
-
-        # now add static features if requested
-        return self.preprocessor.add_static_features(inpan)
-
-    def forward(self, inp, update_state=True, replace_state=True):
-        r"""
-        Predict a single step from raw input.
-
-        Parameters
-        ----------
-        inp : torch.Tensor
-            Input of shape ``(B, (n_history + 1) * C, H, W)`` in physical units.
-        update_state : bool, optional
-            Advance the stochastic noise state before the forward pass, by
-            default ``True``.
-        replace_state : bool, optional
-            Draw a fresh noise state rather than taking one autoregressive
-            step, by default ``True``. Required if the batch size changed since
-            the last call and the noise is stateful.
-
-        Returns
-        -------
-        torch.Tensor
-            Prediction of shape ``(B, C_out, H, W)``, denormalized back to
-            physical units.
-        """
-        inpans = self._preprocess(inp, update_state=update_state, replace_state=replace_state)
-
-        # forward pass
-        yn = self.model(inpans)
-
-        # perform bias correction if requested
-        yn = self.preprocessor.correct_bias(yn)
-
-        # undo normalization
-        y = self.preprocessor.history_denormalize(yn, target=True)
-
-        return y
-
-    def encode_process(self, inp, update_state=True, replace_state=True):
-        r"""Prepare one input and return backbone features before decoding.
-
-        Shares :meth:`_preprocess` with :meth:`forward`, so the preprocessing is
-        identical by construction; only the decoder, bias correction, and target
-        denormalization are skipped.
-
-        Parameters
-        ----------
-        inp : torch.Tensor
-            Input of shape ``(B, (n_history + 1) * C, H, W)`` in physical units.
-        update_state : bool, optional
-            Advance the stochastic noise state first, by default ``True``.
-        replace_state : bool, optional
-            Draw a fresh noise state rather than stepping, by default ``True``.
-
-        Returns
-        -------
-        torch.Tensor
-            Latent features of shape ``(B, embed_dim, h, w)`` on the model's
-            internal grid.
-
-        Raises
-        ------
-        NotImplementedError
-            If the wrapped model does not expose ``encode_process``.
-        """
-        if not hasattr(self.model, "encode_process"):
-            raise NotImplementedError(f"{type(self.model).__name__} does not expose encode_process().")
-
-        inpans = self._preprocess(inp, update_state=update_state, replace_state=replace_state)
-
-        return self.model.encode_process(inpans)
-
-
-class MultiStepWrapper(nn.Module):
-    r"""
-    Bind a model to its preprocessor for an autoregressive rollout.
-
-    Runs the wrapped model for ``n_future + 1`` steps, feeding each prediction
-    back in as the next input and sliding the history window forward. Returns
-    all steps stacked, which is what multi-step training losses need.
-
-    Two options control cost and stability:
+    Two options control cost and stability of training through a rollout of
+    several steps. Both apply only in training mode, so evaluation and
+    inference are unaffected by them:
 
     * **Push-forward mode.** Detaches the input at each step, so gradients do
       not flow through the whole rollout. This trains the model to be robust to
@@ -186,20 +85,18 @@ class MultiStepWrapper(nn.Module):
       backpropagating through many steps.
     * **Rollout checkpointing.** Recomputes each step's forward during the
       backward pass instead of retaining its activations, turning the
-      ``O(n_future)`` activation multiplier of backprop-through-time into
-      ``O(1)`` at the cost of one extra forward per step.
+      ``O(n_steps)`` activation multiplier of backprop-through-time into
+      ``O(1)`` at the cost of one extra forward per step. Only used for
+      rollouts of more than one step.
 
     Parameters
     ----------
     params : ParamsBase
-        Configuration. Reads ``n_future``, ``multistep.push_forward``, and
-        ``multistep_checkpoint``; the rest is forwarded to the preprocessor.
+        Configuration. Reads ``multistep.push_forward`` and
+        ``multistep_checkpoint``; the rest is forwarded to
+        :class:`~makani.models.preprocessor.Preprocessor2D`.
     model_handle : callable
         Zero-argument factory returning the network to wrap.
-
-    See Also
-    --------
-    SingleStepWrapper : the single-step counterpart.
     """
 
     def __init__(self, params, model_handle):
@@ -209,141 +106,224 @@ class MultiStepWrapper(nn.Module):
         multistep_parameters = params.get("multistep", {"push_forward": False})
         self.push_forward_mode = multistep_parameters["push_forward"]
 
-        # rollout-level activation checkpointing: recompute each step's model forward in
-        # the backward pass instead of retaining its full activation graph. Turns the
-        # O(n_future) activation multiplier of backprop-through-time back into O(1) at the
-        # cost of one extra forward per step. Set via the --multistep_checkpoint CLI flag
-        # (top-level param, like n_future). Off by default.
+        # rollout-level activation checkpointing, set via the --multistep_checkpoint CLI flag (top-level
+        # param, like n_future). Off by default. Whether the model is safe to checkpoint is checked on
+        # first use, so that loading a model for evaluation never fails on it.
         self.multistep_checkpoint = params.get("multistep_checkpoint", False)
-        if self.multistep_checkpoint:
-            _assert_checkpoint_safe(self.model)
+        self._checkpoint_checked = False
 
-        # collect parameters for history
-        self.n_future = params.n_future
+    def _prepare_window(self, inp, dynamic_features, noise):
+        # the network input of one window, and the history statistics its prediction is denormalized with
+        pp = self.preprocessor
 
-    def _forward_train(self, inp, update_state=True, replace_state=True):
-        result = []
-        inpt = inp
+        x = pp.assemble_input(inp, dynamic_features, noise)
+        stats = pp.compute_history_stats(x)
+        inpans = pp.pack_model_input(pp.history_normalize(x, target=False, stats=stats))
 
-        # initialize fresh buffer: decide whether we want to replace the state
-        if update_state:
-            self.preprocessor.update_internal_state(replace_state=replace_state)
+        return inpans, stats
 
-        # do the rollout
-        for step in range(self.n_future + 1):
+    def _predict_window(self, inp, dynamic_features, noise, use_checkpoint: bool = False):
+        pp = self.preprocessor
 
-            # in push-forward mode, we need to detach the tensor:
-            if self.push_forward_mode:
-                inpt = inpt.detach()
+        inpans, stats = self._prepare_window(inp, dynamic_features, noise)
 
-            # add unpredicted features
-            inpa = self.preprocessor.append_unpredicted_features(inpt)
+        if use_checkpoint:
+            # Only the pure network forward is recomputed in the backward pass; the input preparation
+            # stays outside the checkpoint, so it runs once. Global-RNG ops inside the network are
+            # handled by preserve_rng_state=True; private-generator modules are rejected up front by
+            # _assert_checkpoint_safe.
+            predn = checkpoint(self.model, inpans, use_reentrant=False, preserve_rng_state=True)
+        else:
+            predn = self.model(inpans)
 
-            # do history normalization
-            self.preprocessor.history_compute_stats(inpa)
-            inpan = self.preprocessor.history_normalize(inpa, target=False)
+        # the network predicts one step as a flat channel stack; give it its time axis back
+        predn = pp.correct_bias(predn).unsqueeze(1)
 
-            # add static features
-            inpans = self.preprocessor.add_static_features(inpan)
+        return pp.history_denormalize(predn, target=True, stats=stats)
 
-            # prediction
-            # Only the pure model forward is checkpointed; the stateful preprocessor calls
-            # (history/noise/state updates) stay outside the checkpoint so they run once and
-            # are not re-executed during the backward recompute. Global-RNG ops inside the
-            # model are handled by preserve_rng_state=True; private-generator modules are
-            # rejected up-front by _assert_checkpoint_safe. Push-forward mode already detaches
-            # between steps, so checkpointing would be redundant there.
-            if self.multistep_checkpoint and self.training and torch.is_grad_enabled() and not self.push_forward_mode:
-                predn = checkpoint(self.model, inpans, use_reentrant=False, preserve_rng_state=True)
-            else:
-                predn = self.model(inpans)
-
-            # perform bias correction if requested
-            predn = self.preprocessor.correct_bias(predn)
-
-            # append the denormalized result to output list
-            # important to do that here, otherwise normalization stats
-            # will have been updated later:
-            pred = self.preprocessor.history_denormalize(predn, target=True)
-
-            # append output
-            result.append(pred)
-
-            if step == self.n_future:
-                break
-
-            # update internal buffer
-            self.preprocessor.update_internal_state(replace_state=False)
-
-            # append history
-            inpt = self.preprocessor.append_history(inpt, pred, step)
-
-        # concat the tensors along channel dim to be compatible with flattened target
-        result = torch.cat(result, dim=1)
-
-        return result
-
-    def _forward_eval(self, inp, update_state=True, replace_state=True):
-        # update internal state; size the noise state to this call's batch so that
-        # batched inference works regardless of params.batch_size. See
-        # SingleStepWrapper._preprocess for the rationale. The training path
-        # deliberately keeps the fixed-batch behaviour.
-        if update_state:
-            self.preprocessor.update_internal_state(replace_state=replace_state, batch_size=inp.shape[0])
-
-        # first append unpredicted features
-        inpa = self.preprocessor.append_unpredicted_features(inp)
-
-        # do history normalization
-        self.preprocessor.history_compute_stats(inpa)
-        inpan = self.preprocessor.history_normalize(inpa, target=False)
-
-        # add static features
-        inpans = self.preprocessor.add_static_features(inpan)
-
-        # important, remove normalization here,
-        # because otherwise normalization stats are already outdated
-        yn = self.model(inpans)
-
-        # perform bias correction if requested
-        yn = self.preprocessor.correct_bias(yn)
-
-        # important, remove normalization here,
-        # because otherwise normalization stats are already outdated
-        y = self.preprocessor.history_denormalize(yn, target=True)
-
-        return y
-
-    def forward(self, inp, update_state=True, replace_state=True):
+    def compile_step(self, **compile_kwargs):
         r"""
-        Roll the model forward autoregressively and return all predicted steps.
+        ``torch.compile`` the prediction of one rollout step.
 
-        Dispatches to the training or evaluation path based on the module's
-        training mode; the training path additionally honors push-forward mode
-        and rollout checkpointing, which do not apply under ``no_grad``.
+        A rollout runs its loop, and draws its noise, in Python; what is worth
+        compiling is the step: preprocessing, network and postprocessing. The
+        compiled step does not depend on the number of steps, and the state
+        dict keeps its keys.
+
+        Parameters
+        ----------
+        **compile_kwargs
+            Passed on to ``torch.compile``.
+        """
+        # layers whose forward breaks the graph, e.g. around distributed collectives, are compiled
+        # as frames of their own, once per parameter shape. Models with many such layers of
+        # different sizes exceed torch's default limit of 8 and fall back to eager for the rest
+        torch._dynamo.config.recompile_limit = int(os.getenv("MAKANI_INDUCTOR_COMPILE_LIMIT", "32"))
+        self._predict_window = torch.compile(self._predict_window, **compile_kwargs)
+
+    def predict(self, inp, dynamic_features, noise=None):
+        r"""
+        Predict one step from a window, without a rollout.
 
         Parameters
         ----------
         inp : torch.Tensor
-            Initial input of shape ``(B, (n_history + 1) * C, H, W)`` in
-            physical units.
-        update_state : bool, optional
-            Advance the stochastic noise state before the rollout, by default
-            ``True``.
-        replace_state : bool, optional
-            Draw a fresh noise state rather than continuing an existing
-            trajectory, by default ``True``.
+            The window, ``(B, n_history + 1, C, H, W)``, in data space.
+        dynamic_features : dict
+            The dynamic features over the window, name to ``(B, n_history + 1, C_f, H, W)``;
+            empty if the model takes none.
+        noise : torch.Tensor, optional
+            The input noise sample, if the model takes noise, see
+            :meth:`~makani.models.preprocessor.Preprocessor2D.noise_source`.
 
         Returns
         -------
         torch.Tensor
-            Predictions for all ``n_future + 1`` steps, concatenated along the
-            channel dimension as ``(B, (n_future + 1) * C_out, H, W)``.
+            The prediction, ``(B, 1, C_out, H, W)``, in data space.
         """
-        # decide which routine to call
-        if self.training:
-            y = self._forward_train(inp, update_state=update_state, replace_state=replace_state)
-        else:
-            y = self._forward_eval(inp, update_state=update_state, replace_state=replace_state)
+        return self._predict_window(inp, dynamic_features, noise)
 
-        return y
+    def encode(self, inp, dynamic_features, noise=None):
+        r"""
+        The latent state of the network for one window, before decoding.
+
+        The input goes through the same preparation as in :meth:`predict`; only
+        the decoder, the bias correction and the denormalization are skipped.
+
+        Parameters
+        ----------
+        inp, dynamic_features, noise
+            As in :meth:`predict`.
+
+        Returns
+        -------
+        torch.Tensor
+            The latent features, ``(B, embed_dim, h, w)`` on the internal grid of the network.
+
+        Raises
+        ------
+        NotImplementedError
+            If the network does not expose ``encode_process``.
+        """
+        if not hasattr(self.model, "encode_process"):
+            raise NotImplementedError(f"{type(self.model).__name__} does not expose encode_process().")
+
+        inpans, _ = self._prepare_window(inp, dynamic_features, noise)
+
+        return self.model.encode_process(inpans)
+
+    def predict_step(self, step: RolloutStep, use_checkpoint: bool = False):
+        r"""
+        Predict one step of a rollout.
+
+        Parameters
+        ----------
+        step : RolloutStep
+            The step, as a :class:`~makani.utils.dataloaders.rollout.Rollout` hands it out.
+        use_checkpoint : bool, optional
+            Recompute the network in the backward pass instead of keeping its
+            activations. By default ``False``.
+
+        Returns
+        -------
+        torch.Tensor
+            The prediction, ``(B * E, 1, C_out, H, W)``, in data space, at
+            the batch of the rollout with its ``E`` ensemble members folded in.
+        """
+        return self._predict_window(step.input, step.input_dynamic_features, step.noise, use_checkpoint)
+
+    def forward(self, rollout: Rollout):
+        r"""
+        Run the model over all steps of a rollout.
+
+        Each prediction is fed back into the window of the next step, see
+        :class:`~makani.utils.dataloaders.rollout.Rollout`. In training mode,
+        push-forward mode and rollout checkpointing apply if configured. For a
+        single step outside a rollout, use :meth:`predict`; for the predictions
+        one step at a time, use :meth:`steps`.
+
+        Parameters
+        ----------
+        rollout : Rollout
+            The rollout, not started yet.
+
+        Returns
+        -------
+        torch.Tensor
+            The predictions, ``(B * E, n_steps, C_out, H, W)``, in data
+            space, at the batch of the rollout with its ``E`` ensemble members
+            folded in; :meth:`~makani.utils.dataloaders.rollout.Rollout.unfold`
+            splits them out. Step ``k`` predicts target step ``k``.
+
+        Raises
+        ------
+        TypeError, ValueError, RuntimeError
+            As in :meth:`steps`.
+        """
+        # (B * E, n_steps, C_out, H, W), step k predicts target step k
+        return torch.cat(list(self.steps(rollout)), dim=1)
+
+    def steps(self, rollout: Rollout):
+        r"""
+        Run the model over the steps of a rollout, one prediction at a time.
+
+        The same rollout as :meth:`forward`, but the predictions are handed out
+        as they are made, so that the caller can release each one before the
+        next, e.g. in an evaluation over many lead times. Each prediction is
+        fed back into the window of the next step before it is handed out, so
+        the rollout has finished once the last one is. The rollout is checked
+        right away, not at the first step.
+
+        Parameters
+        ----------
+        rollout : Rollout
+            The rollout, not started yet.
+
+        Returns
+        -------
+        iterator of torch.Tensor
+            The prediction of each step, ``(B * E, 1, C_out, H, W)``, in data
+            space, at the batch of the rollout with its ``E`` ensemble members
+            folded in.
+
+        Raises
+        ------
+        TypeError
+            If ``rollout`` is not a :class:`~makani.utils.dataloaders.rollout.Rollout`.
+        ValueError
+            If the rollout has no steps.
+        RuntimeError
+            If the rollout has been started already, or if rollout
+            checkpointing is configured for a model that is not safe to
+            checkpoint, see :func:`_assert_checkpoint_safe`.
+        """
+        if not isinstance(rollout, Rollout):
+            raise TypeError(
+                f"{type(self).__name__} takes a Rollout, got {type(rollout).__name__}; "
+                "use predict(x, dynamic_features, noise) for a single step"
+            )
+        if rollout.n_steps == 0:
+            raise ValueError("The rollout has no steps to predict")
+        if rollout.started:
+            raise RuntimeError("The rollout has been stepped already: a rollout can be run only once, make a new one")
+        push_forward = self.training and self.push_forward_mode
+        # push-forward already detaches between steps, so checkpointing would be redundant there, and a
+        # single step has nothing to gain from it
+        use_checkpoint = (
+            self.training
+            and self.multistep_checkpoint
+            and torch.is_grad_enabled()
+            and not push_forward
+            and rollout.n_steps > 1
+        )
+        if use_checkpoint and not self._checkpoint_checked:
+            _assert_checkpoint_safe(self.model)
+            self._checkpoint_checked = True
+
+        return self._steps(rollout, push_forward, use_checkpoint)
+
+    def _steps(self, rollout, push_forward, use_checkpoint):
+        for step in rollout:
+            pred = self.predict_step(step, use_checkpoint=use_checkpoint)
+            rollout.advance(pred.detach() if push_forward else pred)
+            yield pred

@@ -16,6 +16,7 @@
 
 import sys
 import os
+import math
 import unittest
 from parameterized import parameterized
 
@@ -74,24 +75,43 @@ class TestDistributedLayers(unittest.TestCase):
             [181, 360, 91, 180, 1, 10, 1e-4],
             [128, 256, 256, 512, 32, 8, 1e-4],
             [91, 180, 181, 360, 1, 10, 1e-4],
+            # the three filters of SFNO with scale_factor=8 on a 36 x 72 grid: truncated modes,
+            # mixed grid types and an internal grid too small to split evenly
+            [36, 72, 4, 9, 4, 8, 1e-4, "equiangular", "legendre-gauss", 4, 5],
+            [4, 9, 4, 9, 4, 8, 1e-4, "legendre-gauss", "legendre-gauss", 4, 5],
+            [4, 9, 36, 72, 4, 8, 1e-4, "legendre-gauss", "equiangular", 4, 5],
         ],
         skip_on_empty=True,
     )
     def test_distributed_spectral_conv(
-        self, nlat_in, nlon_in, nlat_out, nlon_out, batch_size, num_chan, tol, verbose=False
+        self,
+        nlat_in,
+        nlon_in,
+        nlat_out,
+        nlon_out,
+        batch_size,
+        num_chan,
+        tol,
+        grid_in="equiangular",
+        grid_out="equiangular",
+        lmax=None,
+        mmax=None,
+        verbose=False,
     ):
         B, C, Hi, Wi, Ho, Wo = batch_size, num_chan, nlat_in, nlon_in, nlat_out, nlon_out
 
         from makani.models.common import SpectralConv
 
-        # set up handles
-        forward_transform_local = th.RealSHT(nlat=Hi, nlon=Wi).to(self.device)
+        # set up handles; without explicit modes the inverse takes those of the forward
+        forward_transform_local = th.RealSHT(nlat=Hi, nlon=Wi, lmax=lmax, mmax=mmax, grid=grid_in).to(self.device)
         inverse_transform_local = th.InverseRealSHT(
-            nlat=Ho, nlon=Wo, lmax=forward_transform_local.lmax, mmax=forward_transform_local.mmax
+            nlat=Ho, nlon=Wo, lmax=forward_transform_local.lmax, mmax=forward_transform_local.mmax, grid=grid_out
         ).to(self.device)
-        forward_transform_dist = thd.DistributedRealSHT(nlat=Hi, nlon=Wi).to(self.device)
+        forward_transform_dist = thd.DistributedRealSHT(nlat=Hi, nlon=Wi, lmax=lmax, mmax=mmax, grid=grid_in).to(
+            self.device
+        )
         inverse_transform_dist = thd.DistributedInverseRealSHT(
-            nlat=Ho, nlon=Wo, lmax=forward_transform_dist.lmax, mmax=forward_transform_dist.mmax
+            nlat=Ho, nlon=Wo, lmax=forward_transform_dist.lmax, mmax=forward_transform_dist.mmax, grid=grid_out
         ).to(self.device)
 
         set_seed(333)
@@ -144,15 +164,16 @@ class TestDistributedLayers(unittest.TestCase):
         #############################################################
         # FWD pass
         inp_full.requires_grad = True
-        out_full, _ = spect_conv_local(inp_full)
+        out_full, res_full = spect_conv_local(inp_full)
 
-        # create grad for backward
+        # create grads for backward; the residual is part of it, since the blocks use it as their skip
+        # connection, and when the grids differ it is resampled through the transforms
         with torch.no_grad():
-            # create full grad
             ograd_full = torch.randn_like(out_full)
+            rgrad_full = torch.randn_like(res_full)
 
         # BWD pass
-        out_full.backward(ograd_full)
+        torch.autograd.backward([out_full, res_full], [ograd_full, rgrad_full])
         igrad_full = inp_full.grad.clone()
         wgrad_full = spect_conv_local.weight.grad.clone()
         bgrad_full = spect_conv_local.bias.grad.clone()
@@ -163,12 +184,12 @@ class TestDistributedLayers(unittest.TestCase):
         # FWD pass
         inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
         inp_local.requires_grad = True
-        out_local, _ = spect_conv_dist(inp_local)
+        out_local, res_local = spect_conv_dist(inp_local)
 
         # BWD pass
         ograd_local = self._split_helper(ograd_full, hdim=-2, wdim=-1)
-        out_local, _ = spect_conv_dist(inp_local)
-        out_local.backward(ograd_local)
+        rgrad_local = self._split_helper(rgrad_full, hdim=-2, wdim=-1)
+        torch.autograd.backward([out_local, res_local], [ograd_local, rgrad_local])
         igrad_local = inp_local.grad.clone()
         wgrad_local = spect_conv_dist.module.weight.grad.clone()
         bgrad_local = spect_conv_dist.module.bias.grad.clone()
@@ -181,6 +202,14 @@ class TestDistributedLayers(unittest.TestCase):
             self.assertTrue(
                 reduce_success(
                     compare_tensors("output", out_gather_full, out_full, tol, tol, verbose=verbose), self.device
+                )
+            )
+
+        with self.subTest(desc="residual"):
+            res_gather_full = self._gather_helper(res_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("residual", res_gather_full, res_full, tol, tol, verbose=verbose), self.device
                 )
             )
 
@@ -221,6 +250,345 @@ class TestDistributedLayers(unittest.TestCase):
                         self.device,
                     )
                 )
+
+    # the DISCO convolutions of SNO with scale_factor=8 on a 36 x 72 grid: the encoder onto the internal
+    # 4 x 9 grid and the convolution of the decoder on the output grid. The local convolution of the
+    # blocks runs on a 16 x 33 grid instead of 4 x 9: its support would cover most of the sphere there,
+    # so with 4 polar ranks each holding a single latitude, the halo would reach past a neighbour
+    @parameterized.expand(
+        [
+            [36, 72, 4, 9, "equiangular", "legendre-gauss", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
+            [16, 33, 16, 33, "legendre-gauss", "legendre-gauss", (3, 3), math.sqrt(2.0) * math.pi / 15.0, 4, 8, 1e-4],
+            [36, 72, 36, 72, "equiangular", "equiangular", (3, 3), 2.0 * math.pi / 35.0, 4, 8, 1e-4],
+        ],
+        skip_on_empty=True,
+    )
+    def test_distributed_disco_conv(
+        self,
+        nlat_in,
+        nlon_in,
+        nlat_out,
+        nlon_out,
+        grid_in,
+        grid_out,
+        kernel_shape,
+        theta_cutoff,
+        batch_size,
+        num_chan,
+        tol,
+        verbose=False,
+    ):
+        B, C = batch_size, num_chan
+
+        conv_args = dict(
+            in_shape=(nlat_in, nlon_in),
+            out_shape=(nlat_out, nlon_out),
+            kernel_shape=kernel_shape,
+            basis_type="harmonic",
+            basis_norm_mode="mean",
+            grid_in=grid_in,
+            grid_out=grid_out,
+            bias=False,
+            theta_cutoff=theta_cutoff,
+        )
+
+        set_seed(333)
+        conv_local = th.DiscreteContinuousConvS2(C, C, **conv_args).to(self.device)
+        conv_dist = thd.DistributedDiscreteContinuousConvS2(C, C, **conv_args).to(self.device)
+        with torch.no_grad():
+            conv_dist.weight.copy_(conv_local.weight)
+
+        inp_full = torch.randn((B, C, nlat_in, nlon_in), dtype=torch.float32, device=self.device)
+
+        # local
+        inp_full.requires_grad = True
+        out_full = conv_local(inp_full)
+        with torch.no_grad():
+            ograd_full = torch.randn_like(out_full)
+        out_full.backward(ograd_full)
+        igrad_full = inp_full.grad.clone()
+        wgrad_full = conv_local.weight.grad.clone()
+
+        # distributed
+        inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
+        inp_local.requires_grad = True
+        out_local = conv_dist(inp_local)
+        ograd_local = self._split_helper(ograd_full, hdim=-2, wdim=-1)
+        out_local.backward(ograd_local)
+        igrad_local = inp_local.grad.clone()
+        # the weight is replicated over the spatial ranks, each holding the contribution of its part of the grid
+        wgrad_local = conv_dist.weight.grad.clone()
+        if comm.get_size("spatial") > 1:
+            dist.all_reduce(wgrad_local, group=comm.get_group("spatial"))
+
+        with self.subTest(desc="output"):
+            out_gather_full = self._gather_helper(out_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("output", out_gather_full, out_full, tol, tol, verbose=verbose), self.device
+                )
+            )
+
+        with self.subTest(desc="input gradients"):
+            igrad_gather_full = self._gather_helper(igrad_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("input gradients", igrad_gather_full, igrad_full, tol, tol, verbose=verbose),
+                    self.device,
+                )
+            )
+
+        with self.subTest(desc="weight gradients"):
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("weight gradients", wgrad_local, wgrad_full, tol, tol, verbose=verbose),
+                    self.device,
+                )
+            )
+
+    def test_distributed_disco_conv_after_conv_without_halo(self, verbose=False):
+        """
+        SNO's encoder convolution followed by its decoder convolution, as in the model.
+
+        On a 2 x 2 grid the encoder (36 x 72 -> 4 x 9) needs no latitude halo. torch-harmonics 0.9.3 still sent
+        the whole local tensor as a halo, which nobody received; on NCCL the decoder's halo exchange picked it
+        up and got the first latitude row of the second polar rank wrong, from B * C_in >= 256 on.
+        """
+        B, C, tol = 8, 32, 1e-4
+
+        conv_args = dict(kernel_shape=(3, 3), basis_type="harmonic", basis_norm_mode="mean", bias=False)
+        encoder_args = dict(
+            in_shape=(36, 72),
+            out_shape=(4, 9),
+            grid_in="equiangular",
+            grid_out="legendre-gauss",
+            theta_cutoff=2.0 * math.pi / 35.0,
+            **conv_args,
+        )
+        decoder_args = dict(
+            in_shape=(36, 72),
+            out_shape=(36, 72),
+            grid_in="equiangular",
+            grid_out="equiangular",
+            theta_cutoff=2.0 * math.pi / 35.0,
+            **conv_args,
+        )
+
+        set_seed(333)
+        encoder_local = th.DiscreteContinuousConvS2(5, C, **encoder_args).to(self.device)
+        encoder_dist = thd.DistributedDiscreteContinuousConvS2(5, C, **encoder_args).to(self.device)
+        decoder_local = th.DiscreteContinuousConvS2(C, 5, **decoder_args).to(self.device)
+        decoder_dist = thd.DistributedDiscreteContinuousConvS2(C, 5, **decoder_args).to(self.device)
+        with torch.no_grad():
+            encoder_dist.weight.copy_(encoder_local.weight)
+            decoder_dist.weight.copy_(decoder_local.weight)
+
+        enc_inp_full = torch.randn((B, 5, 36, 72), dtype=torch.float32, device=self.device)
+        dec_inp_full = torch.randn((B, C, 36, 72), dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            enc_out_full = encoder_local(enc_inp_full)
+            dec_out_full = decoder_local(dec_inp_full)
+            enc_out_local = encoder_dist(self._split_helper(enc_inp_full, hdim=-2, wdim=-1))
+            dec_out_local = decoder_dist(self._split_helper(dec_inp_full, hdim=-2, wdim=-1))
+
+        for desc, out_local, out_full in [
+            ("encoder output", enc_out_local, enc_out_full),
+            ("decoder output", dec_out_local, dec_out_full),
+        ]:
+            with self.subTest(desc=desc):
+                out_gather_full = self._gather_helper(out_local, hdim=-2, wdim=-1)
+                self.assertTrue(
+                    reduce_success(
+                        compare_tensors(desc, out_gather_full, out_full, tol, tol, verbose=verbose), self.device
+                    )
+                )
+
+    # the bilinear resampling in the decoder of SNO, from the internal 4 x 9 grid back onto 36 x 72, and the
+    # opposite direction
+    @parameterized.expand(
+        [
+            [4, 9, 36, 72, "legendre-gauss", "equiangular", 4, 8, 1e-5],
+            [36, 72, 4, 9, "equiangular", "legendre-gauss", 4, 8, 1e-5],
+        ],
+        skip_on_empty=True,
+    )
+    def test_distributed_resample(
+        self, nlat_in, nlon_in, nlat_out, nlon_out, grid_in, grid_out, batch_size, num_chan, tol, verbose=False
+    ):
+        B, C = batch_size, num_chan
+
+        resample_args = dict(grid_in=grid_in, grid_out=grid_out, mode="bilinear")
+        resample_local = th.ResampleS2(nlat_in, nlon_in, nlat_out, nlon_out, **resample_args).to(self.device)
+        resample_dist = thd.DistributedResampleS2(nlat_in, nlon_in, nlat_out, nlon_out, **resample_args).to(self.device)
+
+        set_seed(333)
+        inp_full = torch.randn((B, C, nlat_in, nlon_in), dtype=torch.float32, device=self.device)
+
+        # local
+        inp_full.requires_grad = True
+        out_full = resample_local(inp_full)
+        with torch.no_grad():
+            ograd_full = torch.randn_like(out_full)
+        out_full.backward(ograd_full)
+        igrad_full = inp_full.grad.clone()
+
+        # distributed
+        inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
+        inp_local.requires_grad = True
+        out_local = resample_dist(inp_local)
+        ograd_local = self._split_helper(ograd_full, hdim=-2, wdim=-1)
+        out_local.backward(ograd_local)
+        igrad_local = inp_local.grad.clone()
+
+        with self.subTest(desc="output"):
+            out_gather_full = self._gather_helper(out_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("output", out_gather_full, out_full, tol, tol, verbose=verbose), self.device
+                )
+            )
+
+        with self.subTest(desc="input gradients"):
+            igrad_gather_full = self._gather_helper(igrad_local, hdim=-2, wdim=-1)
+            self.assertTrue(
+                reduce_success(
+                    compare_tensors("input gradients", igrad_gather_full, igrad_full, tol, tol, verbose=verbose),
+                    self.device,
+                )
+            )
+
+    # SNO's distributed layers called several times in a row with changing batch sizes, as the
+    # gradient accumulation test does (a batch of 8 and batches of 4): every call has to match the
+    # serial layer, whatever the module saw before. The local convolution runs on a 16 latitude grid
+    # with SNO's cutoff for it, sqrt(2) pi / (nlat - 1): on 4 latitudes that cutoff spans 85 degrees,
+    # a halo of 2 rows, more than the single latitude each of 4 polar ranks holds; on 16 the halo is
+    # 1 row against 4 latitudes per rank
+    @parameterized.expand(
+        [
+            ["disco_encoder", 36, 72, 4, 9, "equiangular", "legendre-gauss", 2.0 * math.pi / 35.0],
+            ["disco_local", 16, 33, 16, 33, "legendre-gauss", "legendre-gauss", math.sqrt(2.0) * math.pi / 15.0],
+            ["disco_decoder", 36, 72, 36, 72, "equiangular", "equiangular", 2.0 * math.pi / 35.0],
+            ["resample_decoder", 4, 9, 36, 72, "legendre-gauss", "equiangular", None],
+            ["spectral_global", 4, 9, 4, 9, "legendre-gauss", "legendre-gauss", None],
+            ["instance_norm", 4, 9, 4, 9, "legendre-gauss", "legendre-gauss", None],
+        ],
+        skip_on_empty=True,
+    )
+    def test_distributed_layer_batch_size_sequence(
+        self, kind, nlat_in, nlon_in, nlat_out, nlon_out, grid_in, grid_out, theta_cutoff, verbose=False
+    ):
+        # the channels of SNO in the model test: 5 variables in and out, embed_dim 32 inside
+        C, tol = 32, 1e-4
+        C_in = 5 if kind == "disco_encoder" else C
+        C_out = 5 if kind == "disco_decoder" else C
+
+        set_seed(333)
+        if kind.startswith("disco"):
+            conv_args = dict(
+                in_shape=(nlat_in, nlon_in),
+                out_shape=(nlat_out, nlon_out),
+                kernel_shape=(3, 3),
+                basis_type="harmonic",
+                basis_norm_mode="mean",
+                grid_in=grid_in,
+                grid_out=grid_out,
+                bias=False,
+                theta_cutoff=theta_cutoff,
+            )
+            layer_local = th.DiscreteContinuousConvS2(C_in, C_out, **conv_args).to(self.device)
+            layer_dist = thd.DistributedDiscreteContinuousConvS2(C_in, C_out, **conv_args).to(self.device)
+            with torch.no_grad():
+                layer_dist.weight.copy_(layer_local.weight)
+        elif kind.startswith("resample"):
+            resample_args = dict(grid_in=grid_in, grid_out=grid_out, mode="bilinear")
+            layer_local = th.ResampleS2(nlat_in, nlon_in, nlat_out, nlon_out, **resample_args).to(self.device)
+            layer_dist = thd.DistributedResampleS2(nlat_in, nlon_in, nlat_out, nlon_out, **resample_args).to(
+                self.device
+            )
+        elif kind == "instance_norm":
+            # what SNO's blocks normalize with, on its internal grid; affine as in the model, with
+            # weights away from the identity
+            layer_local = nn.InstanceNorm2d(C, eps=1e-6, affine=True, track_running_stats=False).to(self.device)
+            layer_dist = DistributedInstanceNorm2d(C, eps=1e-6, affine=True).to(self.device)
+            with torch.no_grad():
+                layer_local.weight.normal_()
+                layer_local.bias.normal_()
+                layer_dist.weight.copy_(layer_local.weight)
+                layer_dist.bias.copy_(layer_local.bias)
+        else:
+            from makani.models.common import SpectralConv
+
+            transforms_local = (
+                th.RealSHT(nlat_in, nlon_in, lmax=4, mmax=5, grid=grid_in),
+                th.InverseRealSHT(nlat_out, nlon_out, lmax=4, mmax=5, grid=grid_out),
+            )
+            transforms_dist = (
+                thd.DistributedRealSHT(nlat_in, nlon_in, lmax=4, mmax=5, grid=grid_in),
+                thd.DistributedInverseRealSHT(nlat_out, nlon_out, lmax=4, mmax=5, grid=grid_out),
+            )
+            conv_args = dict(operator_type="dhconv", num_groups=1, bias=True, gain=1.0)
+            spectral_local = SpectralConv(*[t.to(self.device) for t in transforms_local], C, C, **conv_args)
+            spectral_dist = SpectralConv(*[t.to(self.device) for t in transforms_dist], C, C, **conv_args)
+            spectral_local, spectral_dist = spectral_local.to(self.device), spectral_dist.to(self.device)
+            with torch.no_grad():
+                spectral_dist.weight.copy_(self._split_helper(spectral_local.weight, hdim=-1, wdim=None))
+                spectral_dist.bias.copy_(spectral_local.bias)
+
+            # the output only; the residual is covered by test_distributed_spectral_conv
+            def layer_local(x):
+                return spectral_local(x)[0]
+
+            def layer_dist(x):
+                return spectral_dist(x)[0]
+
+        # B=4 first, so that a failure at B=8 is not mistaken for one of the first call
+        for call, batch_size in enumerate([4, 8, 4]):
+            inp_full = torch.randn((batch_size, C_in, nlat_in, nlon_in), dtype=torch.float32, device=self.device)
+            with torch.no_grad():
+                out_full = layer_local(inp_full)
+                out_local = layer_dist(self._split_helper(inp_full, hdim=-2, wdim=-1))
+            with self.subTest(desc=f"call {call}, batch {batch_size}: output"):
+                out_gather_full = self._gather_helper(out_local, hdim=-2, wdim=-1)
+                self.assertTrue(
+                    reduce_success(
+                        compare_tensors(
+                            f"{kind} call {call} output", out_gather_full, out_full, tol, tol, verbose=verbose
+                        ),
+                        self.device,
+                    )
+                )
+
+            # each layer against itself, batch by batch: the samples are independent, so the larger
+            # batch has to give what its halves give. Tells which of the two layers is off
+            if batch_size > 4:
+                with torch.no_grad():
+                    halves_full = torch.cat([layer_local(x) for x in inp_full.split(4, dim=0)], dim=0)
+                    inp_local = self._split_helper(inp_full, hdim=-2, wdim=-1)
+                    halves_local = torch.cat([layer_dist(x) for x in inp_local.split(4, dim=0)], dim=0)
+                with self.subTest(desc=f"call {call}, batch {batch_size}: serial layer vs its halves"):
+                    self.assertTrue(
+                        reduce_success(
+                            compare_tensors(
+                                f"{kind} call {call} serial vs halves", out_full, halves_full, tol, tol, verbose=verbose
+                            ),
+                            self.device,
+                        )
+                    )
+                with self.subTest(desc=f"call {call}, batch {batch_size}: distributed layer vs its halves"):
+                    halves_gather_full = self._gather_helper(halves_local, hdim=-2, wdim=-1)
+                    self.assertTrue(
+                        reduce_success(
+                            compare_tensors(
+                                f"{kind} call {call} distributed vs halves",
+                                out_gather_full,
+                                halves_gather_full,
+                                tol,
+                                tol,
+                                verbose=verbose,
+                            ),
+                            self.device,
+                        )
+                    )
 
     @parameterized.expand(
         [

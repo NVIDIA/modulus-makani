@@ -14,7 +14,7 @@ Makani is aimed at researchers working on ML based weather prediction. Stable fe
 
 ## Overview
 
-Makani is a research code developed by engineers and researchers at NVIDIA and NERSC for massively parallel training of weather and climate prediction models on 100+ GPUs and to enable the development of the next generation of weather and climate models. Makani is written in [PyTorch](https://pytorch.org) and supports various forms of model- and data-parallelism, asynchronous loading of data, unpredicted channels, autoregressive training and much more. Makani is fully configurable through .yaml configuration files and support flexible development of novel models. Metrics, Losses and other components are designed in a modular fashion to support configurable, custom training- and inference-recipes at scale. Makani also supports scalable, fully online scoring modes, which are compatible with WeatherBench2. Among others, Makani was used to train the [FourCastNet](https://research.nvidia.com/publication/2025-07_fourcastnet-3-geometric-approach-probabilistic-machine-learning-weather) models, on the ERA5 dataset.
+Makani is a research code developed by engineers and researchers at NVIDIA and NERSC for massively parallel training of weather and climate prediction models on 100+ GPUs and to enable the development of the next generation of weather and climate models. Makani is written in [PyTorch](https://pytorch.org) and supports various forms of model- and data-parallelism, asynchronous loading of data, dynamic and static input features, autoregressive training and much more. Makani is fully configurable through .yaml configuration files and support flexible development of novel models. Metrics, Losses and other components are designed in a modular fashion to support configurable, custom training- and inference-recipes at scale. Makani also supports scalable, fully online scoring modes, which are compatible with WeatherBench2. Among others, Makani was used to train the [FourCastNet](https://research.nvidia.com/publication/2025-07_fourcastnet-3-geometric-approach-probabilistic-machine-learning-weather) models, on the ERA5 dataset.
 
 ## Getting started
 
@@ -200,7 +200,7 @@ Makani offers a conversion script to convert `legacy` checkpoints into `flexible
 
 ### Model packages
 
-By default, Makani will save out a model package when training starts. Model packages allow easily contain all the necessary data to run the model. This includes statistics used to normalize inputs and outputs, unpredicted static channels and even the code which appends celestial features such as the cosine of the solar zenith angle. Read more about model packages [here](networks/Readme.md).
+By default, Makani will save out a model package when training starts. Model packages allow easily contain all the necessary data to run the model. This includes statistics used to normalize inputs and outputs, static features and even the code which appends dynamic features such as the cosine of the solar zenith angle. Read more about model packages [here](makani/models/Readme.md#model-packages).
 
 ### Data Processing Scripts Overview
 
@@ -236,6 +236,12 @@ This will create a large virtual memory pool into which PyTorch can index. If yo
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+```
+
+With `--jit_mode=inductor`, layers whose forward breaks the compiled graph, e.g. around distributed communication, are compiled once for every parameter shape they come with. Models with many such layers of different sizes, like the DISCO convolutions in FourCastNet3, can exceed torch's default recompile limit of 8; the layers beyond it then run eagerly, and torch warns that it `hit config.recompile_limit`. Makani raises the limit to 32. If this is still not enough, set it with
+
+```bash
+export MAKANI_INDUCTOR_COMPILE_LIMIT=64
 ```
 
 ## Contributing

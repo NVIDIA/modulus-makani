@@ -87,7 +87,7 @@ class TestRasterProperties(unittest.TestCase):
                 field = torch.full((n_src_lat, n_src_lon), 3.7, device=self.device)
                 out = remap(field)
                 self.assertTrue(
-                    compare_tensors("constant field", out, torch.full_like(out, 3.7), atol=1e-5, verbose=True)
+                    compare_tensors("constant field", out, torch.full_like(out, 3.7), atol=1e-5, verbose=False)
                 )
 
     def test_conservation(self):
@@ -121,7 +121,7 @@ class TestRasterProperties(unittest.TestCase):
                 total_in = (field * src_area).sum()
                 total_out = (out * tgt_area).sum()
                 self.assertTrue(
-                    compare_tensors("conserved integral", total_out, total_in, atol=1e-9, rtol=1e-9, verbose=True)
+                    compare_tensors("conserved integral", total_out, total_in, atol=1e-9, rtol=1e-9, verbose=False)
                 )
 
     def test_refine_takes_exact_value(self):
@@ -151,10 +151,10 @@ class TestRasterProperties(unittest.TestCase):
         lat_max, lat_idx = remap.latitude_weights.max(dim=1)
         lon_max, lon_idx = remap.longitude_weights.max(dim=1)
         self.assertTrue(
-            compare_tensors("latitude weight row max", lat_max, torch.ones_like(lat_max), atol=1e-8, verbose=True)
+            compare_tensors("latitude weight row max", lat_max, torch.ones_like(lat_max), atol=1e-8, verbose=False)
         )
         self.assertTrue(
-            compare_tensors("longitude weight row max", lon_max, torch.ones_like(lon_max), atol=1e-8, verbose=True)
+            compare_tensors("longitude weight row max", lon_max, torch.ones_like(lon_max), atol=1e-8, verbose=False)
         )
 
         field = torch.arange(n_src_lat * n_src_lon, dtype=torch.float64, device=self.device).reshape(
@@ -165,7 +165,7 @@ class TestRasterProperties(unittest.TestCase):
         expected = field[lat_idx][:, lon_idx]
         non_pole = ~remap.pole_mask
         self.assertTrue(
-            compare_tensors("nested cell value", out[non_pole], expected[non_pole], atol=1e-8, verbose=True)
+            compare_tensors("nested cell value", out[non_pole], expected[non_pole], atol=1e-8, verbose=False)
         )
 
     def test_pole_rows_constant_across_longitude(self):
@@ -190,7 +190,7 @@ class TestRasterProperties(unittest.TestCase):
         self.assertTrue(pole_rows.numel() > 0, "test setup should put a target row on a pole")
         for row in pole_rows.tolist():
             self.assertTrue(
-                compare_tensors(f"pole row {row}", out[row], out[row, :1].expand_as(out[row]), atol=1e-5, verbose=True)
+                compare_tensors(f"pole row {row}", out[row], out[row, :1].expand_as(out[row]), atol=1e-5, verbose=False)
             )
 
 
@@ -211,7 +211,7 @@ class TestMeshProperties(unittest.TestCase):
 
         values = torch.full((n_cells,), -2.4, device=self.device)
         out = remap(values)
-        self.assertTrue(compare_tensors("constant field", out, torch.full_like(out, -2.4), atol=1e-5, verbose=True))
+        self.assertTrue(compare_tensors("constant field", out, torch.full_like(out, -2.4), atol=1e-5, verbose=False))
 
     def test_conservation(self):
         """The area-weighted integral is unchanged, when every target cell catches at least one mesh cell.
@@ -260,7 +260,7 @@ class TestMeshProperties(unittest.TestCase):
                 total_in,
                 atol=1e-9,
                 rtol=1e-9,
-                verbose=True,
+                verbose=False,
             )
         )
 
@@ -274,7 +274,7 @@ class TestMeshProperties(unittest.TestCase):
                 total_in,
                 atol=0.0,
                 rtol=10.0 / np.sqrt(cells_per_target),
-                verbose=True,
+                verbose=False,
             )
         )
 
@@ -295,7 +295,7 @@ class TestMeshProperties(unittest.TestCase):
         self.assertTrue(pole_rows.numel() > 0, "test setup should put a target row on a pole")
         for row in pole_rows.tolist():
             self.assertTrue(
-                compare_tensors(f"pole row {row}", out[row], out[row, :1].expand_as(out[row]), atol=1e-5, verbose=True)
+                compare_tensors(f"pole row {row}", out[row], out[row, :1].expand_as(out[row]), atol=1e-5, verbose=False)
             )
 
 

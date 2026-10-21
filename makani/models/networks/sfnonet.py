@@ -166,6 +166,25 @@ class SpectralFilterLayer(nn.Module):
         return self.filter(x)
 
 
+# normalizations that subtract the (quadrature weighted) mean per sample and channel, so that a
+# constant per-channel offset in front of them has no effect
+_MEAN_REMOVING_NORMS = (
+    nn.InstanceNorm2d,
+    GeometricInstanceNormS2,
+    DistributedInstanceNorm2d,
+    DistributedGeometricInstanceNormS2,
+)
+
+
+def _drop_removed_mlp_bias(module, state_dict, prefix, *args):
+    # the MLP biases a checkpoint has but the block does not, i.e. the removed output bias
+    mlp_prefix = prefix + "mlp."
+    own = set(module.mlp.state_dict().keys())
+    for key in [k for k in state_dict if k.startswith(mlp_prefix) and k.endswith("bias")]:
+        if key[len(mlp_prefix) :] not in own:
+            del state_dict[key]
+
+
 class NeuralOperatorBlock(nn.Module):
     r"""
     One block of the SFNO processor: spectral filter, norms, skips, and MLP.
@@ -347,9 +366,13 @@ class NeuralOperatorBlock(nn.Module):
         if use_mlp == True:
             MLPH = DistributedMLP if (comm.get_size("matmul") > 1) else MLP
             mlp_hidden_dim = int(embed_dim * mlp_ratio)
+            # norm1 follows the MLP directly: an instance norm removes the per-channel mean, and
+            # with it any bias of the output projection, which would never receive a gradient
+            mlp_output_bias = not isinstance(self.norm1, _MEAN_REMOVING_NORMS)
             self.mlp = MLPH(
                 in_features=embed_dim,
                 hidden_features=mlp_hidden_dim,
+                output_bias=mlp_output_bias,
                 act_layer=act_layer,
                 drop_rate=mlp_drop_rate,
                 drop_type="features",
@@ -357,6 +380,10 @@ class NeuralOperatorBlock(nn.Module):
                 checkpointing=(checkpointing_level >= 2),
                 gain=gain_factor,
             )
+
+            # checkpoints from before carry that bias; it never had an effect, so dropping it on load is exact
+            if not mlp_output_bias:
+                self.register_load_state_dict_pre_hook(_drop_removed_mlp_bias)
 
         # dropout
         self.drop_path = DropPath(path_drop_rate) if path_drop_rate > 0.0 else nn.Identity()
@@ -740,22 +767,37 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
             with torch.no_grad():
                 nn.init.trunc_normal_(self.pos_embed, std=0.02)
         elif pos_embed == "frequency":
+            # this rank's block of the (l, m) coefficients and where it sits in the global ones
             if comm.get_size("spatial") > 1:
                 lmax_loc = self.itrans_up.l_shapes[comm.get_rank("h")]
                 mmax_loc = self.itrans_up.m_shapes[comm.get_rank("w")]
+                l_offset = sum(self.itrans_up.l_shapes[: comm.get_rank("h")])
+                m_offset = sum(self.itrans_up.m_shapes[: comm.get_rank("w")])
             else:
                 lmax_loc = self.itrans_up.lmax
                 mmax_loc = self.itrans_up.mmax
+                l_offset = 0
+                m_offset = 0
 
-            rcoeffs = nn.Parameter(torch.tril(torch.randn(1, embed_dim, lmax_loc, mmax_loc), diagonal=0))
-            ccoeffs = nn.Parameter(torch.tril(torch.randn(1, embed_dim, lmax_loc, mmax_loc - 1), diagonal=-1))
+            # real and imaginary parts, each sharded over h and w like the coefficients
+            rcoeffs = nn.Parameter(torch.empty(1, embed_dim, lmax_loc, mmax_loc))
+            ccoeffs = nn.Parameter(torch.empty(1, embed_dim, lmax_loc, mmax_loc))
             with torch.no_grad():
                 nn.init.trunc_normal_(rcoeffs, std=0.02)
                 nn.init.trunc_normal_(ccoeffs, std=0.02)
+            for coeffs in (rcoeffs, ccoeffs):
+                # no reduction: every rank holds its own block
+                coeffs.is_shared_mp = []
+                coeffs.sharded_dims_mp = [None, None, "h", "w"]
             self.pos_embed = nn.ParameterList([rcoeffs, ccoeffs])
             self.pos_embed.type = "frequency"
-            self.pos_embed.is_shared_mp = []
-            self.pos_embed.sharded_dims_mp = [None, None, "h", "w"]
+
+            # only m <= l is a spherical harmonic, and m = 0 has no imaginary part; built from the
+            # global indices, since a rank's block starts at (l_offset, m_offset)
+            l_idx = torch.arange(l_offset, l_offset + lmax_loc).reshape(-1, 1)
+            m_idx = torch.arange(m_offset, m_offset + mmax_loc).reshape(1, -1)
+            self.register_buffer("pos_embed_rmask", (m_idx <= l_idx).float(), persistent=False)
+            self.register_buffer("pos_embed_cmask", ((m_idx <= l_idx) & (m_idx > 0)).float(), persistent=False)
 
         elif pos_embed == "none" or pos_embed == "None" or pos_embed == None:
             pass
@@ -904,7 +946,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
         if hasattr(self, "pos_embed"):
             if self.pos_embed.type == "frequency":
                 pos_embed = torch.stack(
-                    [self.pos_embed[0], nn.functional.pad(self.pos_embed[1], (1, 0), "constant", 0)], dim=-1
+                    [self.pos_embed[0] * self.pos_embed_rmask, self.pos_embed[1] * self.pos_embed_cmask], dim=-1
                 )
                 with amp.autocast(device_type="cuda", enabled=False):
                     pos_embed = self.itrans_up(torch.view_as_complex(pos_embed))

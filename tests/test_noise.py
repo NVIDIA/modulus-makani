@@ -557,6 +557,21 @@ class TestDiffusionNoiseS2(unittest.TestCase):
     def test_is_stateful(self):
         self.assertTrue(self._make_noise().is_stateful())
 
+    def test_state_written_in_inference_mode_can_be_updated_after_it(self):
+        # validation and inference run in inference mode, where the state becomes an inference tensor; the
+        # next update outside of it, e.g. in training, replaces it rather than writing into it
+        noise = self._make_noise()
+        with torch.inference_mode():
+            noise.update(replace_state=True, batch_size=self.B + 1)
+            noise.update(replace_state=False)
+
+        noise.update(replace_state=False)
+        self.assertFalse(noise.state.is_inference())
+        noise.reset()
+        self.assertFalse(noise.state.is_inference())
+        self.assertEqual(noise.state.shape[0], self.B + 1)
+        self.assertTrue(torch.all(noise.state == 0))
+
     def test_initial_state_shape(self):
         noise = self._make_noise()
         # state: (B, T, C, lmax_local, mmax_local, 2)
@@ -803,6 +818,82 @@ class TestDiffusionNoiseS2(unittest.TestCase):
         self.assertIsInstance(
             noise.sigma_l, torch.nn.Parameter, "sigma_l should be an nn.Parameter when learnable=True"
         )
+
+    def _learnable_rollout(self, noise, n_steps=3, seed=333):
+        """The noise of a rollout from a fresh state, as a rollout drives it."""
+        noise.set_rng(seed)
+        outs = []
+        for k in range(n_steps):
+            noise.update(replace_state=(k == 0))
+            outs.append(noise())
+        return torch.stack(outs)
+
+    def _make_learnable(self):
+        return DiffusionNoiseS2(
+            img_shape=IMG_SHAPE,
+            batch_size=self.B,
+            num_channels=self.C,
+            num_time_steps=1,
+            lambd=self.lambd,
+            seed=333,
+            learnable=True,
+        ).to(self.device)
+
+    def test_learnable_gradients_reach_phi_and_sigma_l(self):
+        """phi and sigma_l enter the state only in update(), and get their gradients through it."""
+        noise = self._make_learnable()
+        weight = torch.randn_like(self._learnable_rollout(noise))
+        (weight * self._learnable_rollout(noise)).sum().backward()
+
+        for name in ("phi", "sigma_l"):
+            with self.subTest(parameter=name):
+                grad = getattr(noise, name).grad
+                self.assertIsNotNone(grad, f"{name} should get a gradient")
+                self.assertGreater(grad.abs().max().item(), 0.0)
+
+    def test_learnable_gradients_match_finite_differences(self):
+        """The gradient through the state recurrence, along a random direction, against central differences."""
+        noise = self._make_learnable()
+        weight = torch.randn_like(self._learnable_rollout(noise))
+
+        def loss():
+            return (weight * self._learnable_rollout(noise)).sum()
+
+        loss().backward()
+        eps = 1e-3
+        for name in ("phi", "sigma_l"):
+            with self.subTest(parameter=name):
+                param = getattr(noise, name)
+                direction = torch.randn_like(param)
+                analytic = (param.grad * direction).sum().item()
+                with torch.no_grad():
+                    param.add_(eps * direction)
+                    plus = loss().item()
+                    param.sub_(2 * eps * direction)
+                    minus = loss().item()
+                    param.add_(eps * direction)
+                numeric = (plus - minus) / (2 * eps)
+                self.assertAlmostEqual(analytic, numeric, delta=1e-2 * max(1.0, abs(numeric)))
+
+    def test_learnable_state_survives_reset_and_evaluation(self):
+        """Resetting, or an update without gradients, does not corrupt the backward of a rollout already run."""
+        noise = self._make_learnable()
+        loss = self._learnable_rollout(noise).square().sum()
+
+        noise.reset()
+        with torch.no_grad():
+            noise.update(replace_state=True)
+            noise.update(replace_state=False)
+        loss.backward()
+
+        self.assertIsNotNone(noise.phi.grad)
+        self.assertIsNone(noise.state.grad_fn, "the state should be detached after an update without gradients")
+
+    def test_non_learnable_state_stays_a_plain_buffer(self):
+        noise = self._make_noise()
+        self._learnable_rollout(noise)
+        self.assertIsNone(noise.state.grad_fn)
+        self.assertIn("state", noise._buffers)
 
     # -----------------------------------------------------------------------
     # num_time_steps > 1 — noise.py lines 364-376 (init) and 405-417 (update)

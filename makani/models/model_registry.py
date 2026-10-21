@@ -20,6 +20,7 @@ import importlib.util
 from importlib.metadata import entry_points
 
 import logging
+import warnings
 
 from typing import List, Union
 from functools import partial
@@ -28,7 +29,7 @@ import torch
 import torch.nn as nn
 
 from makani.utils.YParams import ParamsBase, ensure_resampled_shapes
-from makani.models import SingleStepWrapper, MultiStepWrapper
+from makani.models import StepWrapper
 from makani.models import StochasticInterpolantWrapper
 from makani.utils.dataloaders.data_helpers import get_data_normalization
 
@@ -132,28 +133,50 @@ def list_models() -> List[str]:
     return list(_model_registry.keys())
 
 
+def warn_multistep_deprecated(multistep: bool):
+    """Warn that ``multistep`` no longer selects a wrapper, if a caller still asks for one."""
+    if multistep:
+        warnings.warn(
+            "multistep is deprecated and has no effect: the model wrapper serves single steps and rollouts, "
+            "and the number of steps comes from the Rollout",
+            FutureWarning,
+            stacklevel=3,
+        )
+
+
 def get_model(
-    params: ParamsBase, use_stochastic_interpolation: bool = False, multistep: bool = False, **kwargs
+    params: ParamsBase, use_stochastic_interpolation: bool = False, multistep: bool = False
 ) -> "torch.nn.Module":
     """
-    Convenience routine that constructs the model passing parameters and kwargs.
+    Convenience routine that constructs the model from the parameters.
     Unloads all the parameters in the params datastructure as a dict.
 
     Parameters
     ----------
     params : ParamsBase
         parameter struct.
+    use_stochastic_interpolation : bool, optional
+        Wrap the network in a :class:`StochasticInterpolantWrapper` instead of a
+        :class:`~makani.models.stepper.StepWrapper`. By default ``False``.
+    multistep : bool, optional
+        Deprecated and without effect: the same wrapper serves single steps and
+        rollouts, and the number of steps comes from the
+        :class:`~makani.utils.dataloaders.rollout.Rollout`. ``True`` warns.
 
     Returns
     -------
     model : torch.nn.Module
-        The registered model.
+        The registered network, wrapped in a
+        :class:`~makani.models.stepper.StepWrapper` (or a
+        :class:`StochasticInterpolantWrapper`).
 
     Raises
     ------
     KeyError
         If no model is registered under the provided name.
     """
+
+    warn_multistep_deprecated(multistep)
 
     # conditional import for constraints
     if hasattr(params, "constraints"):
@@ -255,11 +278,7 @@ def get_model(
         )
 
     if not use_stochastic_interpolation:
-        # wrap into Multi-Step if requested
-        if multistep:
-            model = MultiStepWrapper(params, model_handle)
-        else:
-            model = SingleStepWrapper(params, model_handle)
+        model = StepWrapper(params, model_handle)
     else:
         model = StochasticInterpolantWrapper(
             params,

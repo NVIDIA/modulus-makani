@@ -26,6 +26,7 @@ from makani.utils.YParams import ParamsBase, ensure_resampled_shapes
 from makani.utils.driver import Driver
 from makani.third_party.climt.zenith_angle_v2 import cos_zenith_angle
 from makani.utils.dataloaders.data_helpers import get_data_normalization
+from makani.utils.dataloaders.batch import ZENITH
 from makani.models import model_registry
 import datetime
 import logging
@@ -99,8 +100,10 @@ class ModelWrapper(torch.nn.Module):
     r"""
     Model wrapper to make inference simple outside of makani.
 
-    Presents a trained model as a plain callable that takes physical fields and
-    a valid time, so downstream consumers do not need makani's training
+    Presents a trained model as a plain callable that takes the fields, either
+    normalized by the dataset statistics (the default) or in physical units
+    (``normalized_data=False``), and a valid time, so downstream consumers do
+    not need makani's training
     machinery. The wrapper owns the pieces that would otherwise be the caller's
     problem: input and output normalization, the lat-lon grid definition, and
     the solar zenith angle channel, which has to be computed from the valid time
@@ -216,11 +219,18 @@ class ModelWrapper(torch.nn.Module):
     def update_state(self, replace_state=True, batch_size=None):
         """Advance the stochastic state without running a forward pass.
 
-        ``batch_size`` sizes the noise state; pass the batch you intend to run
-        with. Leaving it None keeps whatever size the state currently has, which
-        for a freshly loaded package is ``params.batch_size`` (usually 1).
-        :meth:`forward` sizes the state itself, so this is only needed when
-        priming the state ahead of the first call.
+        :meth:`forward` sizes the state itself when called with
+        ``replace_state=True``; prime it here only to continue a sequence from
+        the first call on, at the batch you intend to run.
+
+        Parameters
+        ----------
+        replace_state : bool, optional
+            Draw a fresh state instead of taking one autoregressive step. By
+            default ``True``.
+        batch_size : int, optional
+            Size the noise state to this batch. ``None`` keeps the current size,
+            which for a freshly loaded package is ``params.batch_size`` (usually 1).
         """
         self.model.preprocessor.update_internal_state(replace_state=replace_state, batch_size=batch_size)
         return
@@ -243,26 +253,14 @@ class ModelWrapper(torch.nn.Module):
         return
 
     def _zenith_features(self, x, time):
-        """Build the cached cosine-zenith channel for ``x`` at valid time(s) ``time``.
+        """Build the cosine-zenith feature for ``x`` at valid time(s) ``time``.
 
-        Returns a tensor of shape ``(B, nhist, H, W)`` where ``B == x.shape[0]``
-        and ``nhist == n_history + 1``. That is the layout
-        :meth:`Preprocessor2D._append_channels` requires: it calls
-        ``expand_history`` on the cached tensor, which reshapes ``(B, nhist, H, W)``
-        into ``(B, nhist, 1, H, W)`` before concatenating along the channel axis.
+        Returns a tensor of shape ``(B, nhist, 1, H, W)``, a dynamic feature as
+        the preprocessor takes it, where ``B == x.shape[0]`` and
+        ``nhist == n_history + 1``.
 
         See :meth:`forward` for the ``time`` contract this enforces.
         """
-        # Only the zenith path depends on the input rank: history has to live in the
-        # flattened channel axis for (B, nhist, H, W) to line up with it. The rest of
-        # the pipeline broadcasts over other ranks, so this stays scoped here rather
-        # than becoming a blanket check in _prepare_input.
-        if x.ndim != 4:
-            raise ValueError(
-                f"add_zenith: expected a 4D (B, (n_history+1)*C, H, W) input, got {x.ndim}D. "
-                f"History is carried in the flattened channel axis, not a separate dim."
-            )
-
         nhist = self.model.preprocessor.n_history + 1
         batch_size = x.shape[0]
 
@@ -287,32 +285,41 @@ class ModelWrapper(torch.nn.Module):
                 f"history window across the whole batch."
             )
 
-        return z
+        return z.unsqueeze(2)
 
     def _prepare_input(self, x, time, normalized_data):
-        """Normalize the input and cache the time-dependent unpredicted features.
+        """Normalize the input.
 
-        ``x`` is normally ``(B, (n_history + 1) * C, H, W)``; that layout is
-        required when ``add_zenith`` is set, but not otherwise. See :meth:`forward`
-        for the batching contract on ``time``.
+        ``x`` is ``(B, (n_history + 1) * C, H, W)``, history in the flattened
+        channel axis, oldest first, or ``(B, n_history + 1, C, H, W)``. Returns
+        the input with the time axis explicit, as :class:`StepWrapper` takes it.
         """
-        if not normalized_data:
-            # the statistics are per channel, (1, C, 1, 1), while the history steps are
-            # stacked along the channel dimension, so normalize each step separately
-            preprocessor = self.model.preprocessor
-            n_steps = self.params.get("n_history", 0) + 1
-            if x.dim() == 4:
-                x = preprocessor.expand_history(x, n_steps)
-                x = (x - self.in_bias.unsqueeze(1)) / self.in_scale.unsqueeze(1)
-                x = preprocessor.flatten_history(x)
-            else:
-                x = (x - self.in_bias.unsqueeze(1)) / self.in_scale.unsqueeze(1)
+        preprocessor = self.model.preprocessor
+        if x.dim() == 4:
+            x = preprocessor.expand_history(x, preprocessor.n_history + 1)
 
-        if self.add_zenith:
-            z = self._zenith_features(x, time)
-            self.model.preprocessor.cache_unpredicted_features(None, None, xz=z, yz=None)
+        if not normalized_data:
+            # the statistics are per channel, (1, C, 1, 1); broadcast them over the time steps
+            x = (x - self.in_bias.unsqueeze(1)) / self.in_scale.unsqueeze(1)
 
         return x
+
+    def _step_inputs(self, x, time, normalized_data, replace_state):
+        """Everything :class:`StepWrapper` takes for one step: the window, its dynamic features and its noise.
+
+        The noise state is advanced here, replaced if ``replace_state`` is set, at the batch of ``x``;
+        see :meth:`forward` for the batching contract on ``time`` and the noise.
+        """
+        x = self._prepare_input(x, time, normalized_data)
+        features = {ZENITH: self._zenith_features(x, time)} if self.add_zenith else {}
+
+        noise = None
+        noise_source = self.model.preprocessor.noise_source(batch_size=x.shape[0])
+        if noise_source is not None:
+            noise_source.update(replace_state=replace_state)
+            noise = noise_source()
+
+        return x, features, noise
 
     def encode_process(self, x, time, normalized_data=True, replace_state=None):
         """Return the backbone's processed latent state without running its decoder.
@@ -324,17 +331,29 @@ class ModelWrapper(torch.nn.Module):
         in the backbone's latent feature space and ``normalized_data`` affects
         only how ``x`` is interpreted, never the output.
 
+        Like :meth:`forward`, the call advances the noise state by one step, so
+        ``encode_process`` followed by ``forward`` on the same input draws two
+        different noise samples.
+
+        Parameters
+        ----------
+        x, time, normalized_data, replace_state
+            As in :meth:`forward`.
+
+        Returns
+        -------
+        torch.Tensor
+            The latent features, ``(B, embed_dim, h, w)`` on the internal grid of
+            the backbone.
+
         Raises
         ------
         NotImplementedError
-            If the wrapped step wrapper or backbone does not implement
-            ``encode_process`` (currently only :class:`SingleStepWrapper` around
-            FCN3 does; ``MultiStepWrapper`` and ``ConstraintsWrapper`` do not).
+            If the backbone does not implement ``encode_process`` (currently only
+            FCN3 does).
         """
-        if not hasattr(self.model, "encode_process"):
-            raise NotImplementedError(f"{type(self.model).__name__} does not expose encode_process().")
-        x = self._prepare_input(x, time, normalized_data)
-        return self.model.encode_process(x, replace_state=replace_state)
+        x, features, noise = self._step_inputs(x, time, normalized_data, replace_state)
+        return self.model.encode(x, features, noise)
 
     def forward(self, x, time, normalized_data=True, replace_state=None):
         """Advance the model state by one timestep.
@@ -342,8 +361,9 @@ class ModelWrapper(torch.nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Input state, shape ``(B, (n_history + 1) * C, H, W)``. History is
-            carried in the flattened channel axis, oldest first.
+            Input state, shape ``(B, (n_history + 1) * C, H, W)`` with the
+            history in the flattened channel axis, oldest first, or
+            ``(B, n_history + 1, C, H, W)``.
         time : datetime or array of datetimes
             Valid time(s) for ``x``; see the contract below.
         normalized_data : bool, optional
@@ -351,7 +371,9 @@ class ModelWrapper(torch.nn.Module):
             denormalized on the way out. If True (default), both are assumed to
             already be in normalized space.
         replace_state : bool or None, optional
-            Forwarded to the step wrapper's stochastic-state update.
+            If true, draw a fresh noise state at the batch of ``x`` before the
+            step; otherwise continue the noise sequence by one step. Ignored for
+            a model without input noise.
 
         Returns
         -------
@@ -362,13 +384,11 @@ class ModelWrapper(torch.nn.Module):
         Notes
         -----
         **Batching contract.**
-        Any batch size ``B`` is supported. Two pieces of internal state are
-        sized from ``B`` on every call:
-
-        * The cached cosine-zenith channel, built to ``(B, n_history + 1, H, W)``.
-        * The stochastic noise state, resized by the step wrapper. Note this is
-          independent of ``params.batch_size``, which is a *training* setting and
-          is typically 1 in a packaged model.
+        Any batch size ``B`` is supported. The cosine-zenith feature is built to
+        ``(B, n_history + 1, 1, H, W)`` on every call, and the stochastic noise
+        state, the only state the package keeps between calls, is sized to
+        ``B``. Note this is independent of ``params.batch_size``, which is a
+        *training* setting and is typically 1 in a packaged model.
 
         For a model with input noise, the first call at a new ``B`` must draw a
         fresh state: pass ``replace_state=True``, or prime once up front with
@@ -386,12 +406,20 @@ class ModelWrapper(torch.nn.Module):
         count raises rather than silently mis-broadcasting. At ``B == 1`` the two
         forms coincide.
 
-        Keep ``B`` fixed across a rollout. Changing it mid-rollout reallocates
-        the noise state, which discards the autoregressive noise history for
-        stateful noise modules.
+        Keep ``B`` fixed across a rollout. Changing it mid-rollout is refused for
+        stateful noise unless ``replace_state=True``, which starts a fresh noise
+        sequence.
+
+        Raises
+        ------
+        RuntimeError
+            If stateful noise would have to be resized while continuing its
+            sequence, see above.
         """
-        x = self._prepare_input(x, time, normalized_data)
-        out = self.model(x, replace_state=replace_state)
+        x, features, noise = self._step_inputs(x, time, normalized_data, replace_state)
+
+        # one step, (B, 1, C_out, H, W)
+        out = self.model.predict(x, features, noise).squeeze(1)
 
         if not normalized_data:
             out = out * self.out_scale + self.out_bias
@@ -449,7 +477,12 @@ def save_model_package(params):
 def load_model_package(package, pretrained=True, device="cpu", multistep=False):
     """
     Loads model package and return the wrapper which can be used for inference.
+
+    ``multistep`` is deprecated and has no effect: the same wrapper serves
+    single steps and rollouts. ``True`` warns.
     """
+    model_registry.warn_multistep_deprecated(multistep)
+
     path = package.get("config.json")
     params = ParamsBase.from_json(path)
     # resampled shapes are set at runtime from the dataset during training and are
@@ -465,7 +498,7 @@ def load_model_package(package, pretrained=True, device="cpu", multistep=False):
     params.img_local_shape_y = params.img_shape_y
 
     # get the model and
-    model = model_registry.get_model(params, multistep=multistep).to(device)
+    model = model_registry.get_model(params).to(device)
 
     if pretrained:
         best_checkpoint_path = package.get(LocalPackage.MODEL_PACKAGE_CHECKPOINT_PATH)

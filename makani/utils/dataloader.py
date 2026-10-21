@@ -82,12 +82,6 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
     # get data normalization
     bias, scale = get_data_normalization(params)
 
-    # sanity check
-    if not params.get("multifiles", False):
-        _have_dali = importlib.util.find_spec("nvidia.dali") is not None
-        if not _have_dali:
-            raise ImportError("Setting multifiles to False requires nvidia-dali, but module was not found.")
-
     if params.get("multifiles", False):
         from makani.utils.dataloaders.data_loader_multifiles import MultifilesDataset as MultifilesDataset2D
         from torch.utils.data.distributed import DistributedSampler
@@ -108,7 +102,6 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
             crop_anchor=(params.get("crop_anchor_x", 0), params.get("crop_anchor_y", 0)),
             subsampling_factor=params.get("subsampling_factor", 1),
             grid_type=params.data_grid_type,
-            return_timestamp=(True if (mode == "inference") else False),
             return_target=(False if (mode == "inference") else True),
             dataset_name=params.get("h5_path", "fields"),
             timestamp_name=params.get("timestamp_name", "timestamp"),
@@ -198,7 +191,6 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
             crop_anchor=(params.get("crop_anchor_x", 0), params.get("crop_anchor_y", 0)),
             subsampling_factor=params.get("subsampling_factor", 1),
             grid_type=params.data_grid_type,
-            return_timestamp=(True if (mode == "inference") else False),
             return_target=(False if (mode == "inference") else True),
             io_grid=params.get("io_grid", [1, 1, 1]),
             io_rank=params.get("io_rank", [0, 0, 0]),
@@ -219,18 +211,16 @@ def get_dataloader(params, files_pattern, device, mode="train", dali_device=None
         sampler = None
 
     else:
+        # only this branch needs DALI; the synthetic one above does not
+        if importlib.util.find_spec("nvidia.dali") is None:
+            raise ImportError("Setting multifiles to False requires nvidia-dali, but module was not found.")
+
         from makani.utils.dataloaders.dali_dataloader import DaliDataloader
 
         # dali loader
         if dali_device is None:
             dali_device = "gpu" if torch.cuda.is_available() else "cpu"
-        dataloader = DaliDataloader(
-            params,
-            files_pattern,
-            (mode == "train"),
-            dali_device=dali_device,
-            return_timestamp=(True if (mode == "inference") else False),
-        )
+        dataloader = DaliDataloader(params, files_pattern, (mode == "train"), dali_device=dali_device)
 
         data_shapes = dataloader.data_shapes
 

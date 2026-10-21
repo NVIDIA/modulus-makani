@@ -605,6 +605,22 @@ def init_wb2_zarr_dataset(
     return train_path, num_train, test_path, num_test, stats_path, metadata_path, None
 
 
+def single_step_rollout(inp, dynamic_features=None, noise_source=None):
+    """A rollout over one step from the window ``inp``, ``(B, T, C, *grid)``, without targets.
+
+    For calling a wrapper through its ``forward``, e.g. under DDP, with a single step.
+    """
+    from makani.utils.dataloaders.batch import INPUT, INPUT_DYNAMIC_FEATURES, INPUT_TIMESTAMP
+    from makani.utils.dataloaders.rollout import Rollout
+
+    batch = {
+        INPUT: inp,
+        INPUT_DYNAMIC_FEATURES: dict(dynamic_features or {}),
+        INPUT_TIMESTAMP: torch.zeros(inp.shape[:2], dtype=torch.float64, device=inp.device),
+    }
+    return Rollout(batch, n_steps=1, noise_source=noise_source)
+
+
 def _is_inexact_tensor(tensor):
     # floating point or complex
     return tensor.is_floating_point() or tensor.is_complex()

@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union, Tuple
+from dataclasses import dataclass
+from typing import Dict, NamedTuple, Optional, Tuple, Union
 
 
 import torch
@@ -24,6 +25,7 @@ from makani.utils.grids import GridQuadrature, grid_to_quadrature_rule
 from makani.mpu.mappings import copy_to_parallel_region
 
 from makani.models.preprocessor_helpers import get_bias_correction, get_static_features
+from makani.utils.dataloaders.batch import ZENITH
 
 
 @torch.compiler.disable
@@ -39,35 +41,124 @@ def _run_eager(fn, *args, **kwargs):
     return fn(*args, **kwargs)
 
 
+class HistoryStats(NamedTuple):
+    r"""
+    Normalization statistics of one history window.
+
+    ``mean`` and ``std`` are ``(B, 1, C, 1, 1)``, so that they broadcast over the
+    time and grid dimensions, or zeros and ones of shape ``(1, 1, 1, 1, 1)`` in
+    the ``"none"`` mode; the ``"timediff"`` mode fills ``diff_mean`` and
+    ``diff_var`` instead.
+    """
+
+    mean: Optional[torch.Tensor] = None
+    std: Optional[torch.Tensor] = None
+    diff_mean: Optional[torch.Tensor] = None
+    diff_var: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True)
+class NoiseState:
+    r"""
+    A snapshot of the input noise, to continue its sequence in another rollout.
+
+    Holds the state tensor of the noise module, detached, and the states of its
+    generators, so that the continued sequence is the one an uninterrupted
+    rollout would have drawn. See
+    :meth:`~makani.utils.dataloaders.rollout.Rollout.noise_state`.
+    """
+
+    tensor: torch.Tensor
+    rng_cpu: Optional[torch.Tensor]
+    rng_gpu: Optional[torch.Tensor]
+
+    @property
+    def batch_size(self) -> int:
+        """The batch the state was taken at."""
+        return self.tensor.shape[0]
+
+
+class _NoiseSource:
+    """
+    The input noise of a preprocessor, as :class:`~makani.utils.dataloaders.rollout.Rollout` drives it.
+
+    Sizes the noise state to the batch of the rollout, with the guard of
+    :meth:`Preprocessor2D.update_internal_state` against resizing stateful
+    noise in the middle of a sequence. ``version`` counts the changes of the
+    noise state, so a rollout can tell whether the shared noise module has been
+    advanced by someone else since its last step.
+    """
+
+    def __init__(self, preprocessor, batch_size=None):
+        self.preprocessor = preprocessor
+        self.batch_size = batch_size
+
+    @property
+    def version(self) -> int:
+        """Counts the changes of the noise state, by any caller."""
+        return self.preprocessor._noise_version
+
+    def update(self, replace_state=False):
+        """Replace the state at the batch of the rollout, or take one autoregressive step."""
+        self.preprocessor.update_internal_state(replace_state=replace_state, batch_size=self.batch_size)
+
+    def __call__(self):
+        """The noise sample of the current state."""
+        # eagerly: the noise is complex-valued and cannot be inductor-compiled, see _run_eager
+        return _run_eager(self.preprocessor.input_noise)
+
+    def get_state(self) -> NoiseState:
+        """A detached snapshot of the state and the generators."""
+        pp = self.preprocessor
+        rng_cpu, rng_gpu = pp.get_internal_state(tensor=False)
+        return NoiseState(tensor=pp.get_internal_state(tensor=True), rng_cpu=rng_cpu, rng_gpu=rng_gpu)
+
+    def set_state(self, state: NoiseState):
+        """Restore a snapshot; raises ``ValueError`` if it was taken at another batch than the rollout's."""
+        if (self.batch_size is not None) and (state.batch_size != self.batch_size):
+            raise ValueError(
+                f"The noise state was taken at batch {state.batch_size}, the rollout runs at batch {self.batch_size}"
+            )
+        pp = self.preprocessor
+        pp.set_internal_state(state.tensor)
+        pp.set_internal_state((state.rng_cpu, state.rng_gpu))
+
+
 class Preprocessor2D(nn.Module):
     r"""
-    Input/output plumbing that surrounds the model in a rollout.
+    Input/output plumbing that surrounds the model in one step of a rollout.
 
-    Sits between the dataloader and the network and owns everything that is not
-    the model itself: history handling, static and unpredicted features, noise
-    injection, bias correction, and the normalization of the history window.
-    Keeping this in one module is what lets the network see a single flat
-    channel stack while the training loop still reasons in terms of time steps
-    and variable groups.
+    Sits between the data and the network and owns everything that is not the
+    model itself: dynamic and static features, noise injection, bias
+    correction, and the normalization of the history window.
+
+    Everything here works on tensors with an explicit time axis,
+    ``(B, T, C, H, W)``. The time steps are folded into the channels in exactly
+    one place, :meth:`pack_model_input`, right before the network, which still
+    takes a single flat channel stack.
+
+    The preprocessor keeps no state between steps: the input window, its
+    dynamic features and the noise sample of a step come from a
+    :class:`~makani.utils.dataloaders.rollout.Rollout`, which also slides the
+    window forward, and the history statistics of a step are returned to the
+    caller rather than stored. The one stateful part is the noise module, which
+    the rollout drives through :meth:`noise_source`.
 
     The main responsibilities are:
 
-    * **History.** Inputs may carry ``n_history + 1`` time steps. These are
-      flattened into the channel dimension for the model
-      (:meth:`flatten_history`) and expanded back when needed
-      (:meth:`expand_history`); :meth:`append_history` slides the window forward
-      by one step during autoregressive rollout.
-    * **Unpredicted features.** Quantities the model consumes but does not
-      predict, such as the solar zenith angle, are cached per step and appended
-      to the input. They must be carried over from the target to the input at
-      each rollout step, since the model cannot generate them itself.
+    * **Dynamic features.** Quantities the model consumes but does not
+      predict, such as the solar zenith angle. Which ones the model takes is
+      fixed by the configuration (:attr:`dynamic_features`); their values come
+      with the step and are appended to the input (:meth:`assemble_input`).
     * **Static features.** Time-invariant fields such as orography and the
-      land-sea mask, appended to every input.
+      land-sea mask, appended to every packed input.
     * **Noise.** Optional stochastic perturbation of the input, either
       concatenated as extra channels or added to selected channels, for
       ensemble forecasting.
+    * **History normalization.** Normalization of the input window with its
+      own statistics (:meth:`compute_history_stats`), undone on the prediction.
     * **Bias correction.** An optional additive correction applied to the
-      model input.
+      model output.
 
     Parameters
     ----------
@@ -75,14 +166,13 @@ class Preprocessor2D(nn.Module):
         Configuration object. Relevant keys include the image shape and
         resampled shape, ``n_history``, ``history_normalization_mode``,
         ``input_noise``, and the static-feature and bias-correction settings.
-
-    See Also
-    --------
-    get_preprocessor : factory that constructs this from a config.
     """
 
     def __init__(self, params):
         super().__init__()
+
+        # counts the changes of the noise state, see _NoiseSource.version
+        self._noise_version = 0
 
         # image shape — must be set first; used by quadrature and noise constructors below
         self.img_shape = [params.img_shape_x, params.img_shape_y]
@@ -116,17 +206,10 @@ class Preprocessor2D(nn.Module):
                 distributed=True,
             )
 
-        self.history_mean = None
-        self.history_std = None
-        self.history_diff_mean = None
-        self.history_diff_var = None
         self.history_eps = 1e-6
 
-        # unpredicted input channels:
-        self.unpredicted_inp_train = None
-        self.unpredicted_tar_train = None
-        self.unpredicted_inp_eval = None
-        self.unpredicted_tar_eval = None
+        # the dynamic features the model takes, in the order their channels are appended
+        self.dynamic_features = [ZENITH] if params.get("add_zenith", False) else []
 
         # get bias correction
         bias = get_bias_correction(params)
@@ -235,8 +318,8 @@ class Preprocessor2D(nn.Module):
         r"""
         Fold the time dimension into the channel dimension.
 
-        The network takes a single channel stack, so a history window has to be
-        flattened before it is passed in.
+        Only for the boundary to code that still takes a flat channel stack, the
+        network and the losses; everything in between keeps the time axis.
 
         Parameters
         ----------
@@ -294,196 +377,161 @@ class Preprocessor2D(nn.Module):
             x = torch.reshape(x, (b_, nhist, ct_ // nhist, h_, w_))
         return x
 
-    def add_static_features(self, x):
+    def _check_time_axis(self, x, caller):
+        torch._check(
+            x.dim() == 5,
+            lambda: f"{caller}: expected a tensor with an explicit time axis, (B, T, C, H, W), got shape {tuple(x.shape)}",
+        )
+
+    def pack_model_input(self, x):
         r"""
-        Append the time-invariant feature channels to the input.
+        Pack the input into the single channel stack the network takes.
+
+        The one place where the time axis is folded into the channels: the time
+        steps are stacked oldest first, and the static features, which have no
+        time axis, are appended after them.
 
         Parameters
         ----------
         x : torch.Tensor
-            Tensor of shape ``(B, C, H, W)``.
+            Input of shape ``(B, T, C, H, W)``, with the dynamic features
+            already appended.
 
         Returns
         -------
         torch.Tensor
-            Tensor of shape ``(B, C + n_static, H, W)``, or ``x`` unchanged if
-            no static features are configured.
+            Tensor of shape ``(B, T * C + n_static, H, W)``.
         """
+        self._check_time_axis(x, "pack_model_input")
+
+        x = self.flatten_history(x)
+
         if self.do_add_static_features:
-            # we need to replicate the grid for each batch:
+            # the same fields for every sample
             static = torch.tile(self.static_features, dims=(x.shape[0], 1, 1, 1))
             x = torch.cat([x, static], dim=1)
 
         return x
 
-    def remove_static_features(self, x):
+    def assemble_input(self, x, dynamic_features: Dict[str, torch.Tensor], noise: Optional[torch.Tensor] = None):
         r"""
-        Strip the static feature channels appended by :meth:`add_static_features`.
+        Append the dynamic features and the noise to the input.
+
+        The features and the noise sample are passed in, as a
+        :class:`~makani.utils.dataloaders.rollout.RolloutStep` carries them.
+        The channels are appended in a fixed order,
+        ``[x | dynamic features, in the order of dynamic_features | noise]``;
+        in ``perturb`` mode the noise is added to the selected channels instead.
 
         Parameters
         ----------
         x : torch.Tensor
-            Tensor of shape ``(B, C + n_static, H, W)``, with the static
-            features occupying the trailing channels.
+            Input of shape ``(B, n_history + 1, C, H, W)``.
+        dynamic_features : dict
+            The features of the window by name, each ``(B, n_history + 1, C_f, H, W)``.
+            Has to hold exactly the features the model takes, :attr:`dynamic_features`.
+        noise : torch.Tensor, optional
+            The noise sample for this window. Required if, and only if, the
+            preprocessor has input noise.
 
         Returns
         -------
         torch.Tensor
-            Tensor of shape ``(B, C, H, W)``, or ``x`` unchanged if no static
-            features are configured.
+            Input with the appended channels, ``(B, n_history + 1, C', H, W)``.
+
+        Raises
+        ------
+        ValueError
+            If the features are not the ones the model takes, or the noise is
+            missing or unexpected.
         """
-        # only remove if something was added in the first place
-        if self.do_add_static_features:
-            nfeat = self.static_features.shape[1]
-            x = x[:, : x.shape[1] - nfeat, :, :]
-        return x
+        self._check_time_axis(x, "assemble_input")
 
-    def append_history(self, x1, x2, step, update_state=True):
-        r"""
-        Slide the history window forward by one autoregressive step.
+        if set(dynamic_features) != set(self.dynamic_features):
+            raise ValueError(
+                f"assemble_input: the model takes the dynamic features {sorted(self.dynamic_features)}, "
+                f"got {sorted(dynamic_features)}"
+            )
+        if hasattr(self, "input_noise") != (noise is not None):
+            raise ValueError(
+                "assemble_input: the preprocessor has input noise, but no noise sample was given"
+                if noise is None
+                else "assemble_input: a noise sample was given, but the preprocessor has no input noise"
+            )
 
-        Drops the oldest time step from ``x1`` and appends the new prediction
-        ``x2``, producing the input for the next step of the rollout.
-
-        This also advances the cached unpredicted features: quantities such as
-        the solar zenith angle are known in advance but not predicted by the
-        model, so the target's copy for this step has to be moved into the input
-        buffer or the next step would be conditioned on stale values. Whether
-        the train or eval buffers are updated follows the module's training
-        mode.
-
-        Parameters
-        ----------
-        x1 : torch.Tensor
-            Current input history, shape ``(B, (n_history + 1) * C, H, W)``.
-        x2 : torch.Tensor
-            Newly predicted step, shape ``(B, C, H, W)``.
-        step : int
-            Index of the current rollout step, used to select the corresponding
-            unpredicted features. Steps beyond the cached range leave the
-            unpredicted features untouched.
-        update_state : bool, optional
-            If ``False``, skip advancing the unpredicted feature buffers and
-            only shift the history. By default ``True``.
-
-        Returns
-        -------
-        torch.Tensor
-            Updated history of the same shape as ``x1``. With
-            ``n_history == 0`` this is just ``x2``.
-        """
-
-        # update the unpredicted input
-        if update_state:
-            if self.training:
-                if (self.unpredicted_tar_train is not None) and (step < self.unpredicted_tar_train.shape[1]):
-                    utar = self.unpredicted_tar_train[:, step : (step + 1), :, :, :]
-                    if self.n_history == 0:
-                        self.unpredicted_inp_train.copy_(utar)
-                    else:
-                        self.unpredicted_inp_train.copy_(
-                            torch.cat([self.unpredicted_inp_train[:, 1:, :, :, :], utar], dim=1)
-                        )
-            else:
-                if (self.unpredicted_tar_eval is not None) and (step < self.unpredicted_tar_eval.shape[1]):
-                    utar = self.unpredicted_tar_eval[:, step : (step + 1), :, :, :]
-                    if self.n_history == 0:
-                        self.unpredicted_inp_eval.copy_(utar)
-                    else:
-                        self.unpredicted_inp_eval.copy_(
-                            torch.cat([self.unpredicted_inp_eval[:, 1:, :, :, :], utar], dim=1)
-                        )
-
-        if self.n_history > 0:
-            # this is more complicated
-            x1 = self.expand_history(x1, nhist=self.n_history + 1)
-            x2 = self.expand_history(x2, nhist=1)
-
-            # append
-            res = torch.cat([x1[:, 1:, :, :, :], x2], dim=1)
-
-            # flatten again
-            res = self.flatten_history(res)
-        else:
-            res = x2
-
-        return res
-
-    def _append_channels(self, x, xc):
-
-        # x-dimension
-        xdim = x.dim()
-
-        # expand history
-        x = self.expand_history(x, self.n_history + 1)
-
-        # the cached features, if any; the noise below is appended either way
         appended = []
-        if xc is not None:
-            # Batch alignment between input and cached unpredicted features.
-            # If these diverge, the `cat` below would fail with a cryptic message —
-            # fail up-front with context about the likely cause. torch._check keeps
-            # this a runtime assertion under torch.compile instead of a graph break.
+        for name in self.dynamic_features:
+            feature = dynamic_features[name]
+            # if these diverge, the cat below would fail with a cryptic message. torch._check
+            # keeps this a runtime assertion under torch.compile instead of a graph break.
             torch._check(
-                x.shape[0] == xc.shape[0],
+                (feature.shape[0] == x.shape[0]) and (feature.shape[1] == x.shape[1]),
                 lambda: (
-                    f"_append_channels: batch mismatch between input ({x.shape[0]}) and "
-                    f"cached unpredicted features ({xc.shape[0]}). "
-                    f"Did you cache xz/yz at a different batch size than the current forward?"
+                    f"assemble_input: '{name}' has batch and time {tuple(feature.shape[:2])}, "
+                    f"the input {tuple(x.shape[:2])}. Was it made at a different batch size?"
                 ),
             )
-            appended.append(self.expand_history(xc, self.n_history + 1))
+            appended.append(feature)
 
-        # this routine also adds noise every time a channel gets appended
-        if hasattr(self, "input_noise"):
-            # run the noise module eagerly: it is complex-valued (SHT) and cannot be inductor-
-            # compiled; the method-level disable on its forward is not honored through the
-            # nn.Module call, so break at the call site. See _run_eager.
-            n = _run_eager(self.input_noise)
+        if noise is not None:
             torch._check(
-                n.shape[0] == x.shape[0],
-                lambda: (
-                    f"_append_channels: batch mismatch between input_noise state "
-                    f"({n.shape[0]}) and input ({x.shape[0]}). "
-                    f"Did you call update_internal_state(batch_size=...) at a different "
-                    f"batch than the current forward pass?"
-                ),
+                noise.shape[0] == x.shape[0],
+                lambda: f"assemble_input: the noise has batch {noise.shape[0]}, the input {x.shape[0]}",
             )
             if self.input_noise_mode == "concatenate":
-                appended.append(n)
+                appended.append(noise)
             elif self.input_noise_mode == "perturb":
                 # fully out-of-place: build a zero noise field and add to all channels
                 noise_full = torch.zeros_like(x)
-                noise_full[:, :, self.perturb_channels] = n
+                noise_full[:, :, self.perturb_channels] = noise
                 x = x + noise_full
 
-        # concatenate
-        xo = torch.cat([x] + appended, dim=2)
+        if not appended:
+            return x
 
-        # flatten if requested
-        if xdim == 4:
-            xo = self.flatten_history(xo)
+        return torch.cat([x] + appended, dim=2)
 
-        return xo
-
-    def history_compute_stats(self, x):
+    def noise_source(self, batch_size=None):
         r"""
-        Compute and cache the normalization statistics for a history window.
+        The input noise as a noise source for a :class:`~makani.utils.dataloaders.rollout.Rollout`.
 
-        Must be called before :meth:`history_normalize` or
-        :meth:`history_denormalize`, and re-called whenever the batch size
-        changes. Statistics are area-weighted using the grid quadrature, so
-        they are true spherical means rather than uniform grid averages, and
-        are broadcast across the spatial model-parallel group so every rank
-        normalizes identically.
+        Parameters
+        ----------
+        batch_size : int, optional
+            The batch of the rollout. The noise state is resized to it when the
+            rollout replaces the state at its first step; continuing a sequence
+            at another batch raises, see :meth:`update_internal_state`, and so
+            does restoring a :class:`NoiseState` taken at another batch.
+            ``None`` leaves the state at its current size.
+
+        Returns
+        -------
+        object or None
+            The source, with ``update(replace_state)``, a call for the sample,
+            ``get_state()`` and ``set_state(state)`` for a :class:`NoiseState`,
+            and the ``version`` of the noise state. ``None`` if no input noise
+            is configured.
+        """
+        if not hasattr(self, "input_noise"):
+            return None
+
+        return _NoiseSource(self, batch_size=batch_size)
+
+    def compute_history_stats(self, x) -> HistoryStats:
+        r"""
+        Compute the normalization statistics of a history window.
+
+        Statistics are area-weighted using the grid quadrature, so they are true
+        spherical means rather than uniform grid averages, and are broadcast
+        across the spatial model-parallel group so every rank normalizes
+        identically.
 
         The behavior depends on ``history_normalization_mode``:
 
         * ``"none"`` -- statistics are set to zero mean and unit standard
           deviation, making normalization a no-op.
         * ``"timediff"`` -- statistics of the *differences* between consecutive
-          time steps are cached instead, characterizing the tendency rather than
-          the state.
+          time steps, characterizing the tendency rather than the state.
         * anything else (e.g. ``"exponential"``) -- a weighted mean and standard
           deviation over the history window, using
           ``history_normalization_weights``.
@@ -491,104 +539,70 @@ class Preprocessor2D(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            History window of shape ``(B, (n_history + 1) * C, H, W)`` or
-            ``(B, T, C, H, W)``.
+            History window of shape ``(B, n_history + 1, C, H, W)``.
 
         Returns
         -------
-        None
-            Results are stored on the module as ``history_mean`` /
-            ``history_std`` (or ``history_diff_mean`` / ``history_diff_var``
-            in ``"timediff"`` mode).
+        HistoryStats
+            The statistics, to pass to :meth:`history_normalize` and
+            :meth:`history_denormalize`.
         """
-        if self.history_normalization_mode == "none":
-            self.history_mean = torch.zeros((1, 1, 1, 1), dtype=torch.float32, device=x.device)
-            self.history_std = torch.ones((1, 1, 1, 1), dtype=torch.float32, device=x.device)
-        elif self.history_normalization_mode == "timediff":
-            # reshaping
-            xdim = x.dim()
-            if xdim == 4:
-                b_, c_, h_, w_ = x.shape
-                xr = torch.reshape(x, (b_, (self.n_history + 1), c_ // (self.n_history + 1), h_, w_))
-            else:
-                xshape = x.shape
-                xr = x
+        self._check_time_axis(x, "compute_history_stats")
 
+        if self.history_normalization_mode == "none":
+            return HistoryStats(
+                mean=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32, device=x.device),
+                std=torch.ones((1, 1, 1, 1, 1), dtype=torch.float32, device=x.device),
+            )
+
+        if self.history_normalization_mode == "timediff":
             # time difference mean:
-            self.history_diff_mean = torch.mean(self.quadrature(xr[:, 1:, ...] - xr[:, 0:-1, ...]), dim=(1, 2))
+            diff_mean = torch.mean(self.quadrature(x[:, 1:, ...] - x[:, 0:-1, ...]), dim=(1, 2))
 
             # time difference std
-            self.history_diff_var = torch.mean(
-                self.quadrature(torch.square((xr[:, 1:, ...] - xr[:, 0:-1, ...]) - self.history_diff_mean)), dim=(1, 2)
+            diff_var = torch.mean(
+                self.quadrature(torch.square((x[:, 1:, ...] - x[:, 0:-1, ...]) - diff_mean)), dim=(1, 2)
             )
 
-            # time difference stds
-            self.history_diff_mean = copy_to_parallel_region(self.history_diff_mean, "spatial")
-            self.history_diff_var = copy_to_parallel_region(self.history_diff_var, "spatial")
-        else:
-            xdim = x.dim()
-            if xdim == 4:
-                b_, c_, h_, w_ = x.shape
-                xr = torch.reshape(x, (b_, (self.n_history + 1), c_ // (self.n_history + 1), h_, w_))
-            else:
-                xshape = x.shape
-                xr = x
-
-            # mean
-            # quadrature reduces (H, W) → (B, T, C); weighted sum over T with keepdim → (B, 1, C)
-            self.history_mean = torch.sum(self.quadrature(xr * self.history_normalization_weights), dim=1, keepdim=True)
-            # reshape to (B, 1, C, 1, 1) so it broadcasts with xr (B, T, C, H, W)
-            b_, _, c_ = self.history_mean.shape
-            self.history_mean = self.history_mean.reshape(b_, 1, c_, 1, 1)
-
-            # compute std: (B, T, C, H, W) - (B, 1, C, 1, 1) broadcasts correctly
-            self.history_std = torch.sum(
-                self.quadrature(torch.square(xr - self.history_mean) * self.history_normalization_weights),
-                dim=1,
-                keepdim=True,
+            return HistoryStats(
+                diff_mean=copy_to_parallel_region(diff_mean, "spatial"),
+                diff_var=copy_to_parallel_region(diff_var, "spatial"),
             )
-            self.history_std = torch.sqrt(self.history_std.reshape(b_, 1, c_, 1, 1))
 
-            # squeeze T dim → (B, C, 1, 1); spatial singletons broadcast in history_normalize
-            self.history_mean = self.history_mean.reshape(b_, c_, 1, 1)
-            self.history_std = self.history_std.reshape(b_, c_, 1, 1)
+        # quadrature reduces (H, W) -> (B, T, C); the weighted sum over T -> (B, 1, C)
+        mean = torch.sum(self.quadrature(x * self.history_normalization_weights), dim=1, keepdim=True)
+        b_, _, c_ = mean.shape
+        mean = mean.reshape(b_, 1, c_, 1, 1)
 
-            # copy to parallel region
-            self.history_mean = copy_to_parallel_region(self.history_mean, "spatial")
-            self.history_std = copy_to_parallel_region(self.history_std, "spatial")
+        std = torch.sum(
+            self.quadrature(torch.square(x - mean) * self.history_normalization_weights),
+            dim=1,
+            keepdim=True,
+        )
+        std = torch.sqrt(std.reshape(b_, 1, c_, 1, 1))
 
-        return
+        # copy to parallel region
+        return HistoryStats(mean=copy_to_parallel_region(mean, "spatial"), std=copy_to_parallel_region(std, "spatial"))
 
-    def _check_history_stats(self, x, caller: str):
-        """
-        Controlled-fail validation for history normalization paths.
-
-        - Raises RuntimeError if stats haven't been computed yet (caller forgot
-          history_compute_stats before normalize/denormalize).
-        - Raises ValueError if the input batch doesn't match the stats batch,
-          which in the mean/exponential modes is the only shape dim that isn't a
-          broadcast singleton. Common cause: stats were computed on one batch and
-          normalize/denormalize is being invoked on a differently-sized input
-          without a fresh history_compute_stats call.
-        """
-        if self.history_mean is None or self.history_std is None:
-            raise RuntimeError(
-                f"{caller}: history_mean / history_std are None. "
-                f"Call history_compute_stats(x) before {caller} (mode='{self.history_normalization_mode}')."
+    def _check_history_stats(self, x, caller: str, stats: HistoryStats):
+        # the batch is the only dimension of the statistics that is not a broadcast singleton
+        if (stats.mean is None) or (stats.std is None):
+            raise ValueError(
+                f"{caller}: the statistics have no mean and std; compute them with compute_history_stats "
+                f"in the same mode ('{self.history_normalization_mode}')"
             )
-        stats_batch = self.history_mean.shape[0]
+        stats_batch = stats.mean.shape[0]
         torch._check(
             stats_batch == x.shape[0],
             lambda: (
-                f"{caller}: batch mismatch between input ({x.shape[0]}) and cached "
-                f"history stats ({stats_batch}). Did you forget to call "
-                f"history_compute_stats on the current input before {caller}?"
+                f"{caller}: batch mismatch between input ({x.shape[0]}) and history stats ({stats_batch}). "
+                f"Were they computed on another window?"
             ),
         )
 
-    def history_normalize(self, x, target=False):
+    def history_normalize(self, x, stats: HistoryStats, target=False):
         r"""
-        Normalize a tensor with the cached history statistics.
+        Normalize a tensor with the history statistics.
 
         A no-op in the ``"none"`` and ``"timediff"`` modes, which do not define
         a state-space normalization.
@@ -596,157 +610,67 @@ class Preprocessor2D(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Tensor of shape ``(B, C, H, W)`` or ``(B, T, C, H, W)``. The
-            original layout is restored on return.
+            Tensor of shape ``(B, T, C, H, W)``.
+        stats : HistoryStats
+            The statistics, from :meth:`compute_history_stats`.
         target : bool, optional
-            If ``True``, treat ``x`` as a single-step target and use only the
-            leading channels of the statistics. If ``False`` (the default),
-            treat it as a full history window and tile the statistics over the
-            ``n_history + 1`` steps.
+            If ``True``, ``x`` holds only the predicted channels, which lead
+            the input channels the statistics were computed on, so only those
+            statistics are used. By default ``False``.
 
         Returns
         -------
         torch.Tensor
             Normalized tensor with the same shape as ``x``.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`history_compute_stats` has not been called yet.
         """
         if self.history_normalization_mode in ["none", "timediff"]:
             return x
 
-        self._check_history_stats(x, caller="history_normalize")
+        self._check_time_axis(x, "history_normalize")
+        self._check_history_stats(x, caller="history_normalize", stats=stats)
 
-        xdim = x.dim()
-        if xdim == 5:
-            xshape = x.shape
-            x = self.flatten_history(x)
+        mean, std = self._history_stats(x, target, stats)
 
-        # normalize
-        if target:
-            # strip off the unpredicted channels
-            xn = (x - self.history_mean[:, : x.shape[1], :, :]) / self.history_std[:, : x.shape[1], :, :]
-        else:
-            # tile to include history
-            hm = torch.tile(self.history_mean, (1, self.n_history + 1, 1, 1))
-            hs = torch.tile(self.history_std, (1, self.n_history + 1, 1, 1))
-            xn = (x - hm) / hs
+        return (x - mean) / std
 
-        if xdim == 5:
-            xn = torch.reshape(xn, xshape)
-
-        return xn
-
-    def history_denormalize(self, xn, target=False):
+    def history_denormalize(self, xn, stats: HistoryStats, target=False):
         r"""
-        Undo :meth:`history_normalize` using the cached statistics.
+        Undo :meth:`history_normalize`.
 
         A no-op in the ``"none"`` and ``"timediff"`` modes.
 
         Parameters
         ----------
         xn : torch.Tensor
-            Normalized tensor of shape ``(B, C, H, W)`` or ``(B, T, C, H, W)``.
+            Normalized tensor of shape ``(B, T, C, H, W)``.
+        stats : HistoryStats
+            The statistics, from :meth:`compute_history_stats`.
         target : bool, optional
-            If ``True``, treat ``xn`` as a single-step target and use only the
-            leading channels of the statistics; otherwise tile them over the
-            history window. By default ``False``.
+            If ``True``, ``xn`` holds only the predicted channels, see
+            :meth:`history_normalize`. By default ``False``.
 
         Returns
         -------
         torch.Tensor
             Denormalized tensor with the same shape as ``xn``.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`history_compute_stats` has not been called yet.
         """
         if self.history_normalization_mode in ["none", "timediff"]:
             return xn
 
-        self._check_history_stats(xn, caller="history_denormalize")
+        self._check_time_axis(xn, "history_denormalize")
+        self._check_history_stats(xn, caller="history_denormalize", stats=stats)
 
-        xndim = xn.dim()
-        if xndim == 5:
-            xnshape = xn.shape
-            xn = self.flatten_history(xn)
+        mean, std = self._history_stats(xn, target, stats)
 
-        # de-normalize
+        return xn * std + mean
+
+    def _history_stats(self, x, target, stats):
+        # (B, 1, C, 1, 1), broadcast over time and grid
+        mean, std = stats.mean, stats.std
         if target:
-            # strip off the unpredicted channels
-            x = xn * self.history_std[:, : xn.shape[1], :, :] + self.history_mean[:, : xn.shape[1], :, :]
-        else:
-            # tile to include history
-            hm = torch.tile(self.history_mean, (1, self.n_history + 1, 1, 1))
-            hs = torch.tile(self.history_std, (1, self.n_history + 1, 1, 1))
-            x = xn * hs + hm
-
-        if xndim == 5:
-            x = torch.reshape(x, xnshape)
-
-        return x
-
-    def _ensure_cached(self, name: str, tensor):
-        """
-        Centralized rebind for the cached unpredicted-feature attributes.
-
-        - tensor is None: the cached attribute is cleared to None.
-        - current is None or has a different shape: store a fresh clone.
-        - shapes match: in-place ``copy_`` to reuse the existing memory.
-
-        These are plain attributes (not registered buffers): they are per-step scratch
-        populated from dataloader output on-device, and should not appear in ``state_dict``.
-        """
-        current = getattr(self, name)
-        if tensor is None:
-            setattr(self, name, None)
-            return
-        if (current is not None) and (current.shape == tensor.shape):
-            current.copy_(tensor)
-        else:
-            setattr(self, name, tensor.clone())
-
-    def cache_unpredicted_features(self, x, y, xz=None, yz=None):
-        r"""
-        Cache the unpredicted input and target features for this sample.
-
-        Stores the auxiliary channels the model consumes but does not predict,
-        so that :meth:`append_history` and :meth:`append_unpredicted_features`
-        can draw on them during rollout. Separate train and eval caches are
-        kept, selected by the module's training mode, so that evaluation does
-        not clobber the state of an in-flight training step.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Model input. Passed through unchanged.
-        y : torch.Tensor
-            Model target. Passed through unchanged.
-        xz : torch.Tensor, optional
-            Unpredicted input features, shape ``(B, T, C_z, H, W)``. ``None``
-            clears the cache.
-        yz : torch.Tensor, optional
-            Unpredicted target features, shape ``(B, steps, C_z, H, W)``.
-            ``None`` clears the cache.
-
-        Returns
-        -------
-        x : torch.Tensor
-            The input, unchanged.
-        y : torch.Tensor
-            The target, unchanged.
-        """
-        if self.training:
-            self._ensure_cached("unpredicted_inp_train", xz)
-            self._ensure_cached("unpredicted_tar_train", yz)
-        else:
-            self._ensure_cached("unpredicted_inp_eval", xz)
-            self._ensure_cached("unpredicted_tar_eval", yz)
-
-        return x, y
+            num_channels = x.shape[2]
+            return mean[:, :, :num_channels], std[:, :, :num_channels]
+        return mean, std
 
     def get_base_seed(self, default=333):
         r"""
@@ -814,6 +738,7 @@ class Preprocessor2D(nn.Module):
             self.input_noise.set_rng(seed)
             if reset:
                 self.input_noise.reset()
+            self._noise_version += 1
         return
 
     def get_internal_state(self, tensor=False):
@@ -869,6 +794,7 @@ class Preprocessor2D(nn.Module):
                 self.input_noise.set_tensor_state(state)
             else:
                 self.input_noise.set_rng_state(*state)
+            self._noise_version += 1
 
         return
 
@@ -907,9 +833,10 @@ class Preprocessor2D(nn.Module):
         noise redraw from scratch every step, so for them a resize destroys
         nothing.
 
-        This matches what every caller already does: the ensemble trainer and the
-        inferencer resize only when priming an episode, always with
-        ``replace_state=True``, and then roll forward at a fixed batch.
+        This matches how a :class:`~makani.utils.dataloaders.rollout.Rollout`
+        drives the noise through :meth:`noise_source`: the state is resized only
+        when it is replaced at the first step, and then rolled forward at a
+        fixed batch.
         """
         if hasattr(self, "input_noise"):
             current_batch = self.input_noise.state.shape[0]
@@ -928,41 +855,8 @@ class Preprocessor2D(nn.Module):
                     f"new batch size, or keep the batch size fixed for the whole rollout."
                 )
             self.input_noise.update(replace_state=replace_state, batch_size=batch_size)
+            self._noise_version += 1
         return
-
-    def append_unpredicted_features(self, inp, target=False):
-        r"""
-        Append the cached unpredicted features to a tensor.
-
-        Also injects the input noise when configured, since noise is applied at
-        the same point in the pipeline. The train or eval cache is selected by
-        the module's training mode; if the relevant cache is empty, only the
-        noise is applied, and without noise the input is returned unchanged.
-
-        Parameters
-        ----------
-        inp : torch.Tensor
-            Tensor of shape ``(B, C, H, W)`` or ``(B, T, C, H, W)``. The
-            original layout is restored on return.
-        target : bool, optional
-            Append the target-side unpredicted features rather than the
-            input-side ones, by default ``False``.
-
-        Returns
-        -------
-        torch.Tensor
-            Tensor with the unpredicted feature channels appended.
-        """
-        if self.training:
-            cache = self.unpredicted_tar_train if target else self.unpredicted_inp_train
-        else:
-            cache = self.unpredicted_tar_eval if target else self.unpredicted_inp_eval
-
-        # noise is injected here as well, so an empty cache only means nothing to do without it
-        if (cache is None) and not hasattr(self, "input_noise"):
-            return inp
-
-        return self._append_channels(inp, cache)
 
     def get_static_features(self):
         r"""
@@ -979,39 +873,27 @@ class Preprocessor2D(nn.Module):
         else:
             return None
 
-    def get_unpredicted_features(self):
+    def stack_dynamic_features(self, features):
         r"""
-        Return copies of the cached unpredicted input and target features.
+        Stack dynamic features along the channel axis, in the order the model takes them.
 
-        Which cache is read follows the module's training mode.
+        For models that pack their input themselves rather than through
+        :meth:`assemble_input`.
+
+        Parameters
+        ----------
+        features : dict
+            Features by name, as a batch or a rollout step carries them.
 
         Returns
         -------
-        inpu : torch.Tensor or None
-            Cached unpredicted input features, or ``None`` if unset.
-        taru : torch.Tensor or None
-            Cached unpredicted target features, or ``None`` if unset.
+        torch.Tensor or None
+            ``(B, T, sum C_f, H, W)``, or ``None`` if the model takes no dynamic features.
         """
-        if self.training:
-            if self.unpredicted_inp_train is not None:
-                inpu = self.unpredicted_inp_train.clone()
-            else:
-                inpu = None
-            if self.unpredicted_tar_train is not None:
-                taru = self.unpredicted_tar_train.clone()
-            else:
-                taru = None
-        else:
-            if self.unpredicted_inp_eval is not None:
-                inpu = self.unpredicted_inp_eval.clone()
-            else:
-                inpu = None
-            if self.unpredicted_tar_eval is not None:
-                taru = self.unpredicted_tar_eval.clone()
-            else:
-                taru = None
+        if not self.dynamic_features:
+            return None
 
-        return inpu, taru
+        return torch.cat([features[name] for name in self.dynamic_features], dim=2)
 
     def correct_bias(self, inp: torch.Tensor):
         r"""
@@ -1032,24 +914,3 @@ class Preprocessor2D(nn.Module):
         if hasattr(self, "bias_correction"):
             inp = inp - self.bias_correction
         return inp
-
-
-def get_preprocessor(params):
-    r"""
-    Construct the preprocessor for a given configuration.
-
-    Indirection point for callers, so that selecting a different preprocessor
-    implementation stays a change in one place rather than at every call site.
-    Currently always returns :class:`Preprocessor2D`.
-
-    Parameters
-    ----------
-    params : ParamsBase
-        Configuration object, forwarded to the preprocessor.
-
-    Returns
-    -------
-    Preprocessor2D
-        The configured preprocessor.
-    """
-    return Preprocessor2D(params)

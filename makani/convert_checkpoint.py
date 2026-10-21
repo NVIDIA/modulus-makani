@@ -111,8 +111,7 @@ def consolidate_checkpoints(input_path, output_path, checkpoint_version=0):
     LocalPackage._load_static_data(LocalPackage(input_path), params)
 
     # get the model
-    multistep = params.n_future > 0
-    model = model_registry.get_model(params, multistep=multistep)
+    model = model_registry.get_model(params)
 
     # open all files in mmap mode
     checkpoints = OrderedDict()

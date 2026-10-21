@@ -29,10 +29,11 @@ import wandb
 
 # makani depenedencies
 from makani.utils import LossHandler, MetricsHandler
-from makani.utils.functions import expand_ensemble
 from makani.utils.driver import Driver
 from makani.utils.dataloader import get_dataloader
 from makani.utils.dataloaders.data_helpers import get_climatology
+from makani.utils.dataloaders.batch import batch_to_device, INPUT, TARGET, INPUT_DYNAMIC_FEATURES
+from makani.utils.dataloaders.rollout import Rollout
 from makani.utils.YParams import YParams
 
 # model registry
@@ -197,23 +198,7 @@ class StochasticTrainer(Driver):
                 static_graph=False,
             )
 
-        # lets get one sample from the dataloader:
-        # set to train just to be safe
-        self._set_train()
-        # get sample and map to gpu
-        iterator = iter(self.train_dataloader)
-        data = next(iterator)
-        gdata = map(lambda x: x.to(self.device), data)
-        # extract unpredicted features
-        inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-        # flatten
-        inp = self.preprocessor.flatten_history(inp)
-        tar = self.preprocessor.flatten_history(tar)
-        # get shapes
-        inp_shape = inp.shape
-        tar_shape = tar.shape
-
-        self._compile_model(inp_shape)
+        self._compile_model()
 
         # visualization wrapper: only world-rank 0 renders/logs; other ranks get None.
         out_bias, out_scale = self.train_dataloader.get_output_normalization()
@@ -289,7 +274,7 @@ class StochasticTrainer(Driver):
             self.logger.info("Number of trainable model parameters: {}".format(pcount))
 
     # jit stuff
-    def _compile_model(self, inp_shape):
+    def _compile_model(self):
 
         if self.params.jit_mode == "inductor":
             self.model = torch.compile(self.model)
@@ -503,14 +488,12 @@ class StochasticTrainer(Driver):
             self.iters += 1
 
             # map to device
-            gdata = map(lambda x: x.to(self.device), data)
+            batch = batch_to_device(data, self.device)
+            dynamic_features = batch[INPUT_DYNAMIC_FEATURES]
 
-            # do preprocessing
-            inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-
-            # flatten the history
-            inp = self.preprocessor.flatten_history(inp)
-            tar = self.preprocessor.flatten_history(tar)
+            # the interpolant takes the time steps folded into the channels
+            inp = self.preprocessor.flatten_history(batch[INPUT])
+            tar = self.preprocessor.flatten_history(batch[TARGET])
 
             # assuming float32
             total_data_bytes += inp.nbytes + tar.nbytes
@@ -523,11 +506,15 @@ class StochasticTrainer(Driver):
 
             with self.autocast():
                 if do_update:
-                    pred, tar = self.model_train(inp, tar, n_samples=self.params.stochastic_size)
+                    pred, tar = self.model_train(
+                        inp, tar, dynamic_features=dynamic_features, n_samples=self.params.stochastic_size
+                    )
                     loss = self.loss_obj(pred, tar, inp=inp)
                 else:
                     with self.model_train.no_sync():
-                        pred, tar = self.model_train(inp, tar, n_samples=self.params.stochastic_size)
+                        pred, tar = self.model_train(
+                            inp, tar, dynamic_features=dynamic_features, n_samples=self.params.stochastic_size
+                        )
                         loss = self.loss_obj(pred, tar, inp=inp)
                 loss = loss * loss_scaling_fact
 
@@ -658,46 +645,36 @@ class StochasticTrainer(Driver):
                 for data in progress_bar:
                     eval_steps += 1
 
-                    # map to gpu; materialize to list so we can expand zenith features
-                    gdata = [x.to(self.device) for x in data]
+                    # map to gpu
+                    batch = batch_to_device(data, self.device)
 
-                    # When local_ensemble_size > 1, fold the ensemble dim into the batch
-                    # dim for a single forward per rollout step. xz / yz (zenith features)
-                    # must be expanded to (B*E, ...) so the preprocessor's cache lines up
-                    # with the folded-batch input; tar stays at the original batch — the
-                    # loss expects (B, E, ...) pred vs (B, ...) target.
-                    E = self.params.local_ensemble_size
-                    if len(gdata) == 4:
-                        gdata[2] = expand_ensemble(gdata[2], E)
-                        gdata[3] = expand_ensemble(gdata[3], E)
+                    # the rollout folds the ensemble into the batch dim for a single forward
+                    # per step, (B*E, ...); the targets stay at the original batch -- the loss
+                    # expects (B, E, ...) pred vs (B, ...) target.
+                    rollout = Rollout(batch, ensemble_size=self.params.local_ensemble_size)
 
-                    # preprocess
-                    inp, tar = self.preprocessor.cache_unpredicted_features(*gdata)
-                    inp = self.preprocessor.flatten_history(inp)
+                    # the interpolant, the losses and the metrics take the time steps
+                    # folded into the channels
+                    flatten = self.preprocessor.flatten_history
 
-                    B = inp.shape[0]
-
-                    # expand the input batch to (B*E, ...) for the folded-batch forward
-                    inp = expand_ensemble(inp, E)
-
-                    # split list of targets (stays at batch B)
-                    tarlist = torch.split(tar, 1, dim=1)
-
-                    for idt, targ in enumerate(tarlist):
-                        # flatten history of the target
-                        targ = self.preprocessor.flatten_history(targ)
+                    for step in rollout:
+                        idt = step.index
+                        targ = flatten(step.target)
 
                         with self.autocast():
                             # single forward on the folded batch; StochasticInterpolant.forward
-                            # handles the batch-resize of both the preprocessor's input_noise
-                            # and its own noise_module internally.
-                            pred_flat = self.model_eval(inp, n_steps=self.params.stochastic_interpolation_steps)
+                            # resizes its noise_module to the batch internally.
+                            pred_flat = self.model_eval(
+                                flatten(step.input),
+                                dynamic_features=step.input_dynamic_features,
+                                n_steps=self.params.stochastic_interpolation_steps,
+                            )
 
-                            # advance the input history / unpredicted features once per step
-                            inp = self.preprocessor.append_history(inp, pred_flat, idt, update_state=True)
+                            # the interpolant predicts a single step, which the next one starts from
+                            rollout.advance(pred_flat.unsqueeze(1))
 
-                            # reshape back to (B, E, ...) for the loss and downstream buffers
-                            pred = pred_flat.reshape(B, E, *pred_flat.shape[1:])
+                            # split the ensemble back out, (B, E, ...), for the loss and downstream buffers
+                            pred = rollout.unfold(pred_flat)
 
                             loss = self.loss_obj(pred, targ)
 
@@ -716,7 +693,7 @@ class StochasticTrainer(Driver):
                             pred_gather = self.metrics._gather_input(pred_gather)
                             targ_gather = self.metrics._gather_input(targ_gather)
 
-                            self._visualize_step(pred_gather, targ_gather, eval_steps, idt)
+                            self._visualize_step(pred_gather, targ_gather, eval_steps, idt, rollout.n_steps)
 
                         # log the loss
                         progress_bar.set_postfix({"loss": loss.item()})

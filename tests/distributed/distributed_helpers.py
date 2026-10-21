@@ -172,7 +172,9 @@ def _split_helper(tensor, dim=None, group=None):
             grank = dist.get_rank(group=group)
             # split in dim
             tensor_list_local = split_tensor_along_dim(tensor, dim=dim, num_chunks=gsize)
-            tensor_local = tensor_list_local[grank]
+            # a shard is a strided view into the full tensor; hand it on as a tensor of its own,
+            # as a rank would hold it, so that no collective or kernel sees the view
+            tensor_local = tensor_list_local[grank].contiguous()
         else:
             tensor_local = tensor.clone()
 
@@ -182,6 +184,11 @@ def _split_helper(tensor, dim=None, group=None):
 def _gather_helper(tensor, dim=None, group=None):
     # get shapes
     if (dim is not None) and (dist.get_world_size(group=group) > 1):
+        # all_gather needs contiguous tensors, and a shard handed back unchanged, such as a split
+        # input returned as a residual, can still be a strided view into the full tensor. The
+        # gather is for comparisons only, so it stays out of autograd: that same shard can be a
+        # leaf that requires grad
+        tensor = tensor.detach().contiguous()
         gsize = dist.get_world_size(group=group)
         grank = dist.get_rank(group=group)
         shape_loc = torch.tensor([tensor.shape[dim]], dtype=torch.long, device=tensor.device)
@@ -193,8 +200,8 @@ def _gather_helper(tensor, dim=None, group=None):
             tshape = list(tensor.shape)
             tshape[dim] = shape_list[ids].item()
             tshapes.append(tuple(tshape))
+        # receive buffers of their own for every rank, this one included: all_gather writes into all of them
         tens_gather = [torch.empty(tshapes[ids], dtype=tensor.dtype, device=tensor.device) for ids in range(gsize)]
-        tens_gather[grank] = tensor
         dist.all_gather(tens_gather, tensor, group=group)
         tensor_gather = torch.cat(tens_gather, dim=dim)
     else:
