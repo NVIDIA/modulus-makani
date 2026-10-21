@@ -1,7 +1,8 @@
 name: Run serial tests
 
-# The serial suite on CPU, including the distributed tests on a single rank. tests.yml calls it
-# on every push and pull request. It can also be run on demand.
+# The serial suite on CPU, everything except the distributed tests, which test_distributed.yml
+# runs on process grids. tests.yml calls it on every push and pull request. It can also be run
+# on demand.
 on:
   workflow_dispatch:
   workflow_call:
@@ -70,7 +71,7 @@ jobs:
         # a distinct name, so the coverage job can combine it with the distributed suite's
         COVERAGE_FILE: .coverage.serial
       run: |
-        python -m pytest -ra ./tests --cov=makani --cov-report=term-missing
+        python -m pytest -ra ./tests --ignore=tests/distributed --cov=makani --cov-report=term-missing
 
     - uses: actions/upload-artifact@v4
       with:

@@ -62,7 +62,7 @@ class TestDistributedConservativeRemap(unittest.TestCase):
     split puts a rank's block on an actual pole row.
 
     Forward and backward are checked as separate subtests (``self.subTest``,
-    matching ``tests_distributed_fft.py``), and both are *exact* comparisons
+    matching ``test_distributed_fft.py``), and both are *exact* comparisons
     against the serial operator -- not just "the gradient is finite". Forward:
     gather the distributed output and diff it against serial's. Backward: a
     single shared upstream gradient (``ograd_full``, generated once so every
@@ -99,7 +99,7 @@ class TestDistributedConservativeRemap(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # gradient tolerance follows tests_distributed_model.py's
+            # gradient tolerance follows test_distributed_model.py's
             # test_distributed_model_fwd_bwd precedent (1e-4 for a float32
             # GPU-vs-serial forward/backward comparison) rather than 1e-5:
             # the distributed path sums via halo-exchange-then-matmul while

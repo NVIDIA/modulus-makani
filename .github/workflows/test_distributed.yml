@@ -88,7 +88,7 @@ jobs:
 
     - name: Install package
       run: |
-        python -m pip install -e .[test]
+        python -m pip install -e .[test,vis]
 
     - name: Run the distributed tests
       env:
@@ -112,7 +112,7 @@ jobs:
         grid="${GRID_H}x${GRID_W}x${GRID_E}"
         status=0
         mkdir -p covdata
-        for f in tests/distributed/tests_distributed_*.py; do
+        for f in tests/distributed/test_distributed_*.py; do
           echo "::group::$f"
           name=$(basename "$f" .py)
           pids=()

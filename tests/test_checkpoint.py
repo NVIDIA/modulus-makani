@@ -19,7 +19,7 @@ Non-distributed tests for checkpointing: the pure-Python helpers in
 the ``Driver`` end to end.
 
 The distributed gather/scatter round-trip is covered separately by
-``tests/distributed/tests_distributed_checkpoint.py``.
+``tests/distributed/test_distributed_checkpoint.py``.
 """
 
 import os
@@ -63,7 +63,7 @@ from .testutils import disable_tf32, set_seed, get_default_parameters, compare_a
 #   * ``load_checkpoint``
 #
 # The distributed gather/scatter round-trip is covered separately by
-# ``tests/distributed/tests_distributed_checkpoint.py``.
+# ``tests/distributed/test_distributed_checkpoint.py``.
 
 
 class UnsupportedPayload:

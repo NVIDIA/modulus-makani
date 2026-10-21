@@ -164,7 +164,7 @@ def pytest_collection_modifyitems(config, items):
         return
     suffix = _grid_suffix(grid)
     for item in items:
-        if item.fspath.basename.startswith(("test_distributed_", "tests_distributed_")):
+        if item.fspath.basename.startswith("test_distributed_"):
             item._nodeid = item.nodeid + suffix
 
 

@@ -66,10 +66,10 @@ class TestDistributedDataloaderCheckpoint(unittest.TestCase):
     Run with e.g.::
 
         # pure data parallel (B = 4)
-        mpirun -n 4 pytest tests/distributed/tests_distributed_dataloader_checkpoint.py
+        mpirun -n 4 pytest tests/distributed/test_distributed_dataloader_checkpoint.py
 
         # ensemble x batch data parallelism on top of a 2x2 spatial grid
-        GRID_H=2 GRID_W=2 GRID_E=2 mpirun -n 16 pytest tests/distributed/tests_distributed_dataloader_checkpoint.py
+        GRID_H=2 GRID_W=2 GRID_E=2 mpirun -n 16 pytest tests/distributed/test_distributed_dataloader_checkpoint.py
 
     With world_size=1 the tests still exercise the gather/scatter path, but the
     per-rank distinctness they are really after only shows up with B > 1.
