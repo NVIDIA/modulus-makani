@@ -43,6 +43,7 @@ from makani.models import model_registry
 
 # distributed computing stuff
 from makani.utils import comm
+from makani.mpu.helpers import barrier
 from makani.utils.precision import AutocastManager
 from makani.utils.dataloaders.data_helpers import get_date_from_string
 
@@ -749,7 +750,7 @@ class Inferencer(Driver):
 
         # barrier to ensure everyone is here before calling finalize
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         # create final logs
         if metrics is not None:
@@ -780,7 +781,7 @@ class Inferencer(Driver):
 
         # global sync is in order
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         return logs
 
@@ -845,7 +846,7 @@ class Inferencer(Driver):
 
         # perform a barrier here to make sure everybody is ready
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         try:
             torch.cuda.reset_peak_memory_stats(self.device)

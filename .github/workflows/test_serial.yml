@@ -1,13 +1,23 @@
-name: tests
+name: Run serial tests
 
+# The serial suite on CPU, including the distributed tests on a single rank. tests.yml calls it
+# on every push and pull request. It can also be run on demand.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# a new push supersedes the running job
+concurrency:
+  # not github.workflow: when called from tests.yml, that is the caller's name
+  group: serial-tests-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-
+  tests:
+    name: Unit tests
     runs-on: ubuntu-latest
 
     steps:

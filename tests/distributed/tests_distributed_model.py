@@ -116,6 +116,12 @@ class TestDistributedModel(unittest.TestCase):
         # consistently — see set_image_shape for the rationale.
         set_image_shape(self.params, h=36, w=72)
 
+        # SNO and FCN3 process on a grid coarsened by scale_factor, where their local DISCO
+        # convolutions exchange latitude halos between polar ranks. The default of 8 leaves 4
+        # latitudes, a single one per rank at h=4; FCN3's halo is 4 rows on any grid, so its
+        # shards need at least 4 latitudes each, which 18 latitudes give at h=4
+        self.params.scale_factor = 2
+
         # also set the batch size for testing
         self.params.batch_size = 4
 
@@ -364,7 +370,7 @@ class TestDistributedModel(unittest.TestCase):
         ],
         skip_on_empty=True,
     )
-    def test_distributed_model_gradient_accumulation(self, nettype, atol, rtol, verbose=False):
+    def test_distributed_model_gradient_accumulation(self, nettype, atol, rtol, verbose=True):
         """
         Tests gradient accumulation with distributed models
         """

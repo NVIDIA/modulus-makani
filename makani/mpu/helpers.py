@@ -15,34 +15,41 @@
 
 import torch
 import torch.distributed as dist
+from torch_harmonics.distributed.primitives import _gather
 from makani.utils import comm
 
 
 @torch.compiler.disable
 def gather_uneven(tensor, dim, comm_name):
+    # nothing to gather, and inside comm.serial() the group is None, which would gather over the world
     if comm.get_size(comm_name) == 1:
         return tensor
 
-    # gather dims
-    dim_tensor = torch.tensor([tensor.shape[dim]], dtype=torch.int, device=tensor.device)
-    dim_list = [torch.empty_like(dim_tensor) for _ in range(comm.get_size(comm_name))]
-    dim_list[comm.get_rank(comm_name)] = dim_tensor
-    dist.all_gather(dim_list, dim_tensor, group=comm.get_group(comm_name))
+    # the shards may differ in size along dim; torch-harmonics' gather exchanges the sizes first
+    # and pads the shards to the largest on gloo, which only gathers tensors of equal shape
+    return _gather(tensor.contiguous(), dim, None, group=comm.get_group(comm_name))
 
-    # gather tensor
-    gathered_shape = list(tensor.shape)
-    tensor_list = []
-    for rshape in dim_list:
-        gathered_shape[dim] = rshape.item()
-        tensor_list.append(torch.empty(gathered_shape, dtype=tensor.dtype, device=tensor.device))
 
-    tensor_list[comm.get_rank(comm_name)] = tensor
-    dist.all_gather(tensor_list, tensor, group=comm.get_group(comm_name))
+def all_reduce_mean(tensor, group):
+    """In-place all-reduce to the mean over ``group``. gloo has no ``ReduceOp.AVG``, so it sums and divides there."""
+    if dist.get_backend(group) == dist.Backend.GLOO:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group, async_op=False)
+        tensor.div_(dist.get_world_size(group=group))
+    else:
+        dist.all_reduce(tensor, op=dist.ReduceOp.AVG, group=group, async_op=False)
+    return tensor
 
-    # concatenate
-    result = torch.cat(tensor_list, dim=dim)
 
-    return result
+def barrier(device):
+    """Barrier across all ranks, if torch.distributed is initialized.
+
+    NCCL is given the device explicitly rather than inferring it from the ambient CUDA state;
+    on CPU there is no device index to give.
+    """
+    if not dist.is_initialized():
+        return
+    device_ids = [device.index] if device.type == "cuda" else None
+    dist.barrier(device_ids=device_ids)
 
 
 def sync_params(model, mode="broadcast"):
@@ -69,16 +76,8 @@ def sync_params(model, mode="broadcast"):
                 else:
                     param.copy_(param_real)
             elif mode == "mean":
-                is_complex = param.is_complex()
-                if is_complex:
-                    dist.all_reduce(
-                        torch.view_as_real(param),
-                        op=dist.ReduceOp.AVG,
-                        group=comm.get_group(comm_group),
-                        async_op=False,
-                    )
-                else:
-                    dist.all_reduce(param, op=dist.ReduceOp.AVG, group=comm.get_group(comm_group), async_op=False)
+                param_real = torch.view_as_real(param) if param.is_complex() else param
+                all_reduce_mean(param_real, comm.get_group(comm_group))
             else:
                 raise ValueError(f"Unknown weight synchronization mode {mode}")
 
@@ -97,8 +96,6 @@ def sync_params(model, mode="broadcast"):
                 _sync_param(param, comm_group, mode)
 
     # synchronize the device to make sure all copies have finished
-    if dist.is_initialized():
-        device = next(model.parameters()).device
-        dist.barrier(device_ids=[device.index])
+    barrier(next(model.parameters()).device)
 
     return

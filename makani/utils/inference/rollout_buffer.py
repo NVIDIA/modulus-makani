@@ -30,25 +30,11 @@ from makani.models.common import RealFFT1
 from makani.mpu.fft import DistributedRealFFT1
 from torch_harmonics.distributed import compute_split_shapes, split_tensor_along_dim
 from makani.mpu.mappings import reduce_from_parallel_region
+from makani.mpu.helpers import barrier
 
 # get torch_harmonics for spectra
 import torch_harmonics as th
 import torch_harmonics.distributed as thd
-
-
-def _barrier(device):
-    """
-    Synchronize across ranks if a process group is initialized.
-
-    Wraps ``dist.barrier`` with two safety guards: it's a no-op when no
-    process group has been initialized, and it only passes ``device_ids``
-    on CUDA (``device.index`` is ``None`` for CPU and would make
-    ``dist.barrier(device_ids=[None])`` raise).
-    """
-    if not dist.is_initialized():
-        return
-    device_ids = [device.index] if device.type == "cuda" else None
-    dist.barrier(device_ids=device_ids)
 
 
 def _driver_available(name: str) -> bool:
@@ -790,7 +776,7 @@ class RolloutBuffer(DataBuffer):
 
     def finalize(self):
 
-        _barrier(self.device)
+        barrier(self.device)
 
         # Flush remaining buffered data when there's both a file to write to and
         # an in-memory buffer to flush. ``_flush_buffer_to_disk`` doubles as a
@@ -801,7 +787,7 @@ class RolloutBuffer(DataBuffer):
         if (not self.streaming_mode) and (self.file_handle is not None):
             self._flush_buffer_to_disk()
 
-        _barrier(self.device)
+        barrier(self.device)
 
         # Close the output file and null the handle so a subsequent finalize()
         # or __del__ doesn't try to operate on an already-closed h5py object.
@@ -1056,7 +1042,7 @@ class TemporalAverageBuffer(MeanStdBuffer):
         # close file
         file_handle.close()
 
-        _barrier(self.device)
+        barrier(self.device)
 
         return
 
@@ -1076,7 +1062,7 @@ class TemporalAverageBuffer(MeanStdBuffer):
 
     def finalize(self):
 
-        _barrier(self.device)
+        barrier(self.device)
 
         # compute common mean
         self._aggregate_stats("data")
@@ -1088,7 +1074,7 @@ class TemporalAverageBuffer(MeanStdBuffer):
         if self.output_file is not None:
             self._write_output_data(mean.cpu().numpy(), std.cpu().numpy())
 
-        _barrier(self.device)
+        barrier(self.device)
 
         return
 
@@ -1224,7 +1210,7 @@ class SpectrumAverageBuffer(MeanStdBuffer):
 
     def finalize(self):
 
-        _barrier(self.device)
+        barrier(self.device)
 
         # compute common mean
         self._aggregate_stats("batch")
@@ -1236,7 +1222,7 @@ class SpectrumAverageBuffer(MeanStdBuffer):
         if self.output_file is not None:
             self._write_output_data(mean.cpu().numpy(), std.cpu().numpy())
 
-        _barrier(self.device)
+        barrier(self.device)
 
         return
 
@@ -1312,7 +1298,7 @@ class SpectrumAverageBuffer(MeanStdBuffer):
         # close file
         file_handle.close()
 
-        _barrier(self.device)
+        barrier(self.device)
 
         return
 
@@ -1465,7 +1451,7 @@ class ZonalSpectrumAverageBuffer(MeanStdBuffer):
 
     def finalize(self):
 
-        _barrier(self.device)
+        barrier(self.device)
 
         # compute common mean
         self._aggregate_stats("batch")
@@ -1477,7 +1463,7 @@ class ZonalSpectrumAverageBuffer(MeanStdBuffer):
         if self.output_file is not None:
             self._write_output_data(mean.cpu().numpy(), std.cpu().numpy())
 
-        _barrier(self.device)
+        barrier(self.device)
 
         return
 
@@ -1564,6 +1550,6 @@ class ZonalSpectrumAverageBuffer(MeanStdBuffer):
         # close file
         file_handle.close()
 
-        _barrier(self.device)
+        barrier(self.device)
 
         return

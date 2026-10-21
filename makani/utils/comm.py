@@ -280,6 +280,6 @@ def init(
                 print(f"{rank}: groups:")
                 for gname in get_comm_names():
                     print(f"\t{gname}: {_DM._group_ranks[gname]}, root={_COMM_ROOTS[gname]}")
-            torch.distributed.barrier(device_ids=[_DM.local_rank])
+            torch.distributed.barrier(device_ids=[_DM.local_rank] if torch.cuda.is_available() else None)
 
     return get_size("model")

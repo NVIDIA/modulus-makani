@@ -22,6 +22,7 @@ from makani.utils import comm
 
 import torch_harmonics.distributed as thd
 from torch_harmonics.distributed import split_tensor_along_dim
+from torch_harmonics.distributed.primitives import _gather
 
 from makani.utils.YParams import ParamsBase
 
@@ -189,21 +190,8 @@ def _gather_helper(tensor, dim=None, group=None):
         # gather is for comparisons only, so it stays out of autograd: that same shard can be a
         # leaf that requires grad
         tensor = tensor.detach().contiguous()
-        gsize = dist.get_world_size(group=group)
-        grank = dist.get_rank(group=group)
-        shape_loc = torch.tensor([tensor.shape[dim]], dtype=torch.long, device=tensor.device)
-        shape_list = [torch.empty_like(shape_loc) for _ in range(dist.get_world_size(group=group))]
-        shape_list[grank] = shape_loc
-        dist.all_gather(shape_list, shape_loc, group=group)
-        tshapes = []
-        for ids in range(gsize):
-            tshape = list(tensor.shape)
-            tshape[dim] = shape_list[ids].item()
-            tshapes.append(tuple(tshape))
-        # receive buffers of their own for every rank, this one included: all_gather writes into all of them
-        tens_gather = [torch.empty(tshapes[ids], dtype=tensor.dtype, device=tensor.device) for ids in range(gsize)]
-        dist.all_gather(tens_gather, tensor, group=group)
-        tensor_gather = torch.cat(tens_gather, dim=dim)
+        # the shards may differ in size along dim, which torch-harmonics' gather pads for gloo
+        tensor_gather = _gather(tensor, dim, None, group=group)
     else:
         tensor_gather = tensor.clone()
 

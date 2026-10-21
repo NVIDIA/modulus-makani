@@ -41,6 +41,7 @@ from makani.utils.metrics.functions import (
 import torch.distributed as dist
 from torch_harmonics.distributed import compute_split_shapes
 from makani.mpu.mappings import gather_from_parallel_region, reduce_from_parallel_region
+from makani.mpu.helpers import barrier
 
 
 class MetricRollout:
@@ -648,7 +649,7 @@ class MetricsHandler:
 
         # sync here
         if dist.is_initialized():
-            dist.barrier(device_ids=[self.device.index])
+            barrier(self.device)
 
         with torch.no_grad():
 
