@@ -199,7 +199,7 @@ class Inferencer(Driver):
         self.preprocessor = self.model.preprocessor
 
         # print model
-        if self.world_rank == 0:
+        if self.log_to_screen:
             print(self.model)
 
         # Performance work -- benchmarking the rollout, or the output writer with O_DIRECT/GDS --
@@ -660,9 +660,10 @@ class Inferencer(Driver):
                         # the initial condition is the latest step of the window, the steps before it are history
                         tinp = gtime[:, -1]
 
-                        dates = date_fn(tinp.detach().cpu()).tolist()
-                        datestring = ", ".join([d.strftime("%Y-%m-%dT%H:%M:%S") for d in dates])
-                        print(f"inferencing dates: {datestring}")
+                        if self.log_to_screen:
+                            dates = date_fn(tinp.detach().cpu()).tolist()
+                            datestring = ", ".join([d.strftime("%Y-%m-%dT%H:%M:%S") for d in dates])
+                            print(f"inferencing dates: {datestring}")
 
                         noise_source = self.preprocessor.noise_source(batch_size=gfield.shape[0] * E)
                         rollout = Rollout(gbatch, n_steps=rollout_steps, noise_source=noise_source, ensemble_size=E)
