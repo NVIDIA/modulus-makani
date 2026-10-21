@@ -282,7 +282,7 @@ class TestDistributedLayers(unittest.TestCase):
         batch_size,
         num_chan,
         tol,
-        verbose=True,
+        verbose=False,
     ):
         B, C = batch_size, num_chan
 
@@ -345,9 +345,13 @@ class TestDistributedLayers(unittest.TestCase):
             )
 
         with self.subTest(desc="weight gradients"):
+            # a weight gradient sums over the whole sphere, which the ranks split differently, so its
+            # rounding error follows the gradient's scale, not the entry: e.g. 1.5e-4 at an entry of
+            # 0.08 next to entries of 43. The absolute tolerance follows the largest entry
+            wgrad_atol = tol * max(1.0, wgrad_full.abs().max().item())
             self.assertTrue(
                 reduce_success(
-                    compare_tensors("weight gradients", wgrad_local, wgrad_full, tol, tol, verbose=verbose),
+                    compare_tensors("weight gradients", wgrad_local, wgrad_full, wgrad_atol, tol, verbose=verbose),
                     self.device,
                 )
             )
