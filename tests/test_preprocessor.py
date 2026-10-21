@@ -370,8 +370,9 @@ class TestPreprocessor2DBasic(unittest.TestCase):
         pp = self._make_pp_with_noise()
         pp.update_internal_state()
         tensor_state = pp.get_internal_state(tensor=True)
-        # zero the state, never writing into it, then restore
-        pp.input_noise.reset()
+        # replace the state by another one, never writing into it, then restore; the dummy noise of the
+        # preprocessor is all zeros, so the replacement is random, or the restore would not show
+        pp.input_noise.set_tensor_state(torch.randn_like(tensor_state))
         self.assertFalse(torch.equal(pp.get_internal_state(tensor=True), tensor_state))
         pp.set_internal_state(tensor_state)
         restored = pp.get_internal_state(tensor=True)

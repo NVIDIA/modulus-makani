@@ -458,11 +458,14 @@ class TestDistributedLayers(unittest.TestCase):
 
     # SNO's distributed layers called several times in a row with changing batch sizes, as the
     # gradient accumulation test does (a batch of 8 and batches of 4): every call has to match the
-    # serial layer, whatever the module saw before
+    # serial layer, whatever the module saw before. The local convolution runs on a 16 latitude grid
+    # with SNO's cutoff for it, sqrt(2) pi / (nlat - 1): on 4 latitudes that cutoff spans 85 degrees,
+    # a halo of 2 rows, more than the single latitude each of 4 polar ranks holds; on 16 the halo is
+    # 1 row against 4 latitudes per rank
     @parameterized.expand(
         [
             ["disco_encoder", 36, 72, 4, 9, "equiangular", "legendre-gauss", 2.0 * math.pi / 35.0],
-            ["disco_local", 4, 9, 4, 9, "legendre-gauss", "legendre-gauss", math.sqrt(2.0) * math.pi / 3.0],
+            ["disco_local", 16, 33, 16, 33, "legendre-gauss", "legendre-gauss", math.sqrt(2.0) * math.pi / 15.0],
             ["disco_decoder", 36, 72, 36, 72, "equiangular", "equiangular", 2.0 * math.pi / 35.0],
             ["resample_decoder", 4, 9, 36, 72, "legendre-gauss", "equiangular", None],
             ["spectral_global", 4, 9, 4, 9, "legendre-gauss", "legendre-gauss", None],
