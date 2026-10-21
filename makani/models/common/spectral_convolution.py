@@ -454,24 +454,17 @@ class SpectralAttention(nn.Module):
         torch.Tensor
             Complex coefficients of shape ``(B, out_channels, lmax, mmax)``.
         """
-        B, C, H, W = x.shape
-
-        xr = torch.view_as_real(x)
-
+        # the contractions, weights, biases and activations all work on the complex coefficients directly
         for l in range(self.spectral_layers):
             if hasattr(self, "b"):
-                xr = self.mul_add_handle(xr, self.w[l], self.b[l])
+                x = self.mul_add_handle(x, self.w[l], self.b[l])
             else:
-                xr = self.mul_handle(xr, self.w[l])
-            xr = torch.view_as_complex(xr)
-            xr = self.activations[l](xr)
-            xr = self.drop(xr)
-            xr = torch.view_as_real(xr)
+                x = self.mul_handle(x, self.w[l])
+            x = self.activations[l](x)
+            x = self.drop(x)
 
         # final MLP
-        x = self.mul_handle(xr, self.wout)
-
-        x = torch.view_as_complex(x)
+        x = self.mul_handle(x, self.wout)
 
         return x
 

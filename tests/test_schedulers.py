@@ -135,6 +135,21 @@ class TestGetScheduler(unittest.TestCase):
             with self.subTest(scheduler=name):
                 self.assertIsNone(self.driver.get_scheduler(self.optimizer, _params(name)))
 
+    def test_unset_scheduler(self):
+        # a params object without the key at all, with and without warmup
+        for warmup in [0, 2]:
+            with self.subTest(lr_warmup_steps=warmup):
+                params = ParamsBase()
+                params["lr"] = _LR
+                params["lr_warmup_steps"] = warmup
+                scheduler = self.driver.get_scheduler(self.optimizer, params)
+                if warmup == 0:
+                    self.assertIsNone(scheduler)
+                else:
+                    self.assertIsInstance(scheduler, lr_scheduler.LinearLR)
+                # the trainers read params.scheduler after setting up the scheduler
+                self.assertIsNone(params.scheduler)
+
     def test_warmup_without_scheduler(self):
         params = _params(None, lr_warmup_steps=2, lr_start=0.1)
         scheduler = self.driver.get_scheduler(self.optimizer, params)

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import datetime as dt
+import json
 import os
 import sys
 import tempfile
@@ -136,6 +137,12 @@ class _InferencerTestCase(unittest.TestCase):
             num_data_workers=1,
         )
         params.inf_data_path = self.valid_path
+        # the output buffers place their data on the dataset's coordinates, which parse_dataset_metadata
+        # reads from the metadata file in a real run
+        with open(os.path.join(self.metadata_path, "data.json"), "r") as f:
+            coords = json.load(f)["coords"]
+        params.lat = coords["lat"]
+        params.lon = coords["lon"]
         params.n_train_samples = self.n_train_samples
         params.n_eval_samples = self.n_eval_samples
         params.add_zenith = zenith
@@ -226,11 +233,21 @@ class TestInferencerRollout(_InferencerTestCase):
                         self.assertFalse(torch.equal(pred[:, 0], pred[:, 1]), "the members draw different noise")
 
 
+def _order_multiplicity(nlon, mmax):
+    """How often each order m < mmax occurs in the spectrum of a real field on nlon longitudes."""
+    # the negative orders count as much as the positive ones, except for m = 0 and, for an even nlon, the
+    # Nyquist order nlon / 2, which are their own conjugates
+    weights = torch.full((mmax,), 2.0)
+    weights[0] = 1.0
+    if (nlon % 2 == 0) and (nlon // 2 < mmax):
+        weights[nlon // 2] = 1.0
+    return weights
+
+
 def _power_spectrum(sht, fields):
     """Total power per degree, (..., H, W) -> (..., L), as the spectrum buffer computes it."""
     power = torch.square(torch.abs(sht(torch.from_numpy(fields))))
-    # the negative orders count as much as the positive ones
-    power[..., 1:] *= 2.0
+    power = power * _order_multiplicity(fields.shape[-1], power.shape[-1])
     return torch.sum(power, dim=-1).to(torch.float64)
 
 
@@ -238,7 +255,7 @@ def _zonal_power_spectrum(fields, lat):
     """Latitude-weighted zonal power per order, (..., H, W) -> (..., H, M), as the zonal spectrum buffer computes it."""
     coeffs = torch.fft.rfft(torch.from_numpy(fields), dim=-1, norm="forward")
     power = torch.cos(torch.deg2rad(torch.from_numpy(lat))).reshape(-1, 1) * torch.square(torch.abs(coeffs))
-    power[..., 1:] *= 2.0
+    power = power * _order_multiplicity(fields.shape[-1], power.shape[-1]).to(power.dtype)
     return power.to(torch.float64)
 
 

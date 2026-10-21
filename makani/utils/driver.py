@@ -912,8 +912,11 @@ class Driver(metaclass=abc.ABCMeta):
     def get_scheduler(self, optimizer, params):
         """Convenience routine for setting up the scheduler"""
 
-        # no scheduler is a valid choice: unset, None (also "None" in the yaml files) or "none"
-        if (params.get("scheduler", None) is None) or (str(params.scheduler).lower() == "none"):
+        # no scheduler is a valid choice: unset, None (also "None" in the yaml files) or "none". An unset
+        # scheduler is stored as None, since the trainers read params.scheduler as well
+        if not hasattr(params, "scheduler"):
+            params["scheduler"] = None
+        if (params.scheduler is None) or (str(params.scheduler).lower() == "none"):
             scheduler = None
         elif params.scheduler == "ReduceLROnPlateau":
             if not hasattr(params, "scheduler_mode"):
@@ -951,7 +954,7 @@ class Driver(metaclass=abc.ABCMeta):
             raise ValueError(f"Unknown scheduler {params.scheduler}")
 
         # warmup scheduler
-        if params.lr_warmup_steps > 0:
+        if params.get("lr_warmup_steps", 0) > 0:
             if params.scheduler == "ReduceLROnPlateau":
                 raise NotImplementedError("Error, warmup scheduler not implemented for ReduceLROnPlateau scheduler")
             warmup_scheduler = lr_scheduler.LinearLR(
