@@ -158,7 +158,11 @@ class TestDistributedLayers(unittest.TestCase):
             spect_conv_dist.module.weight.copy_(weight)
             spect_conv_dist.module.bias.copy_(spect_conv_local.bias)
 
-        # input
+        # every rank draws the same input only from the same generator state: the distributed
+        # weights were initialized on each rank's share of the degrees, which differ in size when
+        # lmax does not split evenly. On the GPU the input comes from the CUDA generator, which the
+        # initialization on the CPU leaves alone, on the CPU both come from the same one
+        set_seed(333)
         inp_full = torch.randn((B, C, Hi, Wi), dtype=torch.float32, device=self.device)
 
         #############################################################
@@ -278,7 +282,7 @@ class TestDistributedLayers(unittest.TestCase):
         batch_size,
         num_chan,
         tol,
-        verbose=False,
+        verbose=True,
     ):
         B, C = batch_size, num_chan
 
@@ -542,6 +546,10 @@ class TestDistributedLayers(unittest.TestCase):
 
             def layer_dist(x):
                 return spectral_dist(x)[0]
+
+        # the same inputs on every rank, however much of the generator the distributed initialization
+        # used, see test_distributed_spectral_conv
+        set_seed(333)
 
         # B=4 first, so that a failure at B=8 is not mistaken for one of the first call
         for call, batch_size in enumerate([4, 8, 4]):
