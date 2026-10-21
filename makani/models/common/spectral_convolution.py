@@ -497,19 +497,17 @@ class SpectralAttention(nn.Module):
                 residual = self.inverse_transform(x)
 
         # convert back. Only the residual is cast here: x still holds the complex
-        # spectral coefficients that forward_mlp consumes via view_as_real, so
-        # casting it to the (real) input dtype at this point would discard the
-        # imaginary part. It is cast once after the inverse transform below,
-        # matching SpectralConv.forward.
+        # spectral coefficients that forward_mlp consumes, so casting it to the (real)
+        # input dtype at this point would discard the imaginary part. It is cast once
+        # after the inverse transform below, matching SpectralConv.forward.
         if self.scale_residual:
             residual = residual.to(dtype=dtype)
 
         # MLP
         x = self.forward_mlp(x)
 
-        # BWD transform
+        # BWD transform: the coefficients are complex and stay so, only the real output is cast below
         with amp.autocast(device_type=x.device.type, enabled=False):
-            x = x.to(torch.float32)
             x = self.inverse_transform(x)
 
         # convert back
