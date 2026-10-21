@@ -238,6 +238,12 @@ This will create a large virtual memory pool into which PyTorch can index. If yo
 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 ```
 
+With `--jit_mode=inductor`, layers whose forward breaks the compiled graph, e.g. around distributed communication, are compiled once for every parameter shape they come with. Models with many such layers of different sizes, like the DISCO convolutions in FourCastNet3, can exceed torch's default recompile limit of 8; the layers beyond it then run eagerly, and torch warns that it `hit config.recompile_limit`. Makani raises the limit to 32. If this is still not enough, set it with
+
+```bash
+export MAKANI_INDUCTOR_COMPILE_LIMIT=64
+```
+
 ## Contributing
 
 Thanks for your interest in contributing. There are many ways to contribute to this project.

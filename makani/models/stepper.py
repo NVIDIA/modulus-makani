@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
@@ -153,6 +155,10 @@ class StepWrapper(nn.Module):
         **compile_kwargs
             Passed on to ``torch.compile``.
         """
+        # layers whose forward breaks the graph, e.g. around distributed collectives, are compiled
+        # as frames of their own, once per parameter shape. Models with many such layers of
+        # different sizes exceed torch's default limit of 8 and fall back to eager for the rest
+        torch._dynamo.config.recompile_limit = int(os.getenv("MAKANI_INDUCTOR_COMPILE_LIMIT", "32"))
         self._predict_window = torch.compile(self._predict_window, **compile_kwargs)
 
     def predict(self, inp, dynamic_features, noise=None):
