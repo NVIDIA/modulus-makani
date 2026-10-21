@@ -2,8 +2,8 @@ name: Run distributed tests
 
 # The distributed suite on CPU, with the gloo backend, over polar x azimuth process grids with
 # 1, 2 and 4 ranks per direction, each without and with a 2-way ensemble dimension; the batch
-# dimension is filled with whatever ranks remain, which is always 1 here. Everything CUDA-only
-# (DALI, TransformerEngine) skips.
+# dimension is filled with whatever ranks remain, which is always 1 here. DALI runs its CPU
+# pipelines on grids of up to 8 ranks; everything CUDA-only (TransformerEngine) skips.
 #
 # Heavy (up to 16 processes per grid), so it does not run on every push: tests.yml calls it on
 # pull requests and on pushes to main. It can also be run on demand.
@@ -90,6 +90,23 @@ jobs:
     - name: Install package
       run: |
         python -m pip install -e .[test,vis]
+
+    - name: Install DALI for CPU
+      env:
+        GRID_H: ${{ matrix.grid_h }}
+        GRID_W: ${{ matrix.grid_w }}
+        GRID_E: ${{ matrix.grid_e }}
+      run: |
+        # every rank runs its own DALI pipeline and spawns its own Python worker, which imports torch
+        # again; with 16 ranks that exhausts the runner's memory, so the DALI tests skip there
+        if [ $((GRID_H * GRID_W * GRID_E)) -gt 8 ]; then
+          echo "Not installing DALI on $((GRID_H * GRID_W * GRID_E)) ranks, the DALI tests skip"
+          exit 0
+        fi
+        # CPU pipelines without the GPU codec libraries, see test_serial.yml
+        python -m pip install --no-deps nvidia-dali-cuda120==2.3.0
+        python -m pip install "astunparse>=1.6.0,<=1.6.3" "gast>=0.3.3,<=0.7.0" makefun nvtx optree "six>=1.16,<=1.17"
+        python -c "import nvidia.dali as dali; print('DALI', dali.__version__)"
 
     - name: Run the distributed tests
       env:

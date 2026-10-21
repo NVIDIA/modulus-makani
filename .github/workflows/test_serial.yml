@@ -62,11 +62,18 @@ jobs:
       run: |
         # WeatherBench2 is not on PyPI — install from source with --no-deps to
         # avoid pulling a numpy version that breaks the stack.
-        # Note: NVIDIA DALI has no CPU-only wheel and requires CUDA runtime, so
-        # DALI tests are skipped on this runner (guarded by skipUnless(_have_dali)).
         # weatherbench2 main as of 2026-08-04. Third-party repo, so the SHA pin matters
         # more here than for the NVIDIA-owned dependencies above.
         python -m pip install --no-deps git+https://github.com/google-research/weatherbench2.git@95c36d547b22abc2d191451a580b0b194fde67ef
+    - name: Install DALI for CPU
+      run: |
+        # DALI has no CPU-only wheel, but its CPU pipelines (device_id=None) run without CUDA, so the
+        # DALI loader tests run with dali_device="cpu". --no-deps leaves out the GPU image codec
+        # libraries (nvimgcodec, nvcomp, nvjpeg, ~90 MB) that a CPU pipeline never loads; the
+        # remaining requirements are small pure-Python packages
+        python -m pip install --no-deps nvidia-dali-cuda120==2.3.0
+        python -m pip install "astunparse>=1.6.0,<=1.6.3" "gast>=0.3.3,<=0.7.0" makefun nvtx optree "six>=1.16,<=1.17"
+        python -c "import nvidia.dali as dali; print('DALI', dali.__version__)"
     - name: Test with pytest
       env:
         # a distinct name, so the coverage job can combine it with the distributed suite's

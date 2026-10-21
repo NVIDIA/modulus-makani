@@ -423,7 +423,8 @@ class SampleSource(object):
         return get_seconds_from_times(inp_time), get_seconds_from_times(tar_time)
 
     def _compute_zenith_angle(self, inp_times, tar_times):
-        torch.cuda.nvtx.range_push("SampleSource:_compute_zenith_angle")
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_push("SampleSource:_compute_zenith_angle")
 
         from makani.third_party.climt.zenith_angle_v2 import cos_zenith_angle
 
@@ -436,7 +437,8 @@ class SampleSource(object):
             axis=1,
         )
 
-        torch.cuda.nvtx.range_pop()
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_pop()
         return cos_zenith_inp, cos_zenith_tar
 
     # ---- lifecycle ---------------------------------------------------------
@@ -495,7 +497,8 @@ class SampleSource(object):
         if sample_info.iteration >= self.num_steps_per_epoch:
             raise StopIteration
 
-        torch.cuda.nvtx.range_push("SampleSource:__call__")
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_push("SampleSource:__call__")
 
         if cycle_epoch_idx != self.last_cycle_epoch:
             self.last_cycle_epoch = cycle_epoch_idx
@@ -516,9 +519,11 @@ class SampleSource(object):
 
         self._open_with_retries(file_idx)
 
-        torch.cuda.nvtx.range_push("SampleSource:read")
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_push("SampleSource:read")
         inp, tar = self._read_window(file_idx, local_idx)
-        torch.cuda.nvtx.range_pop()
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_pop()
 
         inp_time, tar_time = self._compute_timestamps(local_idx, file_idx)
 
@@ -527,6 +532,7 @@ class SampleSource(object):
             result = result + self._compute_zenith_angle(inp_time, tar_time)
         result = result + (inp_time, tar_time)
 
-        torch.cuda.nvtx.range_pop()
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_pop()
 
         return result
