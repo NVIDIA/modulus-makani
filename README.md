@@ -4,7 +4,7 @@
 
 [![tests](https://github.com/NVIDIA/makani/actions/workflows/tests.yml/badge.svg)](https://github.com/NVIDIA/makani/actions/workflows/tests.yml)
 [![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/NVIDIA/makani/coverage-data/badge.json&cacheSeconds=3600)](https://github.com/NVIDIA/makani/tree/coverage-data)
-[![license](https://img.shields.io/github/license/NVIDIA/makani)](LICENSE.txt)
+[![license](https://img.shields.io/github/license/NVIDIA/makani)](LICENSE)
 
 Makani (the Hawaiian word for wind 🍃🌺) is a library designed to enable the research and development of the next generation of machine-learning (ML) based weather and climate models in PyTorch. Makani was used to train [FourCastNet3 [1]](https://arxiv.org/abs/2507.12144v2), [Spherical Fourier Neural Operators (SFNO) [2]](https://arxiv.org/abs/2306.03838) for weather (FourCastNet2), [Huge ensemble of SFNO (HENS-SFNO) [3,4]](https://arxiv.org/abs/2408.03100), and [FourCastNet1 [5]](https://arxiv.org/abs/2202.11214).
 
