@@ -69,12 +69,14 @@ class TestDistributedLayers(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [180, 360, 256, 512, 32, 8, 1e-3],
-            [181, 360, 181, 360, 1, 10, 1e-3],
-            [180, 360, 128, 256, 32, 8, 1e-4],
-            [181, 360, 91, 180, 1, 10, 1e-4],
-            [128, 256, 256, 512, 32, 8, 1e-4],
-            [91, 180, 181, 360, 1, 10, 1e-4],
+            # even and odd latitudes, the same grid and up- and downsampling, at most 128 longitudes
+            # so that the CPU runners of the CI hold every rank's serial reference
+            [48, 96, 64, 128, 32, 8, 1e-3],
+            [49, 96, 49, 96, 1, 10, 1e-3],
+            [48, 96, 32, 64, 32, 8, 1e-4],
+            [49, 96, 25, 48, 1, 10, 1e-4],
+            [32, 64, 64, 128, 32, 8, 1e-4],
+            [25, 48, 49, 96, 1, 10, 1e-4],
             # the three filters of SFNO with scale_factor=8 on a 36 x 72 grid: truncated modes,
             # mixed grid types and an internal grid too small to split evenly
             [36, 72, 4, 9, 4, 8, 1e-4, "equiangular", "legendre-gauss", 4, 5],
@@ -592,10 +594,10 @@ class TestDistributedLayers(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [256, 512, 32, 8, True, 1e-4],
-            [181, 360, 1, 10, True, 1e-4],
-            [256, 512, 32, 8, False, 1e-4],
-            [181, 360, 1, 10, False, 1e-4],
+            [64, 128, 32, 8, True, 1e-4],
+            [65, 128, 1, 10, True, 1e-4],
+            [64, 128, 32, 8, False, 1e-4],
+            [65, 128, 1, 10, False, 1e-4],
         ],
         skip_on_empty=True,
     )
@@ -741,10 +743,10 @@ class TestDistributedLayers(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [181, 360, 1, 4, "equiangular", True, 1e-4],
-            [181, 360, 1, 4, "equiangular", False, 1e-4],
-            [180, 360, 1, 10, "legendre-gauss", True, 1e-4],
-            [180, 360, 1, 10, "legendre-gauss", False, 1e-4],
+            [65, 128, 1, 4, "equiangular", True, 1e-4],
+            [65, 128, 1, 4, "equiangular", False, 1e-4],
+            [64, 128, 1, 10, "legendre-gauss", True, 1e-4],
+            [64, 128, 1, 10, "legendre-gauss", False, 1e-4],
         ],
         skip_on_empty=True,
     )

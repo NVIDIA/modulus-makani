@@ -60,10 +60,12 @@ class TestDistributedRealFFT(unittest.TestCase):
 
         return tensor_gather
 
+    # at most 128 longitudes, so that the CPU runners of the CI hold every rank's serial reference.
+    # The odd number of latitudes keeps the shards uneven
     @parameterized.expand(
         [
-            [256, 512, 32, 8, 1e-6],
-            [361, 720, 1, 10, 1e-6],
+            [64, 128, 32, 8, 1e-6],
+            [65, 128, 1, 10, 1e-6],
         ],
         skip_on_empty=True,
     )
@@ -132,8 +134,8 @@ class TestDistributedRealFFT(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [256, 512, 32, 8, 1e-6],
-            [361, 720, 1, 10, 1e-6],
+            [64, 128, 32, 8, 1e-6],
+            [65, 128, 1, 10, 1e-6],
         ],
         skip_on_empty=True,
     )
@@ -208,17 +210,17 @@ class TestDistributedRealFFT(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # 256x512 (batch=32) needs a looser tolerance than 361x720
-            # (batch=1): confirmed via compare_tensors(verbose=True) this is
+            # 64x128 (batch=32) needs a looser tolerance than 65x128
+            # (batch=1): confirmed at 256x512 via compare_tensors(verbose=True) this is
             # float32 reduction-order noise between the distributed
             # (split-transpose-FFT) and serial (single FFT) paths, not a
             # logic bug -- worst observed violation was 7.47e-6 against a
             # 1e-6 bound. Tolerance bumped with headroom over that, not to
             # the bare minimum that happened to pass once.
-            [256, 512, 0, 32, 8, 1e-5],
-            [361, 720, 0, 1, 10, 1e-6],
-            [256, 512, 4, 32, 8, 1e-5],
-            [361, 720, 4, 1, 10, 1e-6],
+            [64, 128, 0, 32, 8, 1e-5],
+            [65, 128, 0, 1, 10, 1e-6],
+            [64, 128, 4, 32, 8, 1e-5],
+            [65, 128, 4, 1, 10, 1e-6],
         ],
         skip_on_empty=True,
     )
@@ -294,17 +296,17 @@ class TestDistributedRealFFT(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # 256x512 (batch=32) needs a looser tolerance than 361x720
-            # (batch=1): confirmed via compare_tensors(verbose=True) this is
+            # 64x128 (batch=32) needs a looser tolerance than 65x128
+            # (batch=1): confirmed at 256x512 via compare_tensors(verbose=True) this is
             # float32 reduction-order noise between the distributed
             # (split-transpose-FFT) and serial (single FFT) paths, not a
             # logic bug -- worst observed violation was 1.04e-5 against a
             # 5e-6 bound. Tolerance bumped with headroom over that, not to
             # the bare minimum that happened to pass once.
-            [256, 512, 0, 32, 8, 2e-5],
-            [361, 720, 0, 1, 10, 5e-6],
-            [256, 512, 4, 32, 8, 2e-5],
-            [361, 720, 4, 1, 10, 5e-6],
+            [64, 128, 0, 32, 8, 2e-5],
+            [65, 128, 0, 1, 10, 5e-6],
+            [64, 128, 4, 32, 8, 2e-5],
+            [65, 128, 4, 1, 10, 5e-6],
         ],
         skip_on_empty=True,
     )
