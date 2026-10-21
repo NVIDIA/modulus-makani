@@ -41,7 +41,7 @@ description = "Massively parallel training of machine-learning based weather and
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-license-files = ["LICENSE.txt", "makani/third_party/climt/LICENSE"]
+license-files = ["LICENSE", "makani/third_party/climt/LICENSE"]
 
 classifiers = [
     "Development Status :: 3 - Alpha",
