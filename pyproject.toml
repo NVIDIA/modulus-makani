@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools", "setuptools-scm"]
+# setuptools 77 reads the SPDX license expression and license-files of PEP 639
+requires = ["setuptools>=77", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -39,13 +40,14 @@ maintainers = [
 description = "Massively parallel training of machine-learning based weather and climate models"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE.txt", "makani/third_party/climt/LICENSE"]
 
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
 
