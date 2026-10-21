@@ -13,24 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime as dt
 import os
 import sys
 import tempfile
 import unittest
 from typing import Optional
 
+import h5py as h5
+import numpy as np
 import torch
+import torch_harmonics as th
 from torch.utils.data import default_collate
 from parameterized import parameterized
 
 from makani.utils.dataloader import get_dataloader
+from makani.utils.dataloaders.data_helpers import get_date_from_string
 from makani.utils.dataloaders.batch import INPUT, INPUT_TIMESTAMP, TARGET, TARGET_TIMESTAMP
 from makani.utils.dataloaders.rollout import Rollout
 from makani.utils.functions import expand_ensemble
 from makani.utils.inference.inferencer import Inferencer
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from .testutils import disable_tf32, set_seed, init_hdf5_dataset
+from .testutils import disable_tf32, set_seed, init_hdf5_dataset, H5_PATH
 from .test_trainers import init_params
 
 # the initial conditions, run in two batches, so that the second one starts a new rollout
@@ -44,6 +49,13 @@ _CASES = [
     ("plain", 1, 0, None, False),
     ("ensemble_noise_history_zenith", 2, 1, {"type": "diffusion", "mode": "concatenate", "n_channels": 1}, True),
 ]
+
+# score_model over a date range of the 2019 validation year: the initial conditions on Jan 4, 6, 8 and 10,
+# in two batches, rolled out over three lead times
+_SCORE_START = "2019-01-04T00:00:00"
+_SCORE_END = "2019-01-12T00:00:00"
+_SCORE_STEP_HOURS = 48
+_SCORE_AUTOREG_STEPS = 2
 
 
 class _RecordingBuffer:
@@ -78,19 +90,8 @@ class _RecordingMetrics:
         self.updates.append((pred.clone(), targ.clone(), idt))
 
 
-class TestInferencerRollout(unittest.TestCase):
-    """
-    The inference loop against a rollout of the same initial conditions with targets.
-
-    The inferencer streams the verification: it loads one sample per lead time
-    without targets, takes the latest step of each as the verification and as
-    the dynamic features and time the window moves on to, and rolls the model
-    out on a rollout without targets. The reference loads the same initial
-    conditions with their targets in one sample each, from the dataset's own
-    indexing, and runs them through the model with a rollout over those targets.
-    Both draw their noise from the same seed, so the predictions have to agree
-    bit for bit, and so do the verification and its times.
-    """
+class _InferencerTestCase(unittest.TestCase):
+    """The data, the experiment directory and the parameters the inferencer tests share."""
 
     @classmethod
     def setUpClass(cls, path: Optional[str] = "/tmp"):
@@ -143,6 +144,21 @@ class TestInferencerRollout(unittest.TestCase):
         # the reference uses the same model, so its weights do not matter
         params.allow_random_weights = True
         return params
+
+
+class TestInferencerRollout(_InferencerTestCase):
+    """
+    The inference loop against a rollout of the same initial conditions with targets.
+
+    The inferencer streams the verification: it loads one sample per lead time
+    without targets, takes the latest step of each as the verification and as
+    the dynamic features and time the window moves on to, and rolls the model
+    out on a rollout without targets. The reference loads the same initial
+    conditions with their targets in one sample each, from the dataset's own
+    indexing, and runs them through the model with a rollout over those targets.
+    Both draw their noise from the same seed, so the predictions have to agree
+    bit for bit, and so do the verification and its times.
+    """
 
     def _reference(self, inferencer, ensemble_size):
         """The rollouts of the initial-condition batches with their targets, in the inferencer's order."""
@@ -208,6 +224,165 @@ class TestInferencerRollout(unittest.TestCase):
 
                     if (noise is not None) and (ensemble_size > 1):
                         self.assertFalse(torch.equal(pred[:, 0], pred[:, 1]), "the members draw different noise")
+
+
+def _power_spectrum(sht, fields):
+    """Total power per degree, (..., H, W) -> (..., L), as the spectrum buffer computes it."""
+    power = torch.square(torch.abs(sht(torch.from_numpy(fields))))
+    # the negative orders count as much as the positive ones
+    power[..., 1:] *= 2.0
+    return torch.sum(power, dim=-1).to(torch.float64)
+
+
+def _zonal_power_spectrum(fields, lat):
+    """Latitude-weighted zonal power per order, (..., H, W) -> (..., H, M), as the zonal spectrum buffer computes it."""
+    coeffs = torch.fft.rfft(torch.from_numpy(fields), dim=-1, norm="forward")
+    power = torch.cos(torch.deg2rad(torch.from_numpy(lat))).reshape(-1, 1) * torch.square(torch.abs(coeffs))
+    power[..., 1:] *= 2.0
+    return power.to(torch.float64)
+
+
+class TestInferencerScoring(_InferencerTestCase):
+    """
+    ``score_model``, the entry point of ``makani/inference.py``, over a short date range with every output it
+    can write. The outputs are checked against each other and against the raw data: the initial conditions
+    in the rollout file against the data at their times, the spectra against the spectra of the rollout file's
+    predictions and of the data at the lead times, and the logged scores against the metrics file.
+    """
+
+    def _score(self, params, outputs):
+        params.valid_autoreg_steps = _SCORE_AUTOREG_STEPS
+        inferencer = Inferencer(params, world_rank=0, device="cpu")
+
+        # keep the logs score_model hands to log_score, which it does not return
+        captured = {}
+        log_score = inferencer.log_score
+
+        def _log_score(scoring_logs, scoring_time):
+            captured["logs"] = scoring_logs
+            log_score(scoring_logs, scoring_time)
+
+        inferencer.log_score = _log_score
+
+        # output_file, metrics_file, bias_file, spectrum_file and zonal_spectrum_file
+        paths = {name: os.path.join(self.tmpdir.name, f"{name}.h5") for name in outputs}
+        inferencer.score_model(
+            start_date=_SCORE_START,
+            end_date=_SCORE_END,
+            date_step=_SCORE_STEP_HOURS,
+            **{f"{name}_file": path for name, path in paths.items()},
+        )
+
+        return inferencer, captured["logs"], paths
+
+    def _raw_indices(self, inferencer):
+        """The positions of the initial conditions in the raw data file, in the order score_model runs them."""
+        dataset = inferencer.valid_dataset
+        start = dataset.get_index_at_time(get_date_from_string(_SCORE_START))
+        end = dataset.get_index_at_time(get_date_from_string(_SCORE_END))
+        indices = range(start, end, _SCORE_STEP_HOURS // dataset.dhours)
+
+        year_start = dt.datetime(year=2019, month=1, day=1, tzinfo=dt.timezone.utc)
+        sample_hours = dt.timedelta(hours=dataset.dhours)
+        return [int((dataset.get_time_at_index(idx) - year_start) / sample_hours) for idx in indices]
+
+    def _raw_data(self):
+        with h5.File(os.path.join(self.valid_path, "2019.h5"), "r") as hf:
+            return hf[H5_PATH][...]
+
+    def _assert_close(self, actual, expected, msg, rtol=1e-4):
+        actual = torch.as_tensor(np.asarray(actual), dtype=torch.float64)
+        expected = torch.as_tensor(expected, dtype=torch.float64)
+        atol = 1e-6 * max(expected.abs().max().item(), 1.0)
+        self.assertTrue(torch.allclose(actual, expected, rtol=rtol, atol=atol), msg)
+
+    @parameterized.expand(_CASES)
+    def test_score_model_outputs_are_consistent(self, name, ensemble_size, n_history, noise, zenith):
+        params = self._params(ensemble_size, n_history, noise, zenith)
+        inferencer, logs, paths = self._score(params, ["metrics", "output", "spectrum", "zonal_spectrum"])
+
+        rollout_steps = _SCORE_AUTOREG_STEPS + 1
+        channels = list(inferencer.params.channel_names)
+        raw_ics = self._raw_indices(inferencer)
+        raw = self._raw_data()
+        dt_steps = inferencer.params.dt
+        num_ics = len(raw_ics)
+
+        # the rollout file: the initial condition and the predictions per lead time, in physical units
+        with h5.File(paths["output"], "r") as hf:
+            fields = hf["fields"][...]
+            timestamps = hf["timestamp"][...]
+            rollout_lead_times = hf["lead_time"][...]
+        self.assertEqual(fields.shape, (num_ics, rollout_steps + 1, ensemble_size, len(channels), *raw.shape[-2:]))
+        self.assertTrue(np.all(np.diff(timestamps) == _SCORE_STEP_HOURS * 3600), "initial condition times")
+        for member in range(ensemble_size):
+            self._assert_close(fields[:, 0, member], raw[raw_ics], f"initial conditions of member {member}")
+        self.assertTrue(np.all(np.isfinite(fields)), "predictions")
+
+        # the verification at each lead time, from the raw data
+        targets = np.stack([raw[[idx + (k + 1) * dt_steps for idx in raw_ics]] for k in range(rollout_steps)], axis=1)
+
+        # the metrics file and the logs agree, and the lead times with the rollout file
+        with h5.File(paths["metrics"], "r") as hf:
+            for metric in ["L1", "RMSE", "ACC"]:
+                with self.subTest(metric=metric):
+                    data = hf[metric]["metric_data"][...]
+                    self.assertEqual(data.shape, (rollout_steps, len(channels)))
+                    self.assertTrue(np.all(np.isfinite(data)))
+                    self.assertTrue(np.allclose(hf[metric]["lead_time"][...], rollout_lead_times[1:]), "lead times")
+
+                    last_lead_time = int(rollout_lead_times[-1])
+                    for ic, channel in enumerate(channels):
+                        logged = logs["metrics"][f"validation {metric} {channel}({last_lead_time})"]
+                        self.assertAlmostEqual(float(logged), float(data[-1, ic]), places=5)
+        self.assertTrue(np.isfinite(logs["base"]["validation loss"]), "validation loss")
+
+        # the spectra: the verification in the first ensemble slot, the members after it
+        sht = th.RealSHT(*raw.shape[-2:], grid=inferencer.params.model_grid_type)
+        with h5.File(paths["spectrum"], "r") as hf:
+            spectrum_mean, spectrum_std = hf["mean"][...], hf["std"][...]
+        with h5.File(paths["zonal_spectrum"], "r") as hf:
+            zonal_mean, zonal_std = hf["mean"][...], hf["std"][...]
+            lat = hf["lat"][...]
+        self.assertEqual(spectrum_mean.shape, (rollout_steps, len(channels), ensemble_size + 1, sht.lmax))
+        nlat, nlon = raw.shape[-2:]
+        self.assertEqual(zonal_mean.shape, (rollout_steps, len(channels), ensemble_size + 1, nlat, nlon // 2 + 1))
+
+        for k in range(rollout_steps):
+            with self.subTest(lead_time=k):
+                # (N, E + 1, C, H, W)
+                states = np.concatenate([targets[:, k, None], fields[:, k + 1]], axis=1)
+
+                # (N, C, E + 1, L), averaged over the initial conditions
+                spect = _power_spectrum(sht, states).permute(0, 2, 1, 3)
+                self._assert_close(spectrum_mean[k], spect.mean(dim=0), "spectrum mean")
+                self._assert_close(spectrum_std[k], spect.std(dim=0), "spectrum std", rtol=1e-3)
+
+                # (N, C, E + 1, H, M)
+                zonal = _zonal_power_spectrum(states, lat).permute(0, 2, 1, 3, 4)
+                self._assert_close(zonal_mean[k], zonal.mean(dim=0), "zonal spectrum mean")
+                self._assert_close(zonal_std[k], zonal.std(dim=0), "zonal spectrum std", rtol=1e-3)
+
+    def test_score_model_bias(self):
+        params = self._params(1, 0, None, False)
+        inferencer, _, paths = self._score(params, ["output", "bias"])
+
+        rollout_steps = _SCORE_AUTOREG_STEPS + 1
+        raw_ics = self._raw_indices(inferencer)
+        raw = self._raw_data()
+
+        with h5.File(paths["output"], "r") as hf:
+            fields = hf["fields"][...]
+        with h5.File(paths["bias"], "r") as hf:
+            bias_mean = hf["mean"][...]
+        self.assertEqual(bias_mean.shape, (rollout_steps, raw.shape[1], *raw.shape[-2:]))
+
+        # the mean error over the initial conditions per lead time, from the rollout file and the raw data
+        for k in range(rollout_steps):
+            with self.subTest(lead_time=k):
+                targets = raw[[idx + (k + 1) * inferencer.params.dt for idx in raw_ics]]
+                error = fields[:, k + 1, 0] - targets
+                self._assert_close(bias_mean[k], torch.from_numpy(error).mean(dim=0), "mean error")
 
 
 if __name__ == "__main__":

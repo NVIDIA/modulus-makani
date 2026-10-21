@@ -19,6 +19,8 @@ are built from, the steppers, the model registry entry points and PhysicsNeMo
 compatibility, and loading parameters that predate the resampled shapes.
 """
 
+import importlib.util
+import json
 import os
 import shutil
 import tempfile
@@ -34,14 +36,23 @@ from importlib.metadata import entry_points
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from makani.models.model_package import ModelWrapper, save_model_package
+from makani.models.model_package import (
+    LocalPackage,
+    ModelWrapper,
+    load_model_package,
+    load_time_loop,
+    save_model_package,
+)
 from makani.models.stepper import StepWrapper
+from makani.utils.driver import Driver
 from makani.utils.dataloaders.batch import make_batch
 from makani.utils.dataloaders.rollout import Rollout
 from .testutils import set_seed, get_default_parameters, compare_tensors, NUM_CHANNELS, IMG_SIZE_H, IMG_SIZE_W
 from makani.utils.YParams import ParamsBase, ensure_resampled_shapes
 from makani.models import model_registry
 
+# earth2mip is optional; load_time_loop builds one of its TimeLoops
+_have_earth2mip = importlib.util.find_spec("earth2mip") is not None
 
 # ---------------------------------------------------------------------------
 # Model packages: makani.models.model_package
@@ -382,6 +393,214 @@ class TestSaveModelPackage(unittest.TestCase):
         save_model_package(self.params)
 
         self.assertIn("config.json", os.listdir(self.tmpdir.name))
+
+
+class TestLoadStaticData(unittest.TestCase):
+    """LocalPackage._load_static_data points the params at the package's canonical files."""
+
+    def test_set_paths_are_redirected_into_the_package(self):
+        package = LocalPackage("/package")
+        params = ParamsBase()
+        params.invariants = [{"channel": "z", "encoding": "normalize"}]
+        params.invariants_path = "/elsewhere/orography.h5"
+        params.global_means_path = "/elsewhere/means.npy"
+        params.global_stds_path = "/elsewhere/stds.npy"
+        params.min_path = "/elsewhere/mins.npy"
+        params.max_path = "/elsewhere/maxs.npy"
+
+        LocalPackage._load_static_data(package, params)
+
+        self.assertEqual(params.invariants_path, os.path.join("/package", LocalPackage.INVARIANTS_FILE))
+        self.assertEqual(params.global_means_path, os.path.join("/package", LocalPackage.MEANS_FILE))
+        self.assertEqual(params.global_stds_path, os.path.join("/package", LocalPackage.STDS_FILE))
+        self.assertEqual(params.min_path, os.path.join("/package", LocalPackage.MINS_FILE))
+        self.assertEqual(params.max_path, os.path.join("/package", LocalPackage.MAXS_FILE))
+
+    def test_unset_paths_stay_unset(self):
+        # the package only holds the files the run had, so absent statistics must not appear
+        package = LocalPackage("/package")
+        params = ParamsBase()
+        params.invariants = None
+        params.global_means_path = "/elsewhere/means.npy"
+        params.global_stds_path = "/elsewhere/stds.npy"
+        params.min_path = None
+
+        LocalPackage._load_static_data(package, params)
+
+        self.assertFalse(hasattr(params, "invariants_path"))
+        self.assertIsNone(params.min_path)
+        self.assertIsNone(params.get("max_path", None))
+        self.assertEqual(params.global_means_path, os.path.join("/package", LocalPackage.MEANS_FILE))
+
+
+class TestLoadModelPackage(_ModelPackageTestBase):
+    """
+    save_model_package followed by load_model_package gives back the same model.
+
+    The package is written the way training writes it: the config and the statistics through
+    save_model_package, the weights as the legacy checkpoint at the canonical package path.
+    The statistics come from files with non-canonical names, so the round trip also checks that
+    they are copied into the package and found there again.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pkgdir = tempfile.TemporaryDirectory()
+        self.srcdir = tempfile.TemporaryDirectory()
+
+        # non-trivial statistics, so normalization errors show in the output
+        means = np.arange(self.C, dtype=np.float64).reshape(1, self.C, 1, 1)
+        stds = (1.0 + 0.5 * np.arange(self.C, dtype=np.float64)).reshape(1, self.C, 1, 1)
+        self.means_src = os.path.join(self.srcdir.name, "my_means.npy")
+        self.stds_src = os.path.join(self.srcdir.name, "my_stds.npy")
+        self.mins_src = os.path.join(self.srcdir.name, "my_mins.npy")
+        self.maxs_src = os.path.join(self.srcdir.name, "my_maxs.npy")
+        np.save(self.means_src, means)
+        np.save(self.stds_src, stds)
+        np.save(self.mins_src, means - 3.0 * stds)
+        np.save(self.maxs_src, means + 3.0 * stds)
+
+        params = get_default_parameters()
+        params.nettype = "SFNO"
+        params.embed_dim = 16
+        params.num_layers = 2
+        params.normalization = "zscore"
+        params.global_means_path = self.means_src
+        params.global_stds_path = self.stds_src
+        params.min_path = self.mins_src
+        params.max_path = self.maxs_src
+        params.data_channel_names = list(params.channel_names)
+        params.dhours = 6
+        params.img_crop_shape_x = params.img_shape_x
+        params.img_crop_shape_y = params.img_shape_y
+        params.img_crop_offset_x = 0
+        params.img_crop_offset_y = 0
+        params.experiment_dir = self.pkgdir.name
+        self.params = params
+
+        self.package = LocalPackage(self.pkgdir.name)
+
+        # the package config is written first, as json.dumps fails on anything the model build
+        # might add to the params
+        save_model_package(params)
+
+        self.model = model_registry.get_model(params)
+        # move the weights away from any fresh initialization, so a model that was not restored
+        # cannot match by chance
+        with torch.no_grad():
+            for p in self.model.parameters():
+                p.add_(0.1 * torch.randn_like(p))
+
+        checkpoint_path = self.package.get(LocalPackage.MODEL_PACKAGE_CHECKPOINT_PATH)
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        Driver.save_checkpoint(checkpoint_path, self.model)
+
+    def tearDown(self):
+        self.pkgdir.cleanup()
+        self.srcdir.cleanup()
+
+    def _reference_wrapper(self):
+        wrapper = ModelWrapper(self.model, self.params)
+        wrapper.eval()
+        return wrapper
+
+    def test_package_holds_the_canonical_files(self):
+        files = os.listdir(self.pkgdir.name)
+        for fname in [
+            "config.json",
+            "metadata.json",
+            LocalPackage.MEANS_FILE,
+            LocalPackage.STDS_FILE,
+            LocalPackage.MINS_FILE,
+            LocalPackage.MAXS_FILE,
+        ]:
+            self.assertIn(fname, files)
+
+    def test_params_survive(self):
+        loaded = load_model_package(self.package, pretrained=True, device="cpu")
+
+        self.assertEqual(loaded.params.nettype, "SFNO")
+        self.assertEqual(loaded.params.embed_dim, 16)
+        self.assertEqual(loaded.params.num_layers, 2)
+        self.assertEqual(loaded.params.channel_names, self.params.channel_names)
+        self.assertEqual(loaded.params.in_channels, self.params.in_channels)
+        self.assertEqual(loaded.params.out_channels, self.params.out_channels)
+        # the statistics are read from the package, not from where the training run had them
+        self.assertEqual(loaded.params.global_means_path, self.package.get(LocalPackage.MEANS_FILE))
+        self.assertEqual(loaded.params.global_stds_path, self.package.get(LocalPackage.STDS_FILE))
+        self.assertEqual(loaded.params.min_path, self.package.get(LocalPackage.MINS_FILE))
+        self.assertEqual(loaded.params.max_path, self.package.get(LocalPackage.MAXS_FILE))
+
+    def test_weights_and_statistics_survive(self):
+        loaded = load_model_package(self.package, pretrained=True, device="cpu")
+        reference = self._reference_wrapper()
+
+        self.assertFalse(loaded.training)
+
+        state_ref = self.model.state_dict()
+        state_loaded = loaded.model.state_dict()
+        self.assertEqual(sorted(state_loaded.keys()), sorted(state_ref.keys()))
+        for key, tensor in state_ref.items():
+            self.assertTrue(torch.equal(state_loaded[key], tensor), key)
+
+        for name in ["in_bias", "in_scale", "out_bias", "out_scale"]:
+            self.assertTrue(torch.equal(getattr(loaded, name), getattr(reference, name)), name)
+
+    def test_forward_matches_the_saved_model(self):
+        loaded = load_model_package(self.package, pretrained=True, device="cpu")
+        reference = self._reference_wrapper()
+
+        x = torch.randn(2, self.C, self.H, self.W)
+        times = self._times(2)
+        with torch.no_grad():
+            out_ref = reference(x, times, normalized_data=False)
+            out_loaded = loaded(x, times, normalized_data=False)
+
+        self.assertTrue(compare_tensors("load_model_package_forward", out_loaded, out_ref, shape_check=True))
+
+    def test_without_pretrained_the_weights_are_not_restored(self):
+        loaded = load_model_package(self.package, pretrained=False, device="cpu")
+
+        state_ref = self.model.state_dict()
+        differs = any(
+            not torch.equal(t, state_ref[k]) for k, t in loaded.model.state_dict().items() if t.is_floating_point()
+        )
+        self.assertTrue(differs)
+
+    def test_multistep_is_deprecated_but_loads_the_same_model(self):
+        with self.assertWarns(FutureWarning):
+            loaded = load_model_package(self.package, pretrained=True, device="cpu", multistep=True)
+        reference = self._reference_wrapper()
+
+        x = torch.randn(1, self.C, self.H, self.W)
+        times = self._times(1)
+        with torch.no_grad():
+            out_ref = reference(x, times)
+            out_loaded = loaded(x, times)
+
+        self.assertTrue(compare_tensors("load_model_package_multistep", out_loaded, out_ref, shape_check=True))
+
+    @unittest.skipUnless(_have_earth2mip, "earth2mip is not installed")
+    def test_load_time_loop(self):
+        from earth2mip.networks import Inference
+
+        time_loop = load_time_loop(self.package, device="cpu")
+
+        self.assertIsInstance(time_loop, Inference)
+        self.assertEqual(list(time_loop.channel_names), self.params.data_channel_names)
+        self.assertEqual(time_loop.n_history, self.params.n_history)
+
+    @unittest.skipUnless(_have_earth2mip, "earth2mip is not installed")
+    def test_load_time_loop_rejects_unequal_channels(self):
+        # the time loop feeds the output back in, so it needs the same channels in and out
+        with open(self.package.get("config.json")) as f:
+            config = json.load(f)
+        config["out_channels"] = config["out_channels"][:-1]
+        with open(self.package.get("config.json"), "w") as f:
+            json.dump(config, f)
+
+        with self.assertRaises(NotImplementedError):
+            load_time_loop(self.package, device="cpu")
 
 
 # ---------------------------------------------------------------------------

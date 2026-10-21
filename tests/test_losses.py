@@ -50,7 +50,8 @@ from makani.utils.losses.energy_score import (
     CorrectedSpectralL2EnergyScoreLoss,
 )
 from makani.utils.losses.crps_loss import KernelScoreLoss
-from makani.utils.losses.base_loss import _compute_channel_weighting_helper
+from makani.utils.losses.base_loss import _compute_channel_weighting_helper, compute_alpha_per_step
+from makani.utils.losses.crps_loss import _crps_skillspread_kernel, _crps_gauss_kernel
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from .testutils import disable_tf32, set_seed, get_default_parameters, compare_tensors, compare_arrays
@@ -4129,6 +4130,128 @@ class TestCoherenceRegularization(unittest.TestCase):
         self.assertIsNotNone(fc.grad)
         self.assertFalse(torch.isnan(fc.grad).any())
         self.assertFalse(torch.isinf(fc.grad).any())
+
+
+# ===========================================================================
+class TestComputeAlphaPerStep(unittest.TestCase):
+    """compute_alpha_per_step against the closed-form schedules."""
+
+    @parameterized.expand([(0,), (1,), (4,)])
+    def test_linear(self, n_future):
+        alpha = compute_alpha_per_step(n_future, schedule="linear", alpha_min=0.2, alpha_max=0.8)
+        if n_future == 0:
+            expected = [0.8]
+        else:
+            expected = [0.2 + 0.6 * k / n_future for k in range(n_future + 1)]
+        self.assertTrue(torch.allclose(alpha, torch.tensor(expected), atol=1e-6))
+
+    @parameterized.expand([(0, None), (4, None), (4, 0.25)])
+    def test_sigmoid(self, n_future, t0_frac):
+        alpha = compute_alpha_per_step(
+            n_future, schedule="sigmoid", alpha_max=0.8, sigmoid_t0_frac=t0_frac, sigmoid_beta=3.0
+        )
+        t0 = 0.5 if t0_frac is None else t0_frac
+        expected = [0.8 / (1.0 + math.exp(-3.0 * (k / max(n_future, 1) - t0))) for k in range(n_future + 1)]
+        self.assertTrue(torch.allclose(alpha, torch.tensor(expected), atol=1e-6))
+
+    def test_unknown_schedule_is_constant(self):
+        alpha = compute_alpha_per_step(3, schedule="constant", alpha_min=0.1, alpha_max=0.7)
+        self.assertTrue(torch.allclose(alpha, torch.full((4,), 0.7)))
+
+    @parameterized.expand([("linear", 0.5), ("quadratic", 0.25), ("unknown", 0.5)])
+    def test_annealing(self, annealing, factor):
+        base = compute_alpha_per_step(3, schedule="linear", alpha_min=0.2, alpha_max=1.0)
+        alpha = compute_alpha_per_step(
+            3, schedule="linear", alpha_min=0.2, alpha_max=1.0, training_progress=0.5, annealing=annealing
+        )
+        self.assertTrue(torch.allclose(alpha, factor * base, atol=1e-6))
+
+
+# ===========================================================================
+class TestCRPSKernelReference(unittest.TestCase):
+    """The skillspread and gauss kernels against independent reference formulas."""
+
+    def setUp(self):
+        set_seed(333)
+
+    @parameterized.expand([(2, 0.0), (5, 0.0), (5, 0.5), (5, 1.0), (8, 0.95)])
+    def test_skillspread_matches_pairwise_formula(self, ens, alpha, verbose=False):
+        obs = torch.randn(3, 7, dtype=torch.float64)
+        fc = torch.randn(ens, 3, 7, dtype=torch.float64)
+        # the kernel expects the ensemble sorted along dim 0
+        fc_sorted, _ = torch.sort(fc, dim=0)
+        out = _crps_skillspread_kernel(obs, fc_sorted, torch.ones_like(fc_sorted), alpha)
+
+        # E|X - y| - (N - 1 + alpha) / (N - 1) * sum_ij |x_i - x_j| / (2 N^2): alpha=1 is the fair CRPS,
+        # alpha=0 the biased ensemble CRPS
+        skill = (fc - obs.unsqueeze(0)).abs().mean(dim=0)
+        pairwise = (fc.unsqueeze(0) - fc.unsqueeze(1)).abs().sum(dim=(0, 1))
+        expected = skill - (ens - 1 + alpha) / (ens - 1) * pairwise / (2 * ens**2)
+        self.assertTrue(compare_tensors("skillspread", out, expected, atol=1e-12, rtol=1e-12, verbose=verbose))
+
+    def test_gauss_matches_normal_crps(self, verbose=False):
+        obs = torch.randn(3, 7, dtype=torch.float64)
+        fc = 1.5 * torch.randn(16, 3, 7, dtype=torch.float64) + 0.3
+        out = _crps_gauss_kernel(obs, fc, torch.ones_like(fc), 1e-6)
+
+        # closed-form CRPS of N(mu, sigma^2): sigma * (z (2 Phi(z) - 1) + 2 phi(z) - 1 / sqrt(pi))
+        mu = fc.mean(dim=0)
+        sigma = fc.std(dim=0, unbiased=False)
+        normal = torch.distributions.Normal(torch.zeros_like(mu), torch.ones_like(mu))
+        z = (obs - mu) / sigma
+        expected = sigma * (z * (2 * normal.cdf(z) - 1) + 2 * normal.log_prob(z).exp() - 1 / math.sqrt(math.pi))
+        self.assertTrue(compare_tensors("gauss", out, expected, atol=1e-12, rtol=1e-10, verbose=verbose))
+
+
+# ===========================================================================
+class TestTransformedCRPSVariants(unittest.TestCase):
+    """The gauss kernel and the spatial weights in the gradient and vorticity/divergence CRPS losses."""
+
+    _E = 5
+
+    def setUp(self):
+        disable_tf32()
+        set_seed(333)
+
+    def _fn(self, cls, crps_type, **kw):
+        kwargs = _WIND_GEOM_KWARGS if cls is VortDivCRPSLoss else _GEOM_KWARGS
+        return cls(**kwargs, crps_type=crps_type, spatial_distributed=False, ensemble_distributed=False, **kw)
+
+    def _channels(self, cls):
+        return _NUM_WIND_CH if cls is VortDivCRPSLoss else _NUM_CH
+
+    @parameterized.expand([(GradientCRPSLoss,), (VortDivCRPSLoss,)])
+    def test_gauss_shape_and_nonneg(self, cls):
+        fn = self._fn(cls, "gauss")
+        nch = self._channels(cls)
+        out = fn(_rand_ensemble(self._E, channels=nch), _rand(channels=nch))
+        self.assertEqual(tuple(out.shape), (_BATCH, fn.n_channels))
+        self.assertTrue((out >= -1e-6).all(), f"negative gauss CRPS, min={out.min().item():.4e}")
+
+    @parameterized.expand(
+        [
+            (GradientCRPSLoss, "skillspread"),
+            (GradientCRPSLoss, "cdf"),
+            (GradientCRPSLoss, "gauss"),
+            (VortDivCRPSLoss, "skillspread"),
+            (VortDivCRPSLoss, "gauss"),
+        ]
+    )
+    def test_unit_spatial_weights_match_none(self, cls, crps_type, verbose=False):
+        fn = self._fn(cls, crps_type)
+        nch = self._channels(cls)
+        fc = _rand_ensemble(self._E, channels=nch)
+        obs = _rand(channels=nch)
+        out_none = fn(fc, obs)
+        out_ones = fn(fc, obs, spatial_weights=torch.ones_like(obs))
+        self.assertTrue(compare_tensors(f"{crps_type} weights", out_ones, out_none, atol=1e-6, verbose=verbose))
+
+    @parameterized.expand([(GradientCRPSLoss,), (VortDivCRPSLoss,)])
+    def test_skillspread_rejects_ensemble_weights(self, cls):
+        fn = self._fn(cls, "skillspread", ensemble_weights=torch.ones(self._E))
+        nch = self._channels(cls)
+        with self.assertRaises(NotImplementedError):
+            fn(_rand_ensemble(self._E, channels=nch), _rand(channels=nch))
 
 
 if __name__ == "__main__":

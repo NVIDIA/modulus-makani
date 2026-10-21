@@ -15,6 +15,7 @@
 
 import os
 import sys
+import shutil
 
 import tempfile
 from typing import Optional
@@ -287,6 +288,195 @@ class TestTrainer(_TrainerTestCase):
             out = self._forward(self.trainer_restored, inp)
             with self.subTest(desc="train output vs reference roundtrip 2"):
                 self.assertTrue(compare_tensors("train output vs reference roundtrip 2", out, out_ref, verbose=verbose))
+
+
+def _optimizer(trainer):
+    # the ensemble trainer names its optimizer and scheduler after the model
+    return trainer.model_optimizer if hasattr(trainer, "model_optimizer") else trainer.optimizer
+
+
+def _scheduler(trainer):
+    return trainer.model_scheduler if hasattr(trainer, "model_scheduler") else trainer.scheduler
+
+
+def _states_equal(msg, state1, state2, verbose=False):
+    """Bitwise comparison of two (nested) state dicts, such as those of a model, an optimizer or a scheduler."""
+    if isinstance(state1, torch.Tensor) or isinstance(state2, torch.Tensor):
+        if not (isinstance(state1, torch.Tensor) and isinstance(state2, torch.Tensor)):
+            if verbose:
+                print(f"{msg}: a tensor compared to a {type(state1 if isinstance(state2, torch.Tensor) else state2)}")
+            return False
+        return compare_tensors(msg, state1, state2, atol=0.0, rtol=0.0, verbose=verbose, shape_check=True)
+    if isinstance(state1, dict):
+        if not (isinstance(state2, dict) and (state1.keys() == state2.keys())):
+            if verbose:
+                print(f"{msg}: the keys differ")
+            return False
+        return all(_states_equal(f"{msg}.{key}", state1[key], state2[key], verbose=verbose) for key in state1)
+    if isinstance(state1, (list, tuple)):
+        if not (isinstance(state2, (list, tuple)) and (len(state1) == len(state2))):
+            if verbose:
+                print(f"{msg}: the lengths differ")
+            return False
+        return all(
+            _states_equal(f"{msg}[{i}]", s1, s2, verbose=verbose) for i, (s1, s2) in enumerate(zip(state1, state2))
+        )
+    if state1 != state2:
+        if verbose:
+            print(f"{msg}: {state1} vs {state2}")
+        return False
+    return True
+
+
+class TestTrainerCheckpointing(_TrainerTestCase):
+    """
+    Continuing a training run from a checkpoint, and starting a new one from the weights of another.
+
+    Everything runs on the CPU, where the training is deterministic, so a resumed run has to
+    reproduce the uninterrupted one bit for bit: whatever state the checkpoint misses, such as
+    that of the optimizer, the scheduler or the counters, shows up as a difference.
+    """
+
+    _SEED = 4321
+
+    @parameterized.expand([(Trainer,), (EnsembleTrainer,)], skip_on_empty=True)
+    def test_resume_continues_training(self, trainer_handle, verbose=False):
+        device = torch.device("cpu")
+
+        # the first epoch, which writes the checkpoint to resume from. The checkpoint path has no
+        # version in it, so the second epoch overwrites it, and a copy is kept aside
+        self.params.max_epochs = 1
+        trainer = trainer_handle(self.params, 0, device=device)
+        trainer.train()
+        checkpoint_path = self.params.checkpoint_path.format(mp_rank=comm.get_rank("model"))
+        shutil.copyfile(checkpoint_path, checkpoint_path + ".epoch1")
+        iters_epoch1 = trainer.iters
+
+        # the reference continues in memory with the second epoch. train() starts at the epoch the
+        # trainer was constructed with, so it is moved on to the one the first call ended at.
+        # The data order and the dropout are drawn from the global generator, which is seeded
+        # alike before the second epoch of both runs
+        self.params.max_epochs = trainer.params.max_epochs = 2
+        trainer.start_epoch = trainer.epoch
+        set_seed(self._SEED)
+        trainer.train()
+
+        # a new trainer resumes from the checkpoint of the first epoch and trains the second
+        shutil.copyfile(checkpoint_path + ".epoch1", checkpoint_path)
+        self.params.resuming = True
+        trainer_resumed = trainer_handle(self.params, 0, device=device)
+
+        with self.subTest(desc="counters after restore"):
+            self.assertEqual(trainer_resumed.epoch, 1)
+            self.assertEqual(trainer_resumed.iters, iters_epoch1)
+
+        set_seed(self._SEED)
+        trainer_resumed.train()
+
+        with self.subTest(desc="counters after training"):
+            self.assertEqual(trainer_resumed.epoch, trainer.epoch)
+            self.assertEqual(trainer_resumed.iters, trainer.iters)
+
+        with self.subTest(desc="model"):
+            self.assertTrue(
+                _states_equal("model", trainer_resumed.model.state_dict(), trainer.model.state_dict(), verbose=verbose)
+            )
+
+        with self.subTest(desc="optimizer"):
+            self.assertTrue(
+                _states_equal(
+                    "optimizer",
+                    _optimizer(trainer_resumed).state_dict(),
+                    _optimizer(trainer).state_dict(),
+                    verbose=verbose,
+                )
+            )
+
+        with self.subTest(desc="scheduler"):
+            self.assertTrue(
+                _states_equal(
+                    "scheduler",
+                    _scheduler(trainer_resumed).state_dict(),
+                    _scheduler(trainer).state_dict(),
+                    verbose=verbose,
+                )
+            )
+
+    @parameterized.expand(
+        [(Trainer,), (EnsembleTrainer,), (StochasticTrainer,), (AutoencoderTrainer,)], skip_on_empty=True
+    )
+    def test_pretrained(self, trainer_handle, verbose=False):
+        device = torch.device("cpu")
+
+        # the run whose checkpoint the new ones start from
+        self.params.max_epochs = 1
+        source = trainer_handle(self.params, 0, device=device)
+        source.train()
+        source_lrs = [group["lr"] for group in _optimizer(source).param_groups]
+
+        self.params.pretrained = True
+        self.params.resuming = False
+        self.params.pretrained_checkpoint_path = self.params.checkpoint_path
+
+        def _model_matches(trainer):
+            return _states_equal("model", trainer.model.state_dict(), source.model.state_dict(), verbose=verbose)
+
+        # by default everything is taken over from the checkpoint
+        trainer = trainer_handle(self.params, 0, device=device)
+        with self.subTest(desc="defaults: model"):
+            self.assertTrue(_model_matches(trainer))
+        with self.subTest(desc="defaults: counters"):
+            self.assertEqual(trainer.epoch, source.epoch)
+            self.assertEqual(trainer.iters, source.iters)
+        with self.subTest(desc="defaults: optimizer"):
+            self.assertTrue(
+                _states_equal(
+                    "optimizer", _optimizer(trainer).state_dict(), _optimizer(source).state_dict(), verbose=verbose
+                )
+            )
+        with self.subTest(desc="defaults: scheduler"):
+            self.assertTrue(
+                _states_equal(
+                    "scheduler", _scheduler(trainer).state_dict(), _scheduler(source).state_dict(), verbose=verbose
+                )
+            )
+
+        # finetuning: only the weights are taken over, the optimizer, the scheduler and the
+        # counters start afresh
+        self.params.load_optimizer = False
+        self.params.load_scheduler = False
+        self.params.load_counters = False
+        trainer = trainer_handle(self.params, 0, device=device)
+        with self.subTest(desc="finetune: model"):
+            self.assertTrue(_model_matches(trainer))
+        with self.subTest(desc="finetune: counters"):
+            self.assertEqual(trainer.epoch, 0)
+            self.assertEqual(trainer.iters, 0)
+        with self.subTest(desc="finetune: optimizer"):
+            self.assertEqual(len(_optimizer(trainer).state_dict()["state"]), 0)
+            self.assertTrue(all(group["lr"] == self.params.lr for group in _optimizer(trainer).param_groups))
+        with self.subTest(desc="finetune: scheduler"):
+            self.assertEqual(_scheduler(trainer).last_epoch, 0)
+
+        # the optimizer is restored, with its learning rate replaced by the configured one
+        self.params.load_optimizer = True
+        self.params.load_scheduler = True
+        self.params.load_counters = True
+        self.params.override_lr = True
+        self.params.lr = 1e-3
+        self.assertTrue(all(lr != self.params.lr for lr in source_lrs))
+        trainer = trainer_handle(self.params, 0, device=device)
+        with self.subTest(desc="override lr: learning rate"):
+            self.assertTrue(all(group["lr"] == self.params.lr for group in _optimizer(trainer).param_groups))
+        with self.subTest(desc="override lr: optimizer state"):
+            self.assertTrue(
+                _states_equal(
+                    "optimizer state",
+                    _optimizer(trainer).state_dict()["state"],
+                    _optimizer(source).state_dict()["state"],
+                    verbose=verbose,
+                )
+            )
 
 
 class _RecordingMetrics:

@@ -243,6 +243,162 @@ class TestGetModelMultistep(unittest.TestCase):
             model_registry.get_model(self.params, multi_step=True)
 
 
+@parameterized_class(("device",), _devices)
+class TestModelOptions(unittest.TestCase):
+    """
+    Model options the default configurations leave off: the normalization layers of FCN3 and the
+    non-linear spectral filter (SpectralAttention) of SFNO.
+    """
+
+    def setUp(self):
+        # the same small grid and parameters as TestModels
+        TestModels.setUp(self)
+
+    def _forward_backward(self):
+        model = model_registry.get_model(self.params).to(self.device)
+
+        inp = torch.randn(
+            self.params.batch_size,
+            self.params.N_in_channels,
+            self.params.img_shape_x,
+            self.params.img_shape_y,
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=True,
+        )
+        out = model(single_step_rollout(inp.unsqueeze(1))).squeeze(1)
+        self.assertEqual(
+            out.shape,
+            (self.params.batch_size, self.params.N_out_channels, self.params.img_shape_x, self.params.img_shape_y),
+        )
+        self.assertTrue(torch.isfinite(out).all())
+
+        out.sum().backward()
+        self.assertTrue(inp.grad is not None)
+        self.assertTrue(torch.isfinite(inp.grad).all())
+
+    @parameterized.expand([("layer_norm",), ("instance_norm",), ("instance_norm_s2",)])
+    def test_fcn3_normalization_layer(self, normalization_layer):
+        self.params.nettype = "FCN3"
+        self.params.normalization_layer = normalization_layer
+        self._forward_backward()
+
+    @parameterized.expand([("diagonal",), ("l-dependant",)])
+    def test_sfno_spectral_attention(self, operator_type):
+        self.params.nettype = "SFNO"
+        self.params.filter_type = "non-linear"
+        self.params.operator_type = operator_type
+        self._forward_backward()
+
+
+class _WaterChannelStub(torch.nn.Module):
+    """Holds the buffers clamp_water_channels reads, without building a full model."""
+
+    def __init__(self, num_channels, water_channels, means=None, stds=None):
+        super().__init__()
+        self.register_buffer("water_channels", torch.tensor(water_channels, dtype=torch.long))
+        mask = torch.zeros(num_channels, dtype=torch.bool)
+        mask[water_channels] = True
+        self.register_buffer("water_channel_mask", mask.view(1, -1, 1, 1))
+        if means is not None:
+            self.register_buffer("normalization_means", torch.as_tensor(means))
+            self.register_buffer("normalization_stds", torch.as_tensor(stds))
+
+
+def _soft_clamp_reference(x):
+    # 0 below zero, x^2 on [0, 0.5) and x - 0.25 above: continuous with a continuous first derivative
+    return torch.where(x >= 0.5, x - 0.25, torch.where(x > 0.0, x**2, torch.zeros_like(x)))
+
+
+class TestClampWaterChannels(unittest.TestCase):
+    """clamp_water_channels of FCN3 and FCN3.1 on a stub holding the water-channel buffers."""
+
+    _NUM_CHANNELS = 5
+    _WATER = [1, 3]
+
+    def setUp(self):
+        set_seed(333)
+        self.x = 2.0 * torch.randn(2, self._NUM_CHANNELS, 4, 8)
+        self.dry = [c for c in range(self._NUM_CHANNELS) if c not in self._WATER]
+
+    def _clamp(self, nettype, stub, x):
+        if nettype == "FCN3":
+            from makani.models.networks.fourcastnet3 import AtmoSphericNeuralOperatorNet as net
+        else:
+            from makani.models.networks.fourcastnet3_1 import AtmoSphericNeuralOperatorNet31 as net
+        return net.clamp_water_channels(stub, x)
+
+    @parameterized.expand([("FCN3",), ("FCN3.1",)])
+    def test_without_normalization(self, nettype, verbose=False):
+        out = self._clamp(nettype, _WaterChannelStub(self._NUM_CHANNELS, self._WATER), self.x)
+
+        self.assertTrue(torch.equal(out[:, self.dry], self.x[:, self.dry]))
+        expected = _soft_clamp_reference(self.x[:, self._WATER])
+        self.assertTrue(compare_tensors("water", out[:, self._WATER], expected, verbose=verbose))
+        self.assertTrue((out[:, self._WATER] >= 0.0).all())
+
+    @parameterized.expand([("FCN3",), ("FCN3.1",)])
+    def test_with_normalization(self, nettype, verbose=False):
+        means = torch.tensor([0.0, 0.3, 0.0, 1.2, 0.0])
+        stds = torch.tensor([1.0, 0.5, 1.0, 2.0, 1.0])
+        stub = _WaterChannelStub(self._NUM_CHANNELS, self._WATER, means=means, stds=stds)
+        out = self._clamp(nettype, stub, self.x)
+
+        self.assertTrue(torch.equal(out[:, self.dry], self.x[:, self.dry]))
+
+        # the clamp acts on the de-normalized value, so the physical water content is non-negative
+        offset = (means / stds)[self._WATER].view(1, -1, 1, 1)
+        expected = _soft_clamp_reference(self.x[:, self._WATER] + offset) - offset
+        self.assertTrue(compare_tensors("water", out[:, self._WATER], expected, verbose=verbose))
+        physical = means[self._WATER].view(1, -1, 1, 1) + stds[self._WATER].view(1, -1, 1, 1) * out[:, self._WATER]
+        self.assertTrue((physical >= -1e-6).all())
+
+
+class TestPanguShiftWindowMask(unittest.TestCase):
+    """The attention mask of Pangu's shifted windows."""
+
+    def _check_common(self, mask):
+        values = mask.unique()
+        self.assertTrue(set(values.tolist()) <= {0.0, -100.0})
+        self.assertTrue(torch.equal(mask, mask.transpose(-1, -2)))
+        self.assertTrue((torch.diagonal(mask, dim1=-2, dim2=-1) == 0).all())
+
+    def test_2d(self):
+        from makani.models.networks.pangu import get_shift_window_mask
+
+        lat, lon, win_lat, win_lon, shift_lat, shift_lon = 8, 12, 4, 6, 2, 3
+        mask = get_shift_window_mask((lat, lon), (win_lat, win_lon), (shift_lat, shift_lon), ndim=2)
+
+        # (windows in lon, windows in lat, tokens per window, tokens per window)
+        n_tok = win_lat * win_lon
+        self.assertEqual(tuple(mask.shape), (lon // win_lon, lat // win_lat, n_tok, n_tok))
+        self._check_common(mask)
+
+        # a window away from the shifted edges attends everywhere
+        self.assertTrue((mask[0, 0] == 0).all())
+
+        # in the last latitude window, the rows rolled over from the other pole must not attend to
+        # the rows in place, since latitude is not periodic
+        rows = torch.arange(n_tok) // win_lon + (lat - win_lat)
+        rolled = rows >= lat - shift_lat
+        expected = torch.where(rolled.unsqueeze(0) != rolled.unsqueeze(1), -100.0, 0.0)
+        self.assertTrue(torch.equal(mask[0, -1], expected))
+
+    def test_3d(self):
+        from makani.models.networks.pangu import get_shift_window_mask
+
+        shape, window, shift = (4, 8, 12), (2, 4, 6), (1, 2, 3)
+        mask = get_shift_window_mask(shape, window, shift, ndim=3)
+
+        # (windows in lon, windows in pressure x lat, tokens per window, tokens per window)
+        n_tok = window[0] * window[1] * window[2]
+        n_pl_lat = (shape[0] // window[0]) * (shape[1] // window[1])
+        self.assertEqual(tuple(mask.shape), (shape[2] // window[2], n_pl_lat, n_tok, n_tok))
+        self._check_common(mask)
+        self.assertTrue((mask[0, 0] == 0).all())
+        self.assertTrue((mask == -100.0).any())
+
+
 if __name__ == "__main__":
     disable_tf32()
     unittest.main()

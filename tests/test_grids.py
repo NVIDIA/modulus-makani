@@ -23,7 +23,7 @@ import torch
 from parameterized import parameterized
 
 from makani.utils.grid_types import expected_latitudes, matching_grid_types, verify_grid_type
-from makani.utils.grids import grid_to_quadrature_rule, GridConverter, GridQuadrature
+from makani.utils.grids import grid_to_quadrature_rule, GridConverter, GridQuadrature, BandLimitMask
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from .testutils import disable_tf32, set_seed, compare_tensors
@@ -372,6 +372,65 @@ class TestGridTypeVerification(unittest.TestCase):
 
     def test_a_grid_off_the_sphere_is_not_checked(self):
         verify_grid_type("euclidean", np.linspace(0.0, 1.0, 8))
+
+
+# ---------------------------------------------------------------------------
+# BandLimitMask
+# ---------------------------------------------------------------------------
+
+
+class TestBandLimitMask(unittest.TestCase):
+    """BandLimitMask keeps the modes below the band limit and removes the ones above."""
+
+    def setUp(self):
+        disable_tf32()
+        set_seed(333)
+
+    def test_sht_removes_modes_above_lmax(self, verbose=False):
+        import torch_harmonics as th
+
+        nlat, nlon, lmax = 16, 32, 6
+        isht = th.InverseRealSHT(nlat, nlon, grid="legendre-gauss")
+
+        # random real field with modes up to the grid's full band limit
+        coeffs = torch.randn(2, 3, isht.lmax, isht.mmax, dtype=torch.complex64)
+        ls = torch.arange(isht.lmax).reshape(-1, 1)
+        ms = torch.arange(isht.mmax).reshape(1, -1)
+        coeffs = torch.where(ms <= ls, coeffs, torch.zeros_like(coeffs))
+        coeffs[..., 0] = coeffs[..., 0].real.to(coeffs.dtype)
+        low = torch.where(ls < lmax, coeffs, torch.zeros_like(coeffs))
+
+        field = isht(coeffs)
+        expected = isht(low)
+
+        mask = BandLimitMask((nlat, nlon), "legendre-gauss", lmax=lmax, type="sht")
+        self.assertTrue(compare_tensors("band limited", mask(field), expected, atol=1e-5, rtol=1e-5, verbose=verbose))
+        # a field that is already band limited passes unchanged
+        self.assertTrue(compare_tensors("unchanged", mask(expected), expected, atol=1e-5, rtol=1e-5, verbose=verbose))
+
+    def test_fft_cutoff_shrinks_towards_the_poles(self, verbose=False):
+        from torch_harmonics.quadrature import precompute_latitudes
+
+        nlat, nlon, lmax, m = 16, 32, 8, 3
+        lon = torch.arange(nlon, dtype=torch.float32) * 2 * math.pi / nlon
+        wave = torch.cos(m * lon).reshape(1, 1, 1, nlon).expand(1, 1, nlat, nlon)
+        constant = torch.ones(1, 1, nlat, nlon)
+
+        mask = BandLimitMask((nlat, nlon), "equiangular", lmax=lmax, type="fft")
+
+        # the zonal mean is kept on every latitude
+        self.assertTrue(compare_tensors("m=0", mask(constant), constant, atol=1e-5, verbose=verbose))
+
+        # wavenumber m is kept where the latitude circle resolves it at the equator's grid spacing
+        colats, _ = precompute_latitudes(nlat, grid="equiangular")
+        keep = m <= torch.ceil((lmax - 1) * torch.sin(colats.float()))
+        self.assertTrue(keep.any() and not keep.all(), "the test should cover kept and removed latitudes")
+        expected = torch.where(keep.reshape(1, 1, nlat, 1), wave, torch.zeros_like(wave))
+        self.assertTrue(compare_tensors(f"m={m}", mask(wave), expected, atol=1e-5, verbose=verbose))
+
+    def test_unknown_type_raises(self):
+        with self.assertRaises(ValueError):
+            BandLimitMask((16, 32), "equiangular", lmax=8, type="wavelet")
 
 
 if __name__ == "__main__":

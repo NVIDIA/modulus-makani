@@ -225,19 +225,29 @@ class TestDistributedRealFFT(unittest.TestCase):
             [65, 128, 0, 1, 10, 1e-6],
             [64, 128, 4, 32, 8, 1e-5],
             [65, 128, 4, 1, 10, 1e-6],
+            # truncated spectra: modes are (lmax, mmax) in 2D and (ldmax, lhmax, lwmax) in 3D. The
+            # odd counts split the latitudinal modes unevenly into positive and negative frequencies
+            [64, 128, 0, 32, 8, 1e-5, (32, 33)],
+            [65, 128, 0, 1, 10, 1e-6, (33, 40)],
+            [64, 128, 4, 32, 8, 1e-5, (2, 32, 33)],
+            [65, 128, 4, 1, 10, 1e-6, (3, 33, 40)],
         ],
         skip_on_empty=True,
     )
-    def test_distributed_fft2_3(self, nlat, nlon, nalt, batch_size, num_chan, tol, verbose=False):
+    def test_distributed_fft2_3(self, nlat, nlon, nalt, batch_size, num_chan, tol, modes=None, verbose=False):
         B, C, D, H, W = batch_size, num_chan, nalt, nlat, nlon
 
         # set up handles
         if D > 0:
-            forward_transform_local = RealFFT3(nd=D, nh=H, nw=W).to(self.device)
-            forward_transform_dist = DistributedRealFFT3(nd=D, nh=H, nw=W).to(self.device)
+            ldmax, lhmax, lwmax = modes if modes is not None else (None, None, None)
+            forward_transform_local = RealFFT3(nd=D, nh=H, nw=W, ldmax=ldmax, lhmax=lhmax, lwmax=lwmax).to(self.device)
+            forward_transform_dist = DistributedRealFFT3(nd=D, nh=H, nw=W, ldmax=ldmax, lhmax=lhmax, lwmax=lwmax).to(
+                self.device
+            )
         else:
-            forward_transform_local = RealFFT2(nlat=H, nlon=W).to(self.device)
-            forward_transform_dist = DistributedRealFFT2(nlat=H, nlon=W).to(self.device)
+            lmax, mmax = modes if modes is not None else (None, None)
+            forward_transform_local = RealFFT2(nlat=H, nlon=W, lmax=lmax, mmax=mmax).to(self.device)
+            forward_transform_dist = DistributedRealFFT2(nlat=H, nlon=W, lmax=lmax, mmax=mmax).to(self.device)
 
         # create tensors
         if D > 0:
@@ -311,20 +321,32 @@ class TestDistributedRealFFT(unittest.TestCase):
             [65, 128, 0, 1, 10, 5e-6],
             [64, 128, 4, 32, 8, 2e-5],
             [65, 128, 4, 1, 10, 5e-6],
+            # truncated spectra, which the inverse zero-pads between the positive and negative
+            # frequencies; modes as in test_distributed_fft2_3
+            [64, 128, 0, 32, 8, 2e-5, (32, 33)],
+            [65, 128, 0, 1, 10, 5e-6, (33, 40)],
+            [64, 128, 4, 32, 8, 2e-5, (2, 32, 33)],
+            [65, 128, 4, 1, 10, 5e-6, (3, 33, 40)],
         ],
         skip_on_empty=True,
     )
-    def test_distributed_ifft2_3(self, nlat, nlon, nalt, batch_size, num_chan, tol, verbose=False):
+    def test_distributed_ifft2_3(self, nlat, nlon, nalt, batch_size, num_chan, tol, modes=None, verbose=False):
         B, C, D, H, W = batch_size, num_chan, nalt, nlat, nlon
 
         if D > 0:
-            forward_transform_local = RealFFT3(nd=D, nh=H, nw=W).to(self.device)
-            backward_transform_local = InverseRealFFT3(nd=D, nh=H, nw=W).to(self.device)
-            backward_transform_dist = DistributedInverseRealFFT3(nd=D, nh=H, nw=W).to(self.device)
+            ldmax, lhmax, lwmax = modes if modes is not None else (None, None, None)
+            forward_transform_local = RealFFT3(nd=D, nh=H, nw=W, ldmax=ldmax, lhmax=lhmax, lwmax=lwmax).to(self.device)
+            backward_transform_local = InverseRealFFT3(nd=D, nh=H, nw=W, ldmax=ldmax, lhmax=lhmax, lwmax=lwmax).to(
+                self.device
+            )
+            backward_transform_dist = DistributedInverseRealFFT3(
+                nd=D, nh=H, nw=W, ldmax=ldmax, lhmax=lhmax, lwmax=lwmax
+            ).to(self.device)
         else:
-            forward_transform_local = RealFFT2(nlat=H, nlon=W).to(self.device)
-            backward_transform_local = InverseRealFFT2(nlat=H, nlon=W).to(self.device)
-            backward_transform_dist = DistributedInverseRealFFT2(nlat=H, nlon=W).to(self.device)
+            lmax, mmax = modes if modes is not None else (None, None)
+            forward_transform_local = RealFFT2(nlat=H, nlon=W, lmax=lmax, mmax=mmax).to(self.device)
+            backward_transform_local = InverseRealFFT2(nlat=H, nlon=W, lmax=lmax, mmax=mmax).to(self.device)
+            backward_transform_dist = DistributedInverseRealFFT2(nlat=H, nlon=W, lmax=lmax, mmax=mmax).to(self.device)
 
         # create tensors
         if D > 0:

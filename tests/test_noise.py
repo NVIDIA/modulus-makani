@@ -15,7 +15,8 @@
 
 import math
 import unittest
-from parameterized import parameterized_class
+from unittest import mock
+from parameterized import parameterized, parameterized_class
 
 import numpy as np
 import torch
@@ -25,6 +26,8 @@ from makani.models.noise import (
     IsotropicGaussianRandomFieldS2,
     DiffusionNoiseS2,
     DummyNoiseS2,
+    build_noise,
+    noise_seed_reflect,
 )
 
 import sys
@@ -961,6 +964,112 @@ class TestDiffusionNoiseS2(unittest.TestCase):
             torch.equal(state_before, noise.state),
             "State should have changed after forward(update_internal_state=True)",
         )
+
+
+# ===========================================================================
+class TestBuildNoise(unittest.TestCase):
+    """build_noise dispatches on the type and forwards the configuration."""
+
+    def _build(self, noise_params, **kwargs):
+        args = dict(
+            img_shape=IMG_SHAPE,
+            batch_size=BATCH_SIZE,
+            num_channels=NUM_CHANNELS,
+            num_time_steps=NUM_TIME_STEPS,
+            grid_type="equiangular",
+            seed=444,
+            reflect=True,
+        )
+        args.update(kwargs)
+        return build_noise(noise_params, **args)
+
+    @parameterized.expand(
+        [
+            ("diffusion", DiffusionNoiseS2),
+            ("white", IsotropicGaussianRandomFieldS2),
+            ("dummy", DummyNoiseS2),
+        ]
+    )
+    def test_dispatch(self, ntype, cls):
+        noise = self._build({"type": ntype})
+        self.assertIsInstance(noise, cls)
+        out = noise()
+        self.assertEqual(out.shape[-2:], IMG_SHAPE)
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_white_forwards_parameters(self):
+        noise = self._build({"type": "white", "sigma": 2.5, "alpha": 1.5, "lmax": 8, "learnable": True})
+        self.assertEqual(noise.sigma, 2.5)
+        self.assertEqual(noise.alpha, 1.5)
+        self.assertEqual(noise.lmax, 8)
+        self.assertTrue(noise.learnable)
+        self.assertTrue(noise.reflect)
+
+    def test_diffusion_forwards_parameters(self):
+        noise = self._build({"type": "diffusion", "sigma": 0.5, "kT": 0.01, "lmax": 8})
+        self.assertEqual(noise.sigma, 0.5)
+        self.assertEqual(noise.kT, 0.01)
+        self.assertEqual(noise.lmax, 8)
+        self.assertFalse(noise.learnable)
+
+    def test_diffusion_lambd_defaults_to_argument(self):
+        self.assertEqual(self._build({"type": "diffusion"}, default_lambd=0.25).lambd, 0.25)
+        self.assertEqual(self._build({"type": "diffusion", "lambd": 0.75}, default_lambd=0.25).lambd, 0.75)
+
+    def test_missing_type_raises(self):
+        with self.assertRaises(ValueError):
+            self._build({"sigma": 1.0})
+
+    def test_unknown_type_raises(self):
+        with self.assertRaises(NotImplementedError):
+            self._build({"type": "brownian"})
+
+
+# ===========================================================================
+class TestNoiseSeedReflect(unittest.TestCase):
+    """noise_seed_reflect over simulated process grids: comm is mocked with the ranks of each grid point."""
+
+    def _seeds(self, centered, model_size, ensemble_size, batch_size, seed_offset=0):
+        result = {}
+        for b in range(batch_size):
+            for e in range(ensemble_size):
+                for m in range(model_size):
+                    ranks = {"model": m, "ensemble": e, "batch": b, "data": b * ensemble_size + e}
+                    sizes = {"model": model_size, "ensemble": ensemble_size, "batch": batch_size}
+                    sizes["data"] = ensemble_size * batch_size
+                    with (
+                        mock.patch("makani.models.noise.comm.get_rank", side_effect=ranks.get),
+                        mock.patch("makani.models.noise.comm.get_size", side_effect=sizes.get),
+                    ):
+                        result[(m, e, b)] = noise_seed_reflect(centered, seed_offset=seed_offset)
+        return result
+
+    def test_serial(self):
+        self.assertEqual(noise_seed_reflect(False), (333, False))
+        self.assertEqual(noise_seed_reflect(False, seed_offset=7), (340, False))
+
+    def test_uncentered_members_are_independent(self):
+        seeds = self._seeds(False, model_size=2, ensemble_size=4, batch_size=2)
+        values = [seed for seed, _ in seeds.values()]
+        self.assertEqual(len(set(values)), len(values), "every rank needs its own seed")
+        self.assertFalse(any(reflect for _, reflect in seeds.values()))
+
+    def test_centered_members_are_antithetic_pairs(self):
+        seeds = self._seeds(True, model_size=2, ensemble_size=4, batch_size=2)
+        for (m, e, b), (seed, reflect) in seeds.items():
+            # ensemble members 2k and 2k+1 share a seed and differ by the sign flip
+            partner_seed, partner_reflect = seeds[(m, e ^ 1, b)]
+            self.assertEqual(seed, partner_seed)
+            self.assertNotEqual(reflect, partner_reflect)
+        # apart from the pairing, the seeds are distinct
+        pairs = {(m, e // 2, b): seed for (m, e, b), (seed, _) in seeds.items()}
+        self.assertEqual(len(set(pairs.values())), len(pairs))
+
+    def test_seed_offset_shifts_every_seed(self):
+        base = self._seeds(True, model_size=2, ensemble_size=2, batch_size=2)
+        shifted = self._seeds(True, model_size=2, ensemble_size=2, batch_size=2, seed_offset=1000)
+        for key, (seed, reflect) in base.items():
+            self.assertEqual(shifted[key], (seed + 1000, reflect))
 
 
 if __name__ == "__main__":

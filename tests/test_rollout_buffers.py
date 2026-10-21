@@ -23,7 +23,15 @@ import torch
 import h5py as h5
 from typing import Optional
 
-from makani.utils.inference.rollout_buffer import MeanStdBuffer, RolloutBuffer, TemporalAverageBuffer
+import torch_harmonics as th
+
+from makani.utils.inference.rollout_buffer import (
+    MeanStdBuffer,
+    RolloutBuffer,
+    TemporalAverageBuffer,
+    SpectrumAverageBuffer,
+    ZonalSpectrumAverageBuffer,
+)
 from makani.utils.dataloaders.data_helpers import get_lat_lon_grid
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -608,6 +616,377 @@ class TestTemporalAverageBufferUnit(unittest.TestCase):
 
         # finalize is in-place math + (no-op write) — should not raise
         buf.finalize()
+
+
+def _spectrum_buffer_inputs(fields, channel_names, output_channels, scale, bias, generator):
+    """
+    Build the (data, targ) pair a spectrum buffer is updated with from the fields it should see.
+
+    ``fields`` has shape (batch, 1 + ensemble, len(output_channels), nlat, nlon) and holds the target
+    followed by the ensemble members, in the units after the buffer applies ``scale * x + bias``. The
+    inputs are those fields mapped back through the inverse transform; the channels that are not
+    recorded carry noise, so that recording the wrong channel shows.
+    """
+    B, E1, _, H, W = fields.shape
+    full = torch.randn(B, E1, len(channel_names), H, W, generator=generator, dtype=fields.dtype)
+    for k, cname in enumerate(output_channels):
+        c = channel_names.index(cname)
+        full[:, :, c] = (fields[:, :, k] - bias[c]) / scale[c]
+    return full[:, 1:], full[:, :1]
+
+
+def _welford_reference(samples):
+    """Mean and sum of squared deviations over the sample dimension, the state the Welford buffers hold."""
+    samples = torch.cat(samples, dim=0)
+    mean = samples.mean(dim=0)
+    m2 = (samples - mean).square().sum(dim=0)
+    return mean, m2, samples.shape[0]
+
+
+class TestSpectrumAverageBufferUnit(unittest.TestCase):
+    """
+    SpectrumAverageBuffer accumulates the angular power spectrum of the target and of every ensemble
+    member per rollout step. The fields are synthesized from known spherical harmonic coefficients on a
+    Legendre-Gauss grid, where the SHT of a band-limited field is exact, so the expected spectrum
+
+        P_l = |c_l0|^2 + 2 sum_{m>0} |c_lm|^2
+
+    follows from the coefficients without a forward transform. With orthonormal harmonics this is the
+    spectrum whose sum over l is the squared L2 norm of the field on the sphere (Parseval).
+    """
+
+    nlat, nlon = 16, 32
+    grid = "legendre-gauss"
+
+    def setUp(self):
+        self.isht = th.InverseRealSHT(self.nlat, self.nlon, grid=self.grid)
+        self.lmax, self.mmax = self.isht.lmax, self.isht.mmax
+        self.generator = torch.Generator().manual_seed(4321)
+
+    def _make_buffer(
+        self, num_rollout_steps, ensemble_size, channel_names, output_channels, scale=None, bias=None, output_file=None
+    ):
+        return SpectrumAverageBuffer(
+            num_rollout_steps=num_rollout_steps,
+            rollout_dt=6,
+            img_shape=(self.nlat, self.nlon),
+            ensemble_size=ensemble_size,
+            grid_type=self.grid,
+            channel_names=channel_names,
+            device="cpu",
+            scale=scale,
+            bias=bias,
+            output_channels=output_channels,
+            output_file=output_file,
+        )
+
+    def _random_coeffs(self, *shape):
+        coeffs = torch.complex(
+            torch.randn(*shape, self.lmax, self.mmax, generator=self.generator),
+            torch.randn(*shape, self.lmax, self.mmax, generator=self.generator),
+        )
+        # a real field has no m > l modes and a real m = 0 mode
+        l = torch.arange(self.lmax).reshape(-1, 1)
+        m = torch.arange(self.mmax).reshape(1, -1)
+        coeffs = torch.where(m <= l, coeffs, torch.zeros_like(coeffs))
+        coeffs[..., 0] = torch.complex(coeffs[..., 0].real, torch.zeros_like(coeffs[..., 0].real))
+        return coeffs
+
+    @staticmethod
+    def _power_spectrum(coeffs):
+        # the orders m > 0 stand for m and -m of the real field
+        power = coeffs.abs().square()
+        power[..., 1:] *= 2.0
+        # (batch, 1 + ensemble, channel, l) -> (batch, channel, 1 + ensemble, l), the buffer layout
+        return power.sum(dim=-1).permute(0, 2, 1, 3)
+
+    def _update_sequence(self, buf, batch_sizes, ensemble_size, channel_names, output_channels, scale, bias):
+        """Update the buffer with random band-limited fields and return the expected spectra per rollout step."""
+        expected = {}
+        for idt, B in batch_sizes:
+            coeffs = self._random_coeffs(B, 1 + ensemble_size, len(output_channels))
+            fields = self.isht(coeffs)
+            data, targ = _spectrum_buffer_inputs(fields, channel_names, output_channels, scale, bias, self.generator)
+            buf.update(data, targ, idt)
+            expected.setdefault(idt, []).append(self._power_spectrum(coeffs))
+        return {idt: _welford_reference(spectra) for idt, spectra in expected.items()}
+
+    def test_single_harmonic(self, verbose=False):
+        # one degree with m > 0 and one with m = 0, in the target and the single ensemble member
+        coeffs = torch.zeros(1, 2, 1, self.lmax, self.mmax, dtype=torch.complex64)
+        coeffs[..., 5, 3] = 1.0
+        coeffs[..., 2, 0] = 0.5
+        fields = self.isht(coeffs)
+
+        buf = self._make_buffer(1, 1, ["a"], ["a"])
+        buf.update(fields[:, 1:], fields[:, :1], 0)
+
+        expected = torch.zeros(1, 2, self.lmax)
+        expected[..., 5] = 2.0
+        expected[..., 2] = 0.25
+        with self.subTest(desc="spectrum"):
+            self.assertTrue(
+                compare_tensors("spectrum", buf.running_mean[0], expected, atol=1e-5, rtol=1e-5, verbose=verbose)
+            )
+
+        # Parseval with the Legendre-Gauss quadrature, independent of the SHT: the latitude weights are
+        # symmetric, so the order of the latitudes does not matter
+        _, weights = np.polynomial.legendre.leggauss(self.nlat)
+        weights = torch.from_numpy(weights).to(torch.float64) * 2.0 * np.pi / self.nlon
+        norm2 = torch.einsum("...hw,h->...", fields.to(torch.float64).square(), weights)
+        with self.subTest(desc="Parseval"):
+            self.assertTrue(
+                compare_tensors(
+                    "Parseval",
+                    buf.running_mean[0].sum(dim=-1).to(torch.float64),
+                    norm2.reshape(1, 2),
+                    atol=1e-5,
+                    rtol=1e-5,
+                    verbose=verbose,
+                )
+            )
+
+    def test_statistics_with_scale_bias_and_channel_subset(self, verbose=False):
+        # a reordered channel subset, so that a wrong channel mask or an ignored bias changes the spectra
+        channel_names = ["a", "b", "c"]
+        output_channels = ["c", "a"]
+        scale = torch.tensor([2.0, 0.5, 4.0])
+        bias = torch.tensor([1.0, -3.0, 0.25])
+        ensemble_size = 2
+        buf = self._make_buffer(
+            2,
+            ensemble_size,
+            channel_names,
+            output_channels,
+            scale=scale.reshape(1, -1, 1, 1),
+            bias=bias.reshape(1, -1, 1, 1),
+        )
+
+        # two batches of different size for the first rollout step, one for the second
+        expected = self._update_sequence(
+            buf, [(0, 3), (0, 2), (1, 4)], ensemble_size, channel_names, output_channels, scale, bias
+        )
+
+        for idt, (mean, m2, count) in expected.items():
+            with self.subTest(desc=f"mean step {idt}"):
+                self.assertTrue(
+                    compare_tensors(
+                        f"mean step {idt}", buf.running_mean[idt], mean, atol=1e-4, rtol=1e-4, verbose=verbose
+                    )
+                )
+            with self.subTest(desc=f"m2 step {idt}"):
+                self.assertTrue(
+                    compare_tensors(f"m2 step {idt}", buf.running_var[idt], m2, atol=1e-3, rtol=1e-4, verbose=verbose)
+                )
+            with self.subTest(desc=f"count step {idt}"):
+                self.assertEqual(buf.num_samples_tracked[idt].item(), count)
+
+    def test_finalize_writes_mean_and_std(self, verbose=False):
+        channel_names = ["a", "b"]
+        output_channels = ["b", "a"]
+        scale = torch.ones(2)
+        bias = torch.zeros(2)
+        ensemble_size = 2
+        num_rollout_steps = 2
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = os.path.join(tmpdir, "spectrum.h5")
+            buf = self._make_buffer(
+                num_rollout_steps, ensemble_size, channel_names, output_channels, output_file=output_file
+            )
+            expected = self._update_sequence(
+                buf, [(0, 3), (1, 2), (1, 2)], ensemble_size, channel_names, output_channels, scale, bias
+            )
+            buf.finalize()
+
+            with h5.File(output_file, "r") as f:
+                mean = torch.from_numpy(f["mean"][...])
+                std = torch.from_numpy(f["std"][...])
+                lead_time = f["lead_time"][...]
+                channels = [c.decode() if isinstance(c, bytes) else str(c) for c in f["channel"][...]]
+
+        with self.subTest(desc="shape"):
+            self.assertEqual(tuple(mean.shape), (num_rollout_steps, 2, ensemble_size + 1, self.lmax))
+        for idt, (ref_mean, ref_m2, count) in expected.items():
+            ref_std = torch.sqrt(ref_m2 / (count - 1))
+            with self.subTest(desc=f"mean step {idt}"):
+                self.assertTrue(
+                    compare_tensors(
+                        f"mean step {idt}", mean[idt], ref_mean.double(), atol=1e-4, rtol=1e-4, verbose=verbose
+                    )
+                )
+            with self.subTest(desc=f"std step {idt}"):
+                self.assertTrue(
+                    compare_tensors(
+                        f"std step {idt}", std[idt], ref_std.double(), atol=1e-4, rtol=1e-4, verbose=verbose
+                    )
+                )
+        with self.subTest(desc="lead time"):
+            self.assertTrue(np.array_equal(lead_time, np.array([6.0, 12.0])))
+        with self.subTest(desc="channels"):
+            self.assertEqual(channels, output_channels)
+
+    def test_finalize_without_output_file(self, verbose=False):
+        buf = self._make_buffer(1, 1, ["a"], ["a"])
+        expected = self._update_sequence(buf, [(0, 2)], 1, ["a"], ["a"], torch.ones(1), torch.zeros(1))
+        buf.finalize()
+
+        # nothing to write, and the accumulated statistics stay as they are
+        mean, _, _ = expected[0]
+        self.assertTrue(compare_tensors("mean", buf.running_mean[0], mean, atol=1e-4, rtol=1e-4, verbose=verbose))
+
+
+class TestZonalSpectrumAverageBufferUnit(unittest.TestCase):
+    """
+    ZonalSpectrumAverageBuffer accumulates, per latitude, the one-sided power spectrum of the field
+    along the longitudes, weighted by the cosine of the latitude. With the Fourier coefficients
+    a_m = 1/N sum_k f_k exp(-2 pi i m k / N), the one-sided spectrum counts every order twice except
+    the mean and, for an even number of longitudes N, the Nyquist order m = N / 2, which is its own
+    conjugate. That makes the spectrum sum to the mean of f^2 over the longitudes (Parseval).
+    """
+
+    def setUp(self):
+        self.generator = torch.Generator().manual_seed(1234)
+
+    @staticmethod
+    def _lat_lon(nlat, nlon):
+        lats = np.linspace(75.0, -75.0, nlat).tolist()
+        lons = np.linspace(0.0, 360.0, nlon, endpoint=False).tolist()
+        return lats, lons
+
+    def _make_buffer(
+        self, nlat, nlon, num_rollout_steps, ensemble_size, channel_names, output_channels, scale=None, bias=None
+    ):
+        return ZonalSpectrumAverageBuffer(
+            num_rollout_steps=num_rollout_steps,
+            rollout_dt=6,
+            img_shape=(nlat, nlon),
+            ensemble_size=ensemble_size,
+            channel_names=channel_names,
+            lat_lon=self._lat_lon(nlat, nlon),
+            device="cpu",
+            scale=scale,
+            bias=bias,
+            output_channels=output_channels,
+            output_file=None,
+        )
+
+    @staticmethod
+    def _zonal_power(fields, lats):
+        nlon = fields.shape[-1]
+        coeffs = torch.fft.rfft(fields.to(torch.float64), dim=-1) / nlon
+        power = coeffs.abs().square()
+        power[..., 1:] *= 2.0
+        if nlon % 2 == 0:
+            power[..., nlon // 2] /= 2.0
+        weights = torch.cos(torch.deg2rad(torch.tensor(lats, dtype=torch.float64))).reshape(-1, 1)
+        # (batch, 1 + ensemble, channel, lat, m) -> (batch, channel, 1 + ensemble, lat, m), the buffer layout
+        return (weights * power).permute(0, 2, 1, 3, 4)
+
+    def _cos_lat(self, nlat):
+        lats, _ = self._lat_lon(nlat, 1)
+        return torch.cos(torch.deg2rad(torch.tensor(lats, dtype=torch.float64)))
+
+    def test_single_wave(self, verbose=False):
+        nlat, nlon = 4, 32
+        phi = 2.0 * np.pi * torch.arange(nlon, dtype=torch.float32) / nlon
+        # mean 0.5 and a wave of order 3 with amplitude 1: a_0 = 0.5 and a_3 = a_-3 = 0.5
+        field = (0.5 + torch.cos(3.0 * phi)).expand(1, 2, 1, nlat, nlon)
+
+        buf = self._make_buffer(nlat, nlon, 1, 1, ["a"], ["a"])
+        buf.update(field[:, 1:], field[:, :1], 0)
+
+        expected = torch.zeros(1, 2, nlat, nlon // 2 + 1, dtype=torch.float64)
+        expected[..., 0] = 0.25 * self._cos_lat(nlat).reshape(-1)
+        expected[..., 3] = 0.5 * self._cos_lat(nlat).reshape(-1)
+        self.assertTrue(
+            compare_tensors("spectrum", buf.running_mean[0].double(), expected, atol=1e-6, rtol=1e-5, verbose=verbose)
+        )
+
+    def test_nyquist_order_counted_once(self, verbose=False):
+        # (-1)^k is the Nyquist wave of an even number of longitudes: a_{N/2} = 1, and its power is
+        # the mean of f^2 = 1, not 2
+        nlat, nlon = 4, 32
+        field = torch.ones(nlon)
+        field[1::2] = -1.0
+        field = field.expand(1, 2, 1, nlat, nlon)
+
+        buf = self._make_buffer(nlat, nlon, 1, 1, ["a"], ["a"])
+        buf.update(field[:, 1:], field[:, :1], 0)
+
+        expected = self._cos_lat(nlat).reshape(1, 1, -1).expand(1, 2, nlat)
+        self.assertTrue(
+            compare_tensors(
+                "Nyquist power", buf.running_mean[0, ..., nlon // 2].double(), expected, atol=1e-6, verbose=verbose
+            )
+        )
+
+    def test_parseval(self, verbose=False):
+        # the spectrum of a random field sums to the cosine-weighted mean of f^2 over the longitudes,
+        # for an even and an odd number of longitudes
+        for nlon in [32, 31]:
+            nlat = 6
+            fields = torch.randn(1, 2, 1, nlat, nlon, generator=self.generator)
+            buf = self._make_buffer(nlat, nlon, 1, 1, ["a"], ["a"])
+            buf.update(fields[:, 1:], fields[:, :1], 0)
+
+            expected = self._cos_lat(nlat) * fields.to(torch.float64).square().mean(dim=-1)
+            expected = expected.permute(0, 2, 1, 3)[0]
+            with self.subTest(desc=f"nlon={nlon}"):
+                self.assertTrue(
+                    compare_tensors(
+                        f"Parseval nlon={nlon}",
+                        buf.running_mean[0].sum(dim=-1).double(),
+                        expected,
+                        atol=1e-6,
+                        rtol=1e-5,
+                        verbose=verbose,
+                    )
+                )
+
+    def test_statistics_with_scale_bias_and_channel_subset(self, verbose=False):
+        # an odd number of longitudes has no Nyquist order, so this test is independent of how it is counted
+        nlat, nlon = 6, 31
+        lats, _ = self._lat_lon(nlat, nlon)
+        channel_names = ["a", "b", "c"]
+        output_channels = ["b", "c"]
+        scale = torch.tensor([2.0, 0.5, 4.0])
+        bias = torch.tensor([1.0, -3.0, 0.25])
+        ensemble_size = 2
+        buf = self._make_buffer(
+            nlat,
+            nlon,
+            2,
+            ensemble_size,
+            channel_names,
+            output_channels,
+            scale=scale.reshape(1, -1, 1, 1),
+            bias=bias.reshape(1, -1, 1, 1),
+        )
+
+        expected = {}
+        for idt, B in [(0, 3), (0, 2), (1, 4)]:
+            fields = torch.randn(B, 1 + ensemble_size, len(output_channels), nlat, nlon, generator=self.generator)
+            data, targ = _spectrum_buffer_inputs(fields, channel_names, output_channels, scale, bias, self.generator)
+            buf.update(data, targ, idt)
+            expected.setdefault(idt, []).append(self._zonal_power(fields, lats))
+
+        for idt, spectra in expected.items():
+            mean, m2, count = _welford_reference(spectra)
+            with self.subTest(desc=f"mean step {idt}"):
+                self.assertTrue(
+                    compare_tensors(
+                        f"mean step {idt}", buf.running_mean[idt].double(), mean, atol=1e-5, rtol=1e-4, verbose=verbose
+                    )
+                )
+            with self.subTest(desc=f"m2 step {idt}"):
+                self.assertTrue(
+                    compare_tensors(
+                        f"m2 step {idt}", buf.running_var[idt].double(), m2, atol=1e-5, rtol=1e-4, verbose=verbose
+                    )
+                )
+            with self.subTest(desc=f"count step {idt}"):
+                self.assertEqual(buf.num_samples_tracked[idt].item(), count)
 
 
 class TestRolloutBuffer(unittest.TestCase):
