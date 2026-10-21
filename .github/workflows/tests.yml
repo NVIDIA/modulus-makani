@@ -1,0 +1,20 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The serial suite, on every push and pull request.
+  serial:
+    uses: ./.github/workflows/test_serial.yml
+
+  # The distributed suite: on pull requests, and once per push to main. Not on plain branch
+  # pushes -- up to 16 ranks per grid is heavy.
+  distributed:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/test_distributed.yml
