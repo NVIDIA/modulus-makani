@@ -664,31 +664,7 @@ class TestNonNegativeConstraint(unittest.TestCase):
         else:
             self.assertTrue((g < 0).any().item(), "silu soft clamp has a non-monotonic negative-gradient dip")
 
-    # --- the FCN3 soft clamp ---
-    @parameterized.expand([("train", False), ("train", True), ("eval", False), ("eval", True)])
-    def test_quadratic_matches_fcn3(self, phase, normalized):
-        """With its default eps the "quadratic" mode is the soft clamp of FCN3's clamp_water_channels,
-        in training and in eval mode alike."""
-        from makani.models.networks.fourcastnet3 import _soft_clamp
-
-        B, C, H, W = 2, len(self.ALL_CHANNELS), 4, 8
-        means = torch.tensor([0.0, 0.3, 270.0, 1.2, 250.0]) if normalized else None
-        stds = torch.tensor([1.0, 0.5, 10.0, 2.0, 8.0]) if normalized else None
-        c = self._make(means=means, stds=stds, mode="quadratic")  # the default eps of this mode is FCN3's 0.5
-        c.train(phase == "train")
-        x = 2.0 * torch.randn(B, C, H, W, device=self.device)
-        y = c(x)
-
-        w = x[:, self.CLAMP_IDX, :, :]
-        if normalized:
-            offset = (means / stds)[self.CLAMP_IDX].view(1, -1, 1, 1).to(self.device)
-            expected = _soft_clamp(w, offset=offset) - offset
-        else:
-            expected = _soft_clamp(w)
-        self.assertTrue(compare_tensors("clamped channels", y[:, self.CLAMP_IDX, :, :], expected))
-        unconstrained = [i for i in range(C) if i not in self.CLAMP_IDX]
-        self.assertTrue(compare_tensors("unconstrained channels", y[:, unconstrained, :, :], x[:, unconstrained, :, :]))
-
+    # --- the FCN3 soft clamp, see TestClampWaterChannels in test_models.py for the comparison with FCN3 ---
     @parameterized.expand([("silu", 0.1), ("softplus", 0.1), ("quadratic", 0.5)])
     def test_default_eps(self, mode, eps):
         """eps defaults per mode, and an explicit value overrides it."""
