@@ -299,9 +299,12 @@ class TestInferencerScoring(_InferencerTestCase):
         end = dataset.get_index_at_time(get_date_from_string(_SCORE_END))
         indices = range(start, end, _SCORE_STEP_HOURS // dataset.dhours)
 
+        # a sample covers the window idx, ..., idx + n_history * dt, and its latest step is the initial condition
+        history_offset = dataset.n_history * dataset.dt
+
         year_start = dt.datetime(year=2019, month=1, day=1, tzinfo=dt.timezone.utc)
         sample_hours = dt.timedelta(hours=dataset.dhours)
-        return [int((dataset.get_time_at_index(idx) - year_start) / sample_hours) for idx in indices]
+        return [int((dataset.get_time_at_index(idx) - year_start) / sample_hours) + history_offset for idx in indices]
 
     def _raw_data(self):
         with h5.File(os.path.join(self.valid_path, "2019.h5"), "r") as hf:
