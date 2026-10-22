@@ -143,15 +143,38 @@ def compute_inference_range(
     return start_index, end_index, step, resolved_start_date, resolved_end_date
 
 
-def translate_date_sampler_to_timedelta_sampler(sampler, date_dataset, timedelta_dataset):
+def translate_date_sampler_to_timedelta_sampler(sampler, date_dataset, timedelta_dataset, index_offset=0):
+    # index_offset shifts each sample index to the step whose time is looked up, e.g. n_history * dt for the
+    # latest step of a window, which is the step the predictions are verified against
     indexlist = []
+
+    # like every other sample, the last one of the relative dataset stands for the times up to the next step, e.g.
+    # the 18:00 sample of a 6 hourly climatology for 18:00 to 23:59 of the last day. get_index_at_time refuses
+    # times past the last sample, which hourly data reaches on Dec 31 of a leap year
+    end_of_last_step = timedelta_dataset.end_date + dt.timedelta(hours=timedelta_dataset.dhours)
+
+    def lookup(tdelta):
+        if timedelta_dataset.end_date < tdelta < end_of_last_step:
+            tdelta = timedelta_dataset.end_date
+        return timedelta_dataset.get_index_at_time(tdelta)
+
     iterator = iter(sampler)
     for indices in iterator:
-        tstamps = [date_dataset.get_time_at_index(idx) for idx in indices]
+        tstamps = [date_dataset.get_time_at_index(idx + index_offset) for idx in indices]
         timedeltas = [
             t - dt.datetime(year=t.year, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dt.timezone.utc)
             for t in tstamps
         ]
-        indexlist.append([timedelta_dataset.get_index_at_time(t) for t in timedeltas])
+        tindices = [lookup(t) for t in timedeltas]
+
+        # a time outside the relative dataset would reach its loader as index None, fail here instead
+        for idx, t, tdelta, tidx in zip(indices, tstamps, timedeltas, tindices):
+            if tidx is None:
+                raise ValueError(
+                    f"Error, sample {idx} at {t} maps to {tdelta} into the year, which is outside the range "
+                    f"{timedelta_dataset.start_date} to {timedelta_dataset.end_date} of the relative dataset"
+                )
+
+        indexlist.append(tindices)
 
     return SimpleIndexSampler(indexlist)
