@@ -215,6 +215,10 @@ class TestTranslateDateSamplerToTimedeltaSampler(unittest.TestCase):
                 return self._dates[idx]
 
         class FakeTimedeltaDataset:
+            # covers every time of a year, so that only the recorded lookups matter
+            end_date = dt.timedelta(days=366)
+            dhours = 1
+
             def __init__(self):
                 self._lookup = {}
                 self._next = 0
@@ -300,6 +304,57 @@ class TestTranslateDateSamplerToTimedeltaSampler(unittest.TestCase):
                 [td_ds._lookup[td2]],
             ],
         )
+
+    def test_index_offset(self):
+        # with history, the time looked up is that of the latest step of the window, index_offset steps on
+        dates = [dt.datetime(2017, 1, 1, 6 * h, 0, 0, tzinfo=dt.timezone.utc) for h in range(4)]
+        date_ds, td_ds = self._make_fake_datasets(dates)
+        src = SimpleIndexSampler([[0, 1]])
+
+        out = list(translate_date_sampler_to_timedelta_sampler(src, date_ds, td_ds, index_offset=2))
+
+        self.assertEqual(out, [[td_ds._lookup[dt.timedelta(hours=12)], td_ds._lookup[dt.timedelta(hours=18)]]])
+
+    def test_last_step_of_leap_year(self):
+        # a 6 hourly climatology of 366 days ends at day 365, 18:00. With hourly data, Dec 31 of a leap year
+        # runs to 23:00, past that sample, and has to map to it like any other time within its step
+        class Climatology6h:
+            dhours = 6
+            start_date = dt.timedelta(0)
+            end_date = dt.timedelta(days=365, hours=18)
+
+            def get_index_at_time(self, td):
+                if td < self.start_date or td > self.end_date:
+                    return None
+                return int(td.total_seconds() // (6 * 3600))
+
+        dates = [dt.datetime(2020, 12, 31, h, 0, 0, tzinfo=dt.timezone.utc) for h in [12, 17, 18, 19, 23]]
+        date_ds, _ = self._make_fake_datasets(dates)
+        src = SimpleIndexSampler([[0, 1, 2, 3, 4]])
+
+        out = list(translate_date_sampler_to_timedelta_sampler(src, date_ds, Climatology6h()))
+
+        self.assertEqual(out, [[1462, 1462, 1463, 1463, 1463]])
+
+    def test_time_outside_relative_dataset_raises(self):
+        # a relative dataset returns None for a time it does not cover, which must not reach its loader
+        class ShortTimedeltaDataset:
+            start_date = dt.timedelta(0)
+            end_date = dt.timedelta(days=1)
+            dhours = 1
+
+            def get_index_at_time(self, td):
+                return None if td > self.end_date else int(td.total_seconds() // 3600)
+
+        dates = [
+            dt.datetime(2017, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2017, 1, 3, 0, 0, 0, tzinfo=dt.timezone.utc),
+        ]
+        date_ds, _ = self._make_fake_datasets(dates)
+        src = SimpleIndexSampler([[0, 1]])
+
+        with self.assertRaisesRegex(ValueError, "outside the range"):
+            translate_date_sampler_to_timedelta_sampler(src, date_ds, ShortTimedeltaDataset())
 
 
 class TestComputeInferenceRange(unittest.TestCase):

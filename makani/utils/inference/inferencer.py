@@ -586,9 +586,14 @@ class Inferencer(Driver):
             num_workers=self.params.num_data_workers,
         )
 
+        # a sample covers the window idx, ..., idx + n_history * dt, and the targets are verified at its latest step
+        history_offset = self.valid_dataset.n_history * self.valid_dataset.dt
+
         # get timedelta with respect to beginning of year
         if self.mask_dataset is not None:
-            mask_sampler = translate_date_sampler_to_timedelta_sampler(sampler, self.valid_dataset, self.mask_dataset)
+            mask_sampler = translate_date_sampler_to_timedelta_sampler(
+                sampler, self.valid_dataset, self.mask_dataset, index_offset=history_offset
+            )
             self.mask_dataloader = tud.DataLoader(
                 self.mask_dataset,
                 batch_sampler=mask_sampler,
@@ -600,7 +605,7 @@ class Inferencer(Driver):
 
         if self.climatology_dataset is not None:
             climatology_sampler = translate_date_sampler_to_timedelta_sampler(
-                sampler, self.valid_dataset, self.climatology_dataset
+                sampler, self.valid_dataset, self.climatology_dataset, index_offset=history_offset
             )
             self.climatology_dataloader = tud.DataLoader(
                 self.climatology_dataset,
