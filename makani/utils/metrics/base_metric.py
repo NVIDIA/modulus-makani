@@ -70,6 +70,9 @@ class GeometricBaseMetric(nn.Module, metaclass=ABCMeta):
     Geometric base loss class used by all geometric losses
     """
 
+    # set by metrics whose result for a sample is normalized by its weights already, see weighted_counts
+    normalized_by_weights = False
+
     def __init__(
         self,
         grid_type: str,
@@ -113,7 +116,7 @@ class GeometricBaseMetric(nn.Module, metaclass=ABCMeta):
                     "Batch reduction mode 'mean' is not supported when weights are provided. Use 'sum' instead."
                 )
             elif self.batch_reduction == "sum":
-                counts = torch.sum(self.quadrature(weight.to(dtype=inp.dtype)), dim=0)
+                counts = torch.sum(self.weighted_counts(weight.to(dtype=inp.dtype)), dim=0)
             else:
                 raise ValueError(f"Batch reduction mode '{self.batch_reduction}' is not supported")
         else:
@@ -127,6 +130,31 @@ class GeometricBaseMetric(nn.Module, metaclass=ABCMeta):
         elif self.channel_reduction == "sum":
             counts = torch.sum(counts, dim=0)
 
+        return counts
+
+    def weighted_counts(self, weight: torch.Tensor) -> torch.Tensor:
+        """
+        Defines how much every sample counts when weighted results are combined.
+
+        The result of an area average, such as the L1 error, is an integral over the weights, so a sample counts with
+        the area its weights integrate to, and finalizing renormalizes the result to that area. A metric whose result
+        for a sample is normalized by its weights already, such as a ratio of integrals over the same weights, sets
+        normalized_by_weights instead, and every sample with nonzero weights counts once. Counting it with the area
+        would normalize it a second time.
+
+        Parameters
+        ----------
+        weight : torch.Tensor
+            Weights of shape (batch, channels, lat, lon).
+
+        Returns
+        -------
+        counts : torch.Tensor
+            Tensor of shape (batch, channels).
+        """
+        counts = self.quadrature(weight)
+        if self.normalized_by_weights:
+            counts = (counts > 0).to(dtype=counts.dtype)
         return counts
 
     def combine(
