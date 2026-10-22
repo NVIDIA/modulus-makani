@@ -323,7 +323,7 @@ class TestDistributedRealFFT(unittest.TestCase):
             [65, 128, 4, 1, 10, 5e-6],
             # truncated spectra, which the inverse zero-pads between the positive and negative
             # frequencies; modes as in test_distributed_fft2_3
-            [64, 128, 0, 32, 8, 2e-5, (32, 33), True],
+            [64, 128, 0, 32, 8, 2e-5, (32, 33)],
             [65, 128, 0, 1, 10, 5e-6, (33, 40)],
             [64, 128, 4, 32, 8, 2e-5, (2, 32, 33)],
             [65, 128, 4, 1, 10, 5e-6, (3, 33, 40)],
