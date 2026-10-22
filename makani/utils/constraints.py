@@ -50,8 +50,14 @@ class NonNegativeConstraint(nn.Module):
         flattens them to 0 -- a collapse routed through the floor mismatch rather than a negative
         gradient. It is identity minus a negligible ~(1-leak)*eps*ln2 on the bulk, matching "silu"
         spectrally.
+      - "quadratic": the soft clamp of FCN3's ``clamp_water_channels``: 0 below physical zero,
+        ``x^2/(2*eps)`` on [0, eps) and ``x - eps/2`` above, so value and slope are continuous.
+        The default ``eps=0.5`` reproduces FCN3 exactly. The output is nonnegative by construction and zero
+        below physical zero, so there is no gradient there. Unlike the other modes it is applied
+        in eval mode too: the bulk is shifted by -eps/2, which a hard clamp at eval would not
+        reproduce.
 
-    Eval/inference mode (both): hard clamp, guaranteeing x_raw >= 0 before any
+    Eval/inference mode ("silu" and "softplus"): hard clamp, guaranteeing x_raw >= 0 before any
     downstream conservation corrections.
 
     Args:
@@ -60,15 +66,18 @@ class NonNegativeConstraint(nn.Module):
                         Names not found in channel_names are silently skipped.
         bias:           normalization bias tensor, shape (1, C, 1, 1) or None.
         scale:          normalization scale tensor, shape (1, C, 1, 1) or None.
-        eps:            transition width for the soft clamp (normalized units).
-        mode:           "silu" (default, legacy) or "softplus" (monotonic, recommended).
-        leak:           negative-side gradient floor for the "softplus" mode (ignored for "silu").
+        eps:            transition width for the soft clamp (normalized units). Defaults to 0.5 for
+                        "quadratic" (FCN3) and to 0.1 for the other modes.
+        mode:           "silu" (default, legacy), "softplus" (monotonic, recommended) or "quadratic" (FCN3).
+        leak:           negative-side gradient floor for the "softplus" mode (ignored for the other modes).
     """
 
-    def __init__(self, channel_names, names_to_clamp, bias=None, scale=None, eps=0.1, mode="silu", leak=0.02):
+    def __init__(self, channel_names, names_to_clamp, bias=None, scale=None, eps=None, mode="silu", leak=0.02):
         super().__init__()
-        if mode not in ("silu", "softplus"):
-            raise ValueError(f"NonNegativeConstraint mode must be 'silu' or 'softplus', got {mode!r}")
+        if mode not in ("silu", "softplus", "quadratic"):
+            raise ValueError(f"NonNegativeConstraint mode must be 'silu', 'softplus' or 'quadratic', got {mode!r}")
+        if eps is None:
+            eps = 0.5 if mode == "quadratic" else 0.1
         self.eps = eps
         self.mode = mode
         self.leak = leak
@@ -92,7 +101,14 @@ class NonNegativeConstraint(nn.Module):
         w = x[..., self.channel_indices, :, :]
         offset = self.offset.to(x.dtype) if self.offset is not None else None
 
-        if self.training:
+        if self.mode == "quadratic":
+            # FCN3 soft clamp, in training and eval: 0 below physical zero, quadratic up to eps, linear above
+            w_shifted = w + offset if offset is not None else w
+            w = torch.where(w_shifted > 0.0, w_shifted**2 / (2.0 * self.eps), 0.0)
+            w = torch.where(w_shifted >= self.eps, w_shifted - 0.5 * self.eps, w)
+            if offset is not None:
+                w = w - offset
+        elif self.training:
             # shift so physical zero maps to 0, apply smooth clamp, shift back
             w_shifted = w + offset if offset is not None else w
             if self.mode == "silu":

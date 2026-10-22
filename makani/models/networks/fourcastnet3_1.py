@@ -31,6 +31,7 @@ from makani.models.common import (
     MLPImputation,
 )
 from makani.utils.features import get_water_channels, get_channel_groups
+from makani.utils.constraints import NonNegativeConstraint
 from makani.utils.grids import compute_spherical_bandlimit
 
 # get spectral transforms and spherical convolutions from torch_harmonics
@@ -55,14 +56,6 @@ from makani.models.physicsnemo_compat import module_from_torch
 def _compute_cutoff_radius(lmax, kernel_shape, basis_type):
     margin_factor = {"piecewise linear": 1.0, "morlet": 1.0, "harmonic": 1.0, "zernike": 1.0, "fourier-bessel": 1.5}
     return margin_factor[basis_type] * kernel_shape[0] * math.pi / float(lmax)
-
-
-@torch.compile
-def _soft_clamp(x: torch.Tensor, offset: float = 0.0):
-    x = x + offset
-    y = torch.where(x > 0.0, x**2, 0.0)
-    y = torch.where(x >= 0.5, x - 0.25, y)
-    return y
 
 
 class Sin(nn.Module):
@@ -845,11 +838,18 @@ class AtmoSphericNeuralOperatorNet31(nn.Module):
 
             self.blocks.append(block)
 
-        # controlled output normalization of q and tcwv
+        # controlled output normalization of q and tcwv, at physical zero if the normalization statistics are known
         if clamp_water:
             water_chans = get_water_channels(channel_names)
             if len(water_chans) > 0:
-                self.register_buffer("water_channels", torch.tensor(water_chans, dtype=torch.long), persistent=False)
+                has_stats = normalization_means is not None and normalization_stds is not None
+                self.water_clamp = NonNegativeConstraint(
+                    channel_names,
+                    [channel_names[c] for c in water_chans],
+                    bias=self.normalization_means.view(1, -1, 1, 1) if has_stats else None,
+                    scale=self.normalization_stds.view(1, -1, 1, 1) if has_stats else None,
+                    mode="quadratic",
+                )
 
         # freeze the encoder/decoder
         if freeze_encoder:
@@ -1065,18 +1065,8 @@ class AtmoSphericNeuralOperatorNet31(nn.Module):
         clamp water channes with a smooth, positive activation function
         """
 
-        if hasattr(self, "water_channels"):
-            # potentially qwrong due to water_channels neeeding to be differentiated for input and output
-            if hasattr(self, "normalization_means") and hasattr(self, "normalization_stds"):
-                means = self.normalization_means[self.water_channels].view(1, -1, 1, 1)
-                stds = self.normalization_stds[self.water_channels].view(1, -1, 1, 1)
-                offset = (means / stds).to(x.dtype)
-                w = _soft_clamp(x[..., self.water_channels, :, :], offset=offset) - offset
-            else:
-                w = _soft_clamp(x[..., self.water_channels, :, :])
-            # the following eventually leads to spectral instability
-            # w = nn.functional.softplus(x[..., self.water_channels, :, :], beta=5, threshold=5)
-            x = x.index_copy(-3, self.water_channels, w.to(x.dtype))
+        if hasattr(self, "water_clamp"):
+            x = self.water_clamp(x)
 
         return x
 

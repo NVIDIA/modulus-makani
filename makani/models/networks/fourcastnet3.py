@@ -24,6 +24,7 @@ from functools import partial
 # helpers
 from makani.models.common import DropPath, LayerScale, MLP, EncoderDecoder, SpectralConv
 from makani.utils.features import get_water_channels, get_channel_groups
+from makani.utils.constraints import NonNegativeConstraint
 
 # get spectral transforms and spherical convolutions from torch_harmonics
 import torch_harmonics as th
@@ -48,15 +49,6 @@ def _compute_cutoff_radius(nlat, kernel_shape, basis_type):
     theta_cutoff_factor = {"piecewise linear": 0.5, "morlet": 0.5, "harmonic": 0.5, "zernike": math.sqrt(2.0)}
 
     return (kernel_shape[0] + 1) * theta_cutoff_factor[basis_type] * math.pi / float(nlat - 1)
-
-
-# commenting out torch.compile due to long intiial compile times
-# @torch.compile
-def _soft_clamp(x: torch.Tensor, offset: float = 0.0):
-    x = x + offset
-    y = torch.where(x > 0.0, x**2, 0.0)
-    y = torch.where(x >= 0.5, x - 0.25, y)
-    return y
 
 
 @torch.compiler.disable(recursive=True)
@@ -901,11 +893,13 @@ class AtmoSphericNeuralOperatorNet(nn.Module):
         if clamp_water:
             water_chans = get_water_channels(channel_names)
             if len(water_chans) > 0:
-                self.register_buffer("water_channels", torch.tensor(water_chans, dtype=torch.long), persistent=False)
-                # boolean mask for out-of-place torch.where clamping
-                _mask = torch.zeros(self.n_out_chans, dtype=torch.bool)
-                _mask[water_chans] = True
-                self.register_buffer("water_channel_mask", _mask.view(1, -1, 1, 1), persistent=False)
+                # NOTE: unlike FCN3.1, FCN3 does not store the normalization statistics the model registry passes,
+                # so the clamp acts at normalized zero rather than at physical zero (the dataset minimum for
+                # minmax-normalized water channels). This is kept as is so that trained FCN3 models keep their
+                # behavior; FCN3.1 clamps at physical zero
+                self.water_clamp = NonNegativeConstraint(
+                    channel_names, [channel_names[c] for c in water_chans], bias=None, scale=None, mode="quadratic"
+                )
 
         # freeze the encoder/decoder
         if freeze_encoder:
@@ -1104,24 +1098,8 @@ class AtmoSphericNeuralOperatorNet(nn.Module):
         clamp water channes with a smooth, positive activation function
         """
 
-        if hasattr(self, "water_channels"):
-            # potentially qwrong due to water_channels neeeding to be differentiated for input and output
-            # NOTE: unlike FCN3.1, FCN3 does not store the normalization statistics the model registry passes,
-            # so the clamp below acts at normalized zero rather than at physical zero (the dataset minimum for
-            # minmax-normalized water channels). This is kept as is so that trained FCN3 models keep their
-            # behavior; FCN3.1 clamps at physical zero
-            if hasattr(self, "normalization_means") and hasattr(self, "normalization_stds"):
-                means = self.normalization_means[self.water_channels].view(1, -1, 1, 1)
-                stds = self.normalization_stds[self.water_channels].view(1, -1, 1, 1)
-                offset = (means / stds).to(x.dtype)
-                w = _soft_clamp(x[..., self.water_channels, :, :], offset=offset) - offset
-            else:
-                w = _soft_clamp(x[..., self.water_channels, :, :])
-            # the following eventually leads to spectral instability
-            # w = nn.functional.softplus(x[..., self.water_channels, :, :], beta=5, threshold=5)
-            w_full = torch.zeros_like(x)
-            w_full.index_copy_(-3, self.water_channels, w.to(x.dtype))
-            x = torch.where(self.water_channel_mask, w_full, x)
+        if hasattr(self, "water_clamp"):
+            x = self.water_clamp(x)
 
         return x
 

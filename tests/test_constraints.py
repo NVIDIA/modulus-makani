@@ -368,6 +368,105 @@ class TestConstraints(unittest.TestCase):
             # and it must be vastly larger than the balanced residual
             self.assertGreater(loss_pert, 1e3 * loss_bal)
 
+    def _water_names(self):
+        from makani.utils.features import get_water_channels
+
+        return [self.channel_names[c] for c in get_water_channels(self.channel_names)]
+
+    @parameterized.expand([("silu",), ("softplus",), ("quadratic",)])
+    def test_nonnegative_constraint_wrapper(self, mode):
+        """The "nonnegative" constraint of the wrapper is NonNegativeConstraint on the water channels."""
+        cwrap = ConstraintsWrapper(
+            constraints=[{"type": "nonnegative", "options": {"mode": mode}}],
+            channel_names=self.channel_names,
+            bias=self.bias,
+            scale=self.scale,
+            model_handle=None,
+        ).to(self.device)
+        cwrap.eval()
+        self.assertEqual(cwrap.N_in_channels, len(self.channel_names))
+
+        water = self._water_names()
+        self.assertGreater(len(water), 0)
+        reference = NonNegativeConstraint(self.channel_names, water, bias=self.bias, scale=self.scale, mode=mode).to(
+            self.device
+        )
+        reference.eval()
+
+        inp = 3.0 * torch.randn_like(self.data)
+        out = cwrap(inp)
+        self.assertTrue(compare_tensors("wrapper vs constraint", out, reference(inp)))
+
+        widx = [self.channel_names.index(n) for n in water]
+        bias = self.bias[:, widx].to(self.device)
+        physical = out[:, widx] * self.scale[:, widx].to(self.device) + bias
+        # un-normalizing a value at the floor rounds to ~|bias| * float32 eps
+        self.assertTrue((physical >= -1e-6 * (1.0 + bias.abs())).all())
+
+    @parameterized.expand([("dry", False), ("moist", True)])
+    def test_nonnegative_then_hydrostatic_balance_constraint_wrapper(self, _name, use_moist_air_formula):
+        """Clamping before hydrostatic balance: the clamp acts on the reduced channels the model predicts,
+        so the virtual temperature of the moist formula sees the clamped humidity. The expanded output
+        is then balanced and its water channels are nonnegative."""
+        hb_options = dict(p_min=50, p_max=900, use_moist_air_formula=use_moist_air_formula)
+        constraints = [
+            {"type": "nonnegative", "options": {"mode": "quadratic"}},
+            {"type": "hydrostatic_balance", "options": hb_options},
+        ]
+        cwrap = ConstraintsWrapper(
+            constraints=constraints, channel_names=self.channel_names, bias=self.bias, scale=self.scale
+        ).to(self.device)
+        hb_only = ConstraintsWrapper(
+            constraints=constraints[1:], channel_names=self.channel_names, bias=self.bias, scale=self.scale
+        ).to(self.device)
+        self.assertEqual(cwrap.N_in_channels, hb_only.N_in_channels)
+
+        # the clamp acts on the water channels of the reduced layout, with their normalization statistics
+        hb = cwrap.constraint_list[1]
+        clamp = cwrap.constraint_list[0]
+        reduced_names = [self.channel_names[c] for c in hb.inp_channel_idx]
+        expected_idx = [reduced_names.index(n) for n in self._water_names()]
+        # the clamp follows the reduced layout, where the humidities are ordered by pressure, so compare as sets
+        self.assertEqual(sorted(clamp.channel_indices.tolist()), sorted(expected_idx))
+
+        B, C, H, W = self.data.shape
+        data_short = torch.randn(B, cwrap.N_in_channels, H, W, dtype=torch.float32, device=self.device)
+        out = cwrap(data_short)
+
+        with self.subTest("composition"):
+            expected = hb_only(clamp(data_short))
+            self.assertTrue(compare_tensors("composition", out, expected))
+
+        with self.subTest("hydrostatic balance loss"):
+            hbloss = HydrostaticBalanceLoss(
+                img_shape=self.img_shape,
+                crop_shape=self.crop_shape,
+                crop_offset=self.crop_offset,
+                channel_names=self.channel_names,
+                grid_type="equiangular",
+                bias=self.bias,
+                scale=self.scale,
+                **hb_options,
+            ).to(self.device)
+            hb_loss_val = torch.mean(torch.sum(hbloss(out, None), dim=1)).item()
+            self.assertTrue(hb_loss_val <= 1e-6)
+
+        with self.subTest("water channels nonnegative"):
+            widx = [self.channel_names.index(n) for n in self._water_names()]
+            bias = self.bias[:, widx].to(self.device)
+            physical = out[:, widx] * self.scale[:, widx].to(self.device) + bias
+            self.assertTrue((physical >= -1e-6 * (1.0 + bias.abs())).all())
+
+    def test_hydrostatic_balance_constraint_only_once(self):
+        constraints = [
+            {"type": "hydrostatic_balance", "options": dict(p_min=50, p_max=900)},
+            {"type": "hydrostatic_balance", "options": dict(p_min=50, p_max=900)},
+        ]
+        with self.assertRaises(ValueError):
+            ConstraintsWrapper(
+                constraints=constraints, channel_names=self.channel_names, bias=self.bias, scale=self.scale
+            )
+
 
 @parameterized_class(("device",), _devices)
 class TestNonNegativeConstraint(unittest.TestCase):
@@ -403,7 +502,7 @@ class TestNonNegativeConstraint(unittest.TestCase):
         return c.to(self.device)
 
     # --- eval / hard clamp ---
-    @parameterized.expand([("silu",), ("softplus",)])
+    @parameterized.expand([("silu",), ("softplus",), ("quadratic",)])
     def test_eval_hard_clamp_no_normalization(self, mode):
         """Eval mode: constrained channels are >= 0; unconstrained channels unchanged."""
         B, C, H, W = 2, len(self.ALL_CHANNELS), 8, 8
@@ -415,7 +514,7 @@ class TestNonNegativeConstraint(unittest.TestCase):
         unconstrained = [i for i in range(C) if i not in self.CLAMP_IDX]
         self.assertTrue(compare_tensors("unconstrained channels", y[:, unconstrained, :, :], x[:, unconstrained, :, :]))
 
-    @parameterized.expand([("silu",), ("softplus",)])
+    @parameterized.expand([("silu",), ("softplus",), ("quadratic",)])
     def test_eval_hard_clamp_with_normalization(self, mode):
         """Eval mode: x_raw = y_norm * scale + bias >= 0 after clamping."""
         B, C, H, W = 2, len(self.ALL_CHANNELS), 6, 6
@@ -454,7 +553,7 @@ class TestNonNegativeConstraint(unittest.TestCase):
         y = c(x)
         self.assertFalse((y[:, [1], :, :] == 0).all().item())
 
-    @parameterized.expand([("silu",), ("softplus",)])
+    @parameterized.expand([("silu",), ("softplus",), ("quadratic",)])
     def test_train_large_positive_identity(self, mode):
         """Training mode: on the bulk the clamp has unit slope, so it preserves spatial
         structure (only the l=0 DC mode may shift). silu is exact identity there; softplus
@@ -483,7 +582,7 @@ class TestNonNegativeConstraint(unittest.TestCase):
                     )
                 )
 
-    @parameterized.expand([("silu",), ("softplus",)])
+    @parameterized.expand([("silu",), ("softplus",), ("quadratic",)])
     def test_train_floor_fixed_point(self, mode):
         """The training soft clamp must map physical zero to physical zero (w(0)=0 in the
         shifted space). Otherwise the training floor sits above the eval hard-clamp floor,
@@ -510,7 +609,7 @@ class TestNonNegativeConstraint(unittest.TestCase):
         self.assertIsNotNone(x.grad)
         self.assertFalse((x.grad[:, self.CLAMP_IDX, :, :] == 0).all().item())
 
-    @parameterized.expand([("silu",), ("softplus",)])
+    @parameterized.expand([("silu",), ("softplus",), ("quadratic",)])
     def test_train_normalization_offset(self, mode):
         """Training mode: with normalization, the clamp boundary is at physical zero."""
         B, C, H, W = 1, len(self.ALL_CHANNELS), 4, 4
@@ -565,6 +664,32 @@ class TestNonNegativeConstraint(unittest.TestCase):
             self.assertTrue((g > 0).all().item(), "softplus soft clamp must be monotonic (grad > 0)")
         else:
             self.assertTrue((g < 0).any().item(), "silu soft clamp has a non-monotonic negative-gradient dip")
+
+    # --- the FCN3 soft clamp, see TestClampWaterChannels in test_models.py for the comparison with FCN3 ---
+    @parameterized.expand([("silu", 0.1), ("softplus", 0.1), ("quadratic", 0.5)])
+    def test_default_eps(self, mode, eps):
+        """eps defaults per mode, and an explicit value overrides it."""
+        self.assertEqual(self._make(mode=mode).eps, eps)
+        self.assertEqual(self._make(mode=mode, eps=0.3).eps, 0.3)
+
+    def test_quadratic_continuous_slope(self):
+        """The quadratic mode has continuous value and slope at physical zero and at eps."""
+        eps = 0.2
+        c = self._make(names_to_clamp=["q850"], eps=eps, mode="quadratic")  # no normalization
+        c.train()
+        C = len(self.ALL_CHANNELS)
+        # steps of 1e-4 to either side change value and slope by O(1e-4 / eps), a jump would be O(1)
+        for x0 in [0.0, eps]:
+            pts = torch.tensor([x0 - 1e-4, x0 + 1e-4], device=self.device, dtype=torch.float64)
+            x = torch.full((1, C, 1, 2), 5.0, device=self.device, dtype=torch.float64)
+            x[:, 1, 0, :] = pts
+            x.requires_grad_(True)
+            y = c(x)
+            y.sum().backward()
+            with self.subTest(f"value at {x0}"):
+                self.assertAlmostEqual(y[0, 1, 0, 0].item(), y[0, 1, 0, 1].item(), delta=1e-2)
+            with self.subTest(f"slope at {x0}"):
+                self.assertAlmostEqual(x.grad[0, 1, 0, 0].item(), x.grad[0, 1, 0, 1].item(), delta=1e-2)
 
 
 @parameterized_class(("device",), _devices)

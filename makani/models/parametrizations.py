@@ -54,6 +54,13 @@ class _HydrostaticBalanceWrapper(nn.Module):
         if self.use_moist_air_formula:
             self.aux_idx = [i for i in self.aux_idx if (i not in self.q_idx)]
 
+        # channel layout of the reduced input, in terms of the full channels: T_0, the geopotentials,
+        # the specific humidities if the moist formula is used, and the remaining channels
+        self.inp_channel_idx = [self.t_idx[0]] + self.z_idx
+        if self.use_moist_air_formula:
+            self.inp_channel_idx += self.q_idx
+        self.inp_channel_idx += self.aux_idx
+
         # compute prefact
         # prefactor, units [K * kg / J] = [K * kg * s^2 / (m^2 * kg)] = [K * s^2 / m^2]
         self.prefact = 1.0 / const.R_DRY_AIR
@@ -244,17 +251,21 @@ class ConstraintsWrapper(nn.Module):
     standalone on a tensor, which is useful for post-processing predictions
     produced elsewhere.
 
-    ``constraints`` is a list of dicts, e.g.::
+    ``constraints`` is a list of dicts, applied in order, e.g.::
 
-        constraints = [{"type": "hydrostatic_balance",
+        constraints = [{"type": "nonnegative",
+                        "options": {"mode": "quadratic"}},
+                       {"type": "hydrostatic_balance",
                         "options": {...}}]
 
     Parameters
     ----------
     constraints : list of dict
         Constraint specifications. Each entry needs a ``"type"`` key and an
-        ``"options"`` dict forwarded to that constraint. Currently only
-        ``"hydrostatic_balance"`` is supported.
+        optional ``"options"`` dict forwarded to that constraint. Supported are
+        ``"hydrostatic_balance"`` (:class:`_HydrostaticBalanceWrapper`) and
+        ``"nonnegative"`` (:class:`~makani.utils.constraints.NonNegativeConstraint`,
+        whose ``names_to_clamp`` default to the water channels).
     channel_names : list of str
         Names of the output channels, used to locate the variables each
         constraint acts on.
@@ -271,12 +282,20 @@ class ConstraintsWrapper(nn.Module):
     Raises
     ------
     NotImplementedError
-        If a constraint type other than ``"hydrostatic_balance"`` is requested.
+        If an unsupported constraint type is requested.
+    ValueError
+        If ``"hydrostatic_balance"`` is requested more than once.
 
     Notes
     -----
-    Only a single constraint is applied at present; if several are configured,
-    the first one is used.
+    ``"hydrostatic_balance"`` is a reparametrization: the model predicts a
+    reduced set of ``N_in_channels`` channels (``T_0``, the geopotentials, the
+    humidities for the moist formula and the remaining channels), which it
+    expands to the full channel set. Constraints listed before it act on the
+    reduced channels, constraints after it on the full ones. The order matters:
+    to clamp the humidities, ``"nonnegative"`` has to come first, so that the
+    virtual temperature of the moist formula is computed from the clamped
+    humidities and the output stays balanced.
     """
 
     def __init__(self, constraints, channel_names, bias, scale, model_handle=None):
@@ -287,24 +306,53 @@ class ConstraintsWrapper(nn.Module):
         else:
             self.model = None
 
-        # sanity checks
+        types = [constraint["type"] for constraint in constraints]
+        if types.count("hydrostatic_balance") > 1:
+            raise ValueError("Error, the hydrostatic balance constraint can only be used once.")
+
+        # without a reparametrization, the model predicts the full channel set
+        self.N_in_channels = len(channel_names)
+        inp_channel_names, inp_bias, inp_scale = channel_names, bias, scale
+
+        # the hydrostatic balance reparametrization determines the reduced channels the model predicts,
+        # which the constraints before it act on
+        hb_pos = types.index("hydrostatic_balance") if "hydrostatic_balance" in types else len(constraints)
+        if hb_pos < len(constraints):
+            hb_constraint = _HydrostaticBalanceWrapper(
+                **constraints[hb_pos].get("options", {}), channel_names=channel_names, bias=bias, scale=scale
+            )
+            inp_idx = hb_constraint.inp_channel_idx
+            inp_channel_names = [channel_names[c] for c in inp_idx]
+            inp_bias = bias[:, inp_idx, ...] if bias is not None else None
+            inp_scale = scale[:, inp_idx, ...] if scale is not None else None
+            self.N_in_channels = len(inp_idx)
+
         self.constraint_list = nn.ModuleList()
-        for constraint in constraints:
-            if constraint["type"] == "hydrostatic_balance":
-                self.constraint_list.append(
-                    _HydrostaticBalanceWrapper(
-                        **constraint["options"], channel_names=channel_names, bias=bias, scale=scale
-                    )
-                )
-                self.N_in_channels = self.constraint_list[-1].mapping.shape[1]
+        for idx, constraint in enumerate(constraints):
+            if idx == hb_pos:
+                self.constraint_list.append(hb_constraint)
+                continue
+
+            if idx < hb_pos:
+                names, cbias, cscale = inp_channel_names, inp_bias, inp_scale
             else:
-                raise NotImplementedError(
-                    "Error, constraints different from hydrostatic balance are not yet implemented."
+                names, cbias, cscale = channel_names, bias, scale
+
+            options = dict(constraint.get("options", {}))
+            if constraint["type"] == "nonnegative":
+                from makani.utils.constraints import NonNegativeConstraint
+                from makani.utils.features import get_water_channels
+
+                names_to_clamp = options.pop("names_to_clamp", [names[c] for c in get_water_channels(names)])
+                self.constraint_list.append(
+                    NonNegativeConstraint(names, names_to_clamp, bias=cbias, scale=cscale, **options)
                 )
+            else:
+                raise NotImplementedError(f"Error, constraint type {constraint['type']} is not implemented.")
 
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
         r"""
-        Run the wrapped model, if any, and apply the constraint to the result.
+        Run the wrapped model, if any, and apply the constraints to the result.
 
         Parameters
         ----------
@@ -322,7 +370,9 @@ class ConstraintsWrapper(nn.Module):
             # get model output
             inp = self.model(inp)
 
-        # only support single constraint atm, we deal with stacking later
-        out = self.constraint_list[0](inp)
+        # apply the constraints in order
+        out = inp
+        for constraint in self.constraint_list:
+            out = constraint(out)
 
         return out
