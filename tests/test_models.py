@@ -15,10 +15,12 @@
 
 import sys
 import os
+import tempfile
 import unittest
 import warnings
 from parameterized import parameterized, parameterized_class
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -292,66 +294,71 @@ class TestModelOptions(unittest.TestCase):
         self._forward_backward()
 
 
-class _WaterChannelStub(torch.nn.Module):
-    """Holds the buffers clamp_water_channels reads, without building a full model."""
-
-    def __init__(self, num_channels, water_channels, means=None, stds=None):
-        super().__init__()
-        self.register_buffer("water_channels", torch.tensor(water_channels, dtype=torch.long))
-        mask = torch.zeros(num_channels, dtype=torch.bool)
-        mask[water_channels] = True
-        self.register_buffer("water_channel_mask", mask.view(1, -1, 1, 1))
-        if means is not None:
-            self.register_buffer("normalization_means", torch.as_tensor(means))
-            self.register_buffer("normalization_stds", torch.as_tensor(stds))
-
-
 def _soft_clamp_reference(x):
     # 0 below zero, x^2 on [0, 0.5) and x - 0.25 above: continuous with a continuous first derivative
     return torch.where(x >= 0.5, x - 0.25, torch.where(x > 0.0, x**2, torch.zeros_like(x)))
 
 
 class TestClampWaterChannels(unittest.TestCase):
-    """clamp_water_channels of FCN3 and FCN3.1 on a stub holding the water-channel buffers."""
+    """clamp_water_channels of FCN3 and FCN3.1, built through the model registry with clamp_water set."""
 
-    _NUM_CHANNELS = 5
+    _CHANNEL_NAMES = ["u10m", "tcwv", "u500", "q500", "t500"]
     _WATER = [1, 3]
 
     def setUp(self):
-        set_seed(333)
-        self.x = 2.0 * torch.randn(2, self._NUM_CHANNELS, 4, 8)
-        self.dry = [c for c in range(self._NUM_CHANNELS) if c not in self._WATER]
+        # the same small grid and parameters as TestModels
+        self.device = torch.device("cpu")
+        TestModels.setUp(self)
+        self.params.channel_names = self._CHANNEL_NAMES
+        self.params.clamp_water = True
 
-    def _clamp(self, nettype, stub, x):
-        if nettype == "FCN3":
-            from makani.models.networks.fourcastnet3 import AtmoSphericNeuralOperatorNet as net
-        else:
-            from makani.models.networks.fourcastnet3_1 import AtmoSphericNeuralOperatorNet31 as net
-        return net.clamp_water_channels(stub, x)
+        self.x = 2.0 * torch.randn(2, len(self._CHANNEL_NAMES), 4, 8)
+        self.dry = [c for c in range(len(self._CHANNEL_NAMES)) if c not in self._WATER]
 
-    @parameterized.expand([("FCN3",), ("FCN3.1",)])
-    def test_without_normalization(self, nettype, verbose=False):
-        out = self._clamp(nettype, _WaterChannelStub(self._NUM_CHANNELS, self._WATER), self.x)
+        self.means = torch.tensor([0.0, 0.3, 0.0, 1.2, 0.0])
+        self.stds = torch.tensor([1.0, 0.5, 1.0, 2.0, 1.0])
+
+    def _network(self, nettype, normalized):
+        self.params.nettype = nettype
+        if normalized:
+            tmpdir = tempfile.TemporaryDirectory()
+            self.addCleanup(tmpdir.cleanup)
+            self.params.normalization = "zscore"
+            self.params.global_means_path = os.path.join(tmpdir.name, "means.npy")
+            self.params.global_stds_path = os.path.join(tmpdir.name, "stds.npy")
+            np.save(self.params.global_means_path, self.means.numpy().reshape(1, -1, 1, 1))
+            np.save(self.params.global_stds_path, self.stds.numpy().reshape(1, -1, 1, 1))
+        model = model_registry.get_model(self.params)
+        return next(m for m in model.modules() if hasattr(m, "clamp_water_channels"))
+
+    @parameterized.expand([("FCN3", False), ("FCN3", True), ("FCN3.1", False)])
+    def test_clamp_at_normalized_zero(self, nettype, normalized, verbose=False):
+        """FCN3 does not store the normalization statistics, so it clamps at normalized zero even when
+        they are passed. FCN3.1 does so only without statistics."""
+        net = self._network(nettype, normalized)
+        out = net.clamp_water_channels(self.x)
 
         self.assertTrue(torch.equal(out[:, self.dry], self.x[:, self.dry]))
         expected = _soft_clamp_reference(self.x[:, self._WATER])
         self.assertTrue(compare_tensors("water", out[:, self._WATER], expected, verbose=verbose))
         self.assertTrue((out[:, self._WATER] >= 0.0).all())
 
-    @parameterized.expand([("FCN3",), ("FCN3.1",)])
-    def test_with_normalization(self, nettype, verbose=False):
-        means = torch.tensor([0.0, 0.3, 0.0, 1.2, 0.0])
-        stds = torch.tensor([1.0, 0.5, 1.0, 2.0, 1.0])
-        stub = _WaterChannelStub(self._NUM_CHANNELS, self._WATER, means=means, stds=stds)
-        out = self._clamp(nettype, stub, self.x)
+    @parameterized.expand([("train",), ("eval",)])
+    def test_fcn31_clamp_at_physical_zero(self, phase, verbose=False):
+        """FCN3.1 clamps at physical zero, in training and in eval mode alike."""
+        net = self._network("FCN3.1", normalized=True)
+        net.train(phase == "train")
+        out = net.clamp_water_channels(self.x)
 
         self.assertTrue(torch.equal(out[:, self.dry], self.x[:, self.dry]))
 
         # the clamp acts on the de-normalized value, so the physical water content is non-negative
-        offset = (means / stds)[self._WATER].view(1, -1, 1, 1)
+        offset = (self.means / self.stds)[self._WATER].view(1, -1, 1, 1)
         expected = _soft_clamp_reference(self.x[:, self._WATER] + offset) - offset
         self.assertTrue(compare_tensors("water", out[:, self._WATER], expected, verbose=verbose))
-        physical = means[self._WATER].view(1, -1, 1, 1) + stds[self._WATER].view(1, -1, 1, 1) * out[:, self._WATER]
+        physical = (
+            self.means[self._WATER].view(1, -1, 1, 1) + self.stds[self._WATER].view(1, -1, 1, 1) * out[:, self._WATER]
+        )
         self.assertTrue((physical >= -1e-6).all())
 
 
