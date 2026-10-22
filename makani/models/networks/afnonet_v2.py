@@ -19,6 +19,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
 
+# zeroes the imaginary parts of the DC and Nyquist bins before the inverse, which cuFFT does not do
+from torch_harmonics.fft import irfft
+
 # helpers
 from makani.models.common import ComplexReLU, PatchEmbed2D, DropPath, MLP
 
@@ -202,7 +205,10 @@ class AFNO2D(nn.Module):
         x = F.softshrink(x_fft, lambd=self.sparsity_threshold)
         x = torch.view_as_complex(x)
         x = x.reshape(B, C, H, W // 2 + 1)
-        x = torch.fft.irfft2(x, s=(H, W), dim=(-2, -1), norm="ortho")
+        # the inverse in H first, then the real inverse in W: the m=0 column of the mixed spectrum is not
+        # Hermitian in general, and backends differ in how they treat its imaginary parts
+        x = torch.fft.ifft(x, n=H, dim=-2, norm="ortho")
+        x = irfft(x, n=W, dim=-1, norm="ortho")
         x = x.type(dtype)
 
         return x + self.b1 + bias

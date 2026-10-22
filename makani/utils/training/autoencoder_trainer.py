@@ -288,10 +288,8 @@ class AutoencoderTrainer(Driver):
         if dist.is_initialized():
             barrier(self.device)
 
-        try:
+        if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
-        except ValueError:
-            pass
 
         training_start = time.time()
         best_valid_loss = 1.0e6
@@ -611,7 +609,8 @@ class AutoencoderTrainer(Driver):
         self._set_eval()
 
         # clear cache
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # synchronize
         if dist.is_initialized():

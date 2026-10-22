@@ -82,7 +82,8 @@ if __name__ == "__main__":
         params["optimizer_max_grad_norm"] = 1.0
 
     # set device
-    torch.cuda.set_device(comm.get_local_rank())
+    if torch.cuda.is_available():
+        torch.cuda.set_device(comm.get_local_rank())
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

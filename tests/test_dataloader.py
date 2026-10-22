@@ -956,6 +956,54 @@ class TestHDF5DataLoader(DataLoaderBase, unittest.TestCase):
         # a second close, e.g. the registered test cleanup, must be harmless
         train_loader.close()
 
+    @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
+    def test_dali_load_state_dict_rejects_mismatch(self):
+        """A stored state of a different pipeline raises with strict and is skipped without."""
+        params = copy.deepcopy(self.params)
+        params.multifiles = False
+        params.batch_size = 1
+        params.n_train_samples = 20  # keep the test fast
+        loader, _, _ = self._get_dataloader(
+            params, params.train_data_path, mode="train", device=self.device, dali_device=self.dali_device
+        )
+        next(iter(loader))
+        state_dict = loader.state_dict()
+
+        # each entry changes one of the values the sample sequence depends on
+        tampered = {
+            "format_version": state_dict["format_version"] + 1,
+            "num_shards": state_dict["num_shards"] + 1,
+            "shard_id": state_dict["shard_id"] + 1,
+            "batch_size": state_dict["batch_size"] + 1,
+            "num_steps_per_epoch": state_dict["num_steps_per_epoch"] + 1,
+            "global_seed": state_dict["global_seed"] + 1,
+            "train": not state_dict["train"],
+        }
+        for key, value in tampered.items():
+            mismatched = {**state_dict, key: value}
+            with self.subTest(key=key, strict=True):
+                with self.assertRaisesRegex(ValueError, key.replace("format_version", "format version")):
+                    loader.load_state_dict(mismatched, strict=True)
+            with self.subTest(key=key, strict=False):
+                self.assertFalse(loader.load_state_dict(mismatched, strict=False))
+
+        # the unmodified state still restores after the rejected ones
+        with self.subTest(desc="matching state restores"):
+            self.assertTrue(loader.load_state_dict(state_dict, strict=True))
+
+    @unittest.skipUnless(_have_dali, "nvidia.dali is not installed")
+    def test_dali_state_dict_requires_checkpointing(self):
+        params = copy.deepcopy(self.params)
+        params.multifiles = False
+        params.checkpoint_dataloader_state = False
+        loader, _, _ = self._get_dataloader(
+            params, params.train_data_path, mode="train", device=self.device, dali_device=self.dali_device
+        )
+        with self.assertRaisesRegex(RuntimeError, "checkpointing was disabled"):
+            loader.state_dict()
+        with self.assertRaisesRegex(RuntimeError, "checkpointing was disabled"):
+            loader.load_state_dict({})
+
     # HDF5-only: MultifilesDataset date/index retrieval API
     def test_date_retrieval(self):
         self.params.multifiles = True

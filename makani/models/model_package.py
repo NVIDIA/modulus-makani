@@ -549,8 +549,8 @@ def load_time_loop(package, device=None, time_step_hours=None):
     )
 
     if time_step_hours is None:
-        hour = datetime.timedelta(hours=1)
-        time_step = hour * params.get("dt", 6)
+        # the model step in hours, dt data steps of dhours each, as the wrapper defines it
+        time_step = datetime.timedelta(hours=model.timestep)
     else:
         time_step = datetime.timedelta(hours=time_step_hours)
 

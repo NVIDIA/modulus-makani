@@ -101,7 +101,6 @@ def _get_norm_layer_handle(
             crop_shape=(h, w),
             crop_offset=(0, 0),
             grid_type=sht_grid_type,
-            pole_mask=0,
             num_features=embed_dim,
             eps=1e-6,
             affine=True,
@@ -1107,6 +1106,10 @@ class AtmoSphericNeuralOperatorNet(nn.Module):
 
         if hasattr(self, "water_channels"):
             # potentially qwrong due to water_channels neeeding to be differentiated for input and output
+            # NOTE: unlike FCN3.1, FCN3 does not store the normalization statistics the model registry passes,
+            # so the clamp below acts at normalized zero rather than at physical zero (the dataset minimum for
+            # minmax-normalized water channels). This is kept as is so that trained FCN3 models keep their
+            # behavior; FCN3.1 clamps at physical zero
             if hasattr(self, "normalization_means") and hasattr(self, "normalization_stds"):
                 means = self.normalization_means[self.water_channels].view(1, -1, 1, 1)
                 stds = self.normalization_stds[self.water_channels].view(1, -1, 1, 1)

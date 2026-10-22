@@ -192,9 +192,10 @@ def _crps_gauss_kernel(
     disabling torch compile for the moment due to very long startup times when training large ensembles with ensemble parallelism
     """
 
-    # compute mean var over observations
-    mu = torch.mean(forecasts * weights, dim=0)
-    sigma = torch.sqrt(torch.mean(torch.square(forecasts - mu.unsqueeze(0)) * weights, dim=0))
+    # weighted mean and variance over the ensemble, normalized by the total weight
+    total_weight = torch.sum(weights, dim=0)
+    mu = torch.sum(forecasts * weights, dim=0) / total_weight
+    sigma = torch.sqrt(torch.sum(torch.square(forecasts - mu.unsqueeze(0)) * weights, dim=0) / total_weight)
 
     # protect against too small standard deviations
     sigma = torch.clamp(sigma, min=eps)
@@ -365,7 +366,8 @@ class CRPSLoss(GeometricBaseLoss):
                 crps = _crps_naive_skillspread_kernel(observations, forecasts, ensemble_weights, self.alpha)
             elif self.crps_type == "gauss":
                 if self.ensemble_weights is not None:
-                    ensemble_weights = self.ensemble_weights[idx]
+                    # the gaussian fit does not order the members, so the weights stay in member order
+                    ensemble_weights = self.ensemble_weights.reshape(-1, *(1 for _ in range(forecasts.dim() - 1)))
                 else:
                     ensemble_weights = torch.ones_like(forecasts, device=forecasts.device)
 
@@ -557,7 +559,8 @@ class SpectralCRPSLoss(SpectralBaseLoss):
                     crps = _crps_naive_skillspread_kernel(observations, forecasts, ensemble_weights, self.alpha)
             elif self.crps_type == "gauss":
                 if self.ensemble_weights is not None:
-                    ensemble_weights = self.ensemble_weights[idx]
+                    # the gaussian fit does not order the members, so the weights stay in member order
+                    ensemble_weights = self.ensemble_weights.reshape(-1, *(1 for _ in range(forecasts.dim() - 1)))
                 else:
                     ensemble_weights = torch.ones_like(forecasts, device=forecasts.device)
 
@@ -657,7 +660,9 @@ class GradientCRPSLoss(GradientBaseLoss):
         if self.absolute:
             return chw
         else:
-            return [weight for weight in chw for _ in range(2)]
+            # one weight per gradient component, in the channel-major order of the components; halved,
+            # so that the weights still sum to one like those of every other loss
+            return chw.repeat_interleave(2, dim=-1) / 2.0
 
     def forward(
         self,
@@ -758,7 +763,8 @@ class GradientCRPSLoss(GradientBaseLoss):
                 crps = _crps_skillspread_kernel(observations, forecasts, ensemble_weights, self.alpha)
             elif self.crps_type == "gauss":
                 if self.ensemble_weights is not None:
-                    ensemble_weights = self.ensemble_weights[idx]
+                    # the gaussian fit does not order the members, so the weights stay in member order
+                    ensemble_weights = self.ensemble_weights.reshape(-1, *(1 for _ in range(forecasts.dim() - 1)))
                 else:
                     ensemble_weights = torch.ones_like(forecasts, device=forecasts.device)
 
@@ -933,7 +939,8 @@ class VortDivCRPSLoss(VortDivBaseLoss):
                 crps = _crps_skillspread_kernel(observations, forecasts, ensemble_weights, self.alpha)
             elif self.crps_type == "gauss":
                 if self.ensemble_weights is not None:
-                    ensemble_weights = self.ensemble_weights[idx]
+                    # the gaussian fit does not order the members, so the weights stay in member order
+                    ensemble_weights = self.ensemble_weights.reshape(-1, *(1 for _ in range(forecasts.dim() - 1)))
                 else:
                     ensemble_weights = torch.ones_like(forecasts, device=forecasts.device)
 

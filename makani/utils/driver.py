@@ -912,7 +912,13 @@ class Driver(metaclass=abc.ABCMeta):
     def get_scheduler(self, optimizer, params):
         """Convenience routine for setting up the scheduler"""
 
-        if params.scheduler == "ReduceLROnPlateau":
+        # no scheduler is a valid choice: unset, None (also "None" in the yaml files) or "none". An unset
+        # scheduler is stored as None, since the trainers read params.scheduler as well
+        if not hasattr(params, "scheduler"):
+            params["scheduler"] = None
+        if (params.scheduler is None) or (str(params.scheduler).lower() == "none"):
+            scheduler = None
+        elif params.scheduler == "ReduceLROnPlateau":
             if not hasattr(params, "scheduler_mode"):
                 params["scheduler_mode"] = "min"
             if params.get("skip_validation", False):
@@ -945,10 +951,10 @@ class Driver(metaclass=abc.ABCMeta):
                 eta_min=params.get("scheduler_min_lr", 0.0),
             )
         else:
-            scheduler = None
+            raise ValueError(f"Unknown scheduler {params.scheduler}")
 
         # warmup scheduler
-        if params.lr_warmup_steps > 0:
+        if params.get("lr_warmup_steps", 0) > 0:
             if params.scheduler == "ReduceLROnPlateau":
                 raise NotImplementedError("Error, warmup scheduler not implemented for ReduceLROnPlateau scheduler")
             warmup_scheduler = lr_scheduler.LinearLR(
@@ -958,9 +964,13 @@ class Driver(metaclass=abc.ABCMeta):
                 total_iters=params.get("lr_warmup_steps", 0),
             )
 
-            scheduler = lr_scheduler.SequentialLR(
-                optimizer, [warmup_scheduler, scheduler], milestones=[params.get("lr_warmup_steps", 0)]
-            )
+            # without a scheduler, the learning rate stays constant after the warmup
+            if scheduler is None:
+                scheduler = warmup_scheduler
+            else:
+                scheduler = lr_scheduler.SequentialLR(
+                    optimizer, [warmup_scheduler, scheduler], milestones=[params.get("lr_warmup_steps", 0)]
+                )
 
         return scheduler
 

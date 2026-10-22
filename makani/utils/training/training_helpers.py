@@ -85,6 +85,10 @@ def get_parameter_groups(model: nn.Module, weight_decay: float, mode: str = "ful
 
 
 def get_memory_usage(device):
+    # memory statistics are CUDA only; on the CPU there is nothing to report
+    if torch.device(device).type != "cuda":
+        return 0.0, 0.0
+
     free_mem, total_mem = torch.cuda.mem_get_info(device=device)
     allocated_mem_gb = (total_mem - free_mem) / (1024.0 * 1024.0 * 1024.0)
     torch_mem_gb = torch.cuda.max_memory_allocated(device=device) / (1024.0 * 1024.0 * 1024.0)

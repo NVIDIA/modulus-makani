@@ -25,6 +25,9 @@ from torch_harmonics.distributed import compute_split_shapes
 from torch_harmonics.distributed import distributed_transpose_azimuth as distributed_transpose_w
 from torch_harmonics.distributed import distributed_transpose_polar as distributed_transpose_h
 
+# zeroes the imaginary parts of the DC and Nyquist bins before the inverse, which cuFFT does not do
+from torch_harmonics.fft import irfft
+
 
 class DistributedRealFFT1(nn.Module):
     """
@@ -108,7 +111,7 @@ class DistributedInverseRealFFT1(nn.Module):
             x = distributed_transpose_w(x, (channel_dim, -1), self.m_shapes)
 
         # apply the inverse (real) FFT
-        x = torch.fft.irfft(x, n=self.nlon, dim=-1, norm=norm)
+        x = irfft(x, n=self.nlon, dim=-1, norm=norm)
 
         # transpose: after this, m is split and channels are local
         if self.comm_size_w > 1:
@@ -242,7 +245,7 @@ class DistributedInverseRealFFT2(nn.Module):
             x = distributed_transpose_w(x, (channel_dim, -1), self.m_shapes)
 
         # apply the inverse (real) FFT
-        x = torch.fft.irfft(x, n=self.nlon, dim=-1, norm=norm)
+        x = irfft(x, n=self.nlon, dim=-1, norm=norm)
 
         # transpose: after this, m is split and channels are local
         if self.comm_size_w > 1:
@@ -401,7 +404,7 @@ class DistributedInverseRealFFT3(nn.Module):
             x = distributed_transpose_w(x, (1, -1), self.m_shapes)
 
         # apply the inverse (real) FFT
-        x = torch.fft.irfft(x, n=self.nw, dim=-1, norm="ortho")
+        x = irfft(x, n=self.nw, dim=-1, norm="ortho")
 
         # transpose: after this, m is split and channels are local
         if self.comm_size_w > 1:

@@ -80,7 +80,7 @@ base_config: &BASE_CONFIG
     log_video: 10 # if > 0 will log every i-th epoch
     save_checkpoint: !!bool True
 
-    optimizer_type: "FusedAdam"
+    optimizer_type: "Adam"
     optimizer_beta1: 0.9
     optimizer_beta2: 0.95
     optimizer_max_grad_norm: 32

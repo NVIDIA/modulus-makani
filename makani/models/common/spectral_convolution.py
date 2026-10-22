@@ -454,24 +454,17 @@ class SpectralAttention(nn.Module):
         torch.Tensor
             Complex coefficients of shape ``(B, out_channels, lmax, mmax)``.
         """
-        B, C, H, W = x.shape
-
-        xr = torch.view_as_real(x)
-
+        # the contractions, weights, biases and activations all work on the complex coefficients directly
         for l in range(self.spectral_layers):
             if hasattr(self, "b"):
-                xr = self.mul_add_handle(xr, self.w[l], self.b[l])
+                x = self.mul_add_handle(x, self.w[l], self.b[l])
             else:
-                xr = self.mul_handle(xr, self.w[l])
-            xr = torch.view_as_complex(xr)
-            xr = self.activations[l](xr)
-            xr = self.drop(xr)
-            xr = torch.view_as_real(xr)
+                x = self.mul_handle(x, self.w[l])
+            x = self.activations[l](x)
+            x = self.drop(x)
 
         # final MLP
-        x = self.mul_handle(xr, self.wout)
-
-        x = torch.view_as_complex(x)
+        x = self.mul_handle(x, self.wout)
 
         return x
 
@@ -504,19 +497,17 @@ class SpectralAttention(nn.Module):
                 residual = self.inverse_transform(x)
 
         # convert back. Only the residual is cast here: x still holds the complex
-        # spectral coefficients that forward_mlp consumes via view_as_real, so
-        # casting it to the (real) input dtype at this point would discard the
-        # imaginary part. It is cast once after the inverse transform below,
-        # matching SpectralConv.forward.
+        # spectral coefficients that forward_mlp consumes, so casting it to the (real)
+        # input dtype at this point would discard the imaginary part. It is cast once
+        # after the inverse transform below, matching SpectralConv.forward.
         if self.scale_residual:
             residual = residual.to(dtype=dtype)
 
         # MLP
         x = self.forward_mlp(x)
 
-        # BWD transform
+        # BWD transform: the coefficients are complex and stay so, only the real output is cast below
         with amp.autocast(device_type=x.device.type, enabled=False):
-            x = x.to(torch.float32)
             x = self.inverse_transform(x)
 
         # convert back

@@ -373,10 +373,8 @@ class Trainer(Driver):
         if dist.is_initialized():
             barrier(self.device)
 
-        try:
+        if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
-        except ValueError:
-            pass
 
         training_start = time.time()
         best_valid_loss = 1.0e6

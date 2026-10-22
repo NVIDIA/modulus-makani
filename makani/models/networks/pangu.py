@@ -264,8 +264,10 @@ def window_reverse(windows, window_size, Pl=1, Lat=1, Lon=1, ndim=3):
 
 def get_shift_window_mask(input_resolution, window_size, shift_size, ndim=3):
     """
-    Along the longitude dimension, the leftmost and rightmost indices are actually close to each other.
-    If half windows apper at both leftmost and rightmost positions, they are dircetly merged into one window.
+    Attention mask of the shifted windows. After the roll, the last window along each dimension holds
+    tokens from both ends of that dimension, which the mask keeps from attending to each other. This
+    includes longitude: the half windows from the left and right edges are masked from each other,
+    even though longitude is periodic.
     Args:
         input_resolution (tuple[int]): [pressure levels, latitude, longitude] or [latitude, longitude]
         window_size (tuple[int]): Window size [pressure levels, latitude, longitude] or [latitude, longitude]
@@ -711,7 +713,7 @@ class Transformer3DBlock(nn.Module):
 
         shift_pl, shift_lat, shift_lon = self.shift_size
         if self.roll:
-            shifted_x = torch.roll(x, shifts=(-shift_pl, -shift_lat, -shift_lat), dims=(1, 2, 3))
+            shifted_x = torch.roll(x, shifts=(-shift_pl, -shift_lat, -shift_lon), dims=(1, 2, 3))
             x_windows = window_partition(shifted_x, self.window_size)
             # B*num_lon, num_pl*num_lat, win_pl, win_lat, win_lon, C
         else:
