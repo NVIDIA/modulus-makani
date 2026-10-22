@@ -426,7 +426,8 @@ class Inferencer(Driver):
                 scale=scale,
                 bias=bias,
                 output_file=output_file,
-                output_channels=output_channels,
+                # like the other buffers, no channel selection means all channels
+                output_channels=output_channels if output_channels else self.params.channel_names,
                 output_memory_buffer_size=output_memory_buffer_size,
                 # GDS writes straight from GPU memory, so the staging buffer has to live there too
                 buffer_device=self.device if enable_gds else torch.device("cpu"),
