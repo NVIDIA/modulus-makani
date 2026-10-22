@@ -21,6 +21,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
 
+# zeroes the imaginary parts of the DC and Nyquist bins before the inverse, which cuFFT does not do
+from torch_harmonics.fft import irfft
+
 
 class RealFFT1(nn.Module):
     r"""
@@ -109,7 +112,7 @@ class InverseRealFFT1(nn.Module):
         super().__init__()
 
         # use local FFT here
-        self.ifft_handle = torch.fft.irfft
+        self.ifft_handle = irfft
 
         self.nlon = nlon
         self.lmax = min(lmax or self.nlon // 2 + 1, self.nlon // 2 + 1)
@@ -246,8 +249,10 @@ class InverseRealFFT2(nn.Module):
     def __init__(self, nlat: int, nlon: int, lmax: Optional[int] = None, mmax: Optional[int] = None):
         super().__init__()
 
-        # use local FFT here
-        self.ifft_handle = torch.fft.irfft2
+        # use local FFT here: the inverse in latitude first, then the real inverse in longitude, which
+        # needs the m=0 column to be Hermitian. Truncation to an even lmax breaks that, and backends
+        # differ in how they treat the remaining imaginary parts
+        self.ifft_handle = irfft
 
         self.nlat = nlat
         self.nlon = nlon
@@ -271,7 +276,7 @@ class InverseRealFFT2(nn.Module):
             Complex coefficients of shape ``(..., lmax, m)`` with ``m >= mmax``;
             anything beyond ``mmax`` is dropped.
         norm : str, optional
-            Normalization mode forwarded to :func:`torch.fft.irfft2`, by default
+            Normalization mode forwarded to the inverse FFTs, by default
             ``"ortho"``. Must match the mode used in the forward transform.
 
         Returns
@@ -289,7 +294,8 @@ class InverseRealFFT2(nn.Module):
             xthp = F.pad(xth, (0, 0, 0, self.nlat - self.lmax))
             xt = torch.cat([xthp, xtl], dim=-2)
 
-        out = self.ifft_handle(xt, s=(self.nlat, self.nlon), dim=(-2, -1), norm=norm)
+        out = torch.fft.ifft(xt, n=self.nlat, dim=-2, norm=norm)
+        out = self.ifft_handle(out, n=self.nlon, dim=-1, norm=norm)
 
         return out
 
@@ -378,7 +384,7 @@ class InverseRealFFT3(nn.Module):
 
     Zero-pads the ``d`` and ``h`` spectral axes back to full length (inserting
     the padding between the retained positive and negative frequency blocks)
-    and lets :func:`torch.fft.irfftn` pad the halved ``w`` axis implicitly.
+    and lets the real inverse in ``w`` pad the halved ``w`` axis implicitly.
     Padding is skipped on any axis that was not truncated. Normalization is
     fixed to ``"ortho"``.
 
@@ -451,6 +457,8 @@ class InverseRealFFT3(nn.Module):
             xhp = F.pad(xh, (0, 0, 0, self.nh - self.lhmax))
             x = torch.cat([xhp, xl], dim=-2)
 
-        x = torch.fft.irfftn(x, s=(self.nd, self.nh, self.nw), dim=(-3, -2, -1), norm="ortho")
+        # the complex inverse in d and h first, then the real inverse in w, as in InverseRealFFT2
+        x = torch.fft.ifft2(x, s=(self.nd, self.nh), dim=(-3, -2), norm="ortho")
+        x = irfft(x, n=self.nw, dim=-1, norm="ortho")
 
         return x
