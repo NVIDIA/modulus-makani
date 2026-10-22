@@ -180,6 +180,32 @@ _metric_handler_params = [
 ]
 
 
+def _valid_area_reference(metric_name, fct, obs, area_weight):
+    """
+    ACC, spread or SSR of every sample over the area its weights cover, averaged over the samples with valid points.
+
+    area_weight are the quadrature weights times the mask, in the shape of obs.
+    """
+    # a sample without valid points gives NaN, which nanmean leaves out
+    with np.errstate(invalid="ignore"):
+
+        def area_mean(x):
+            return np.sum(area_weight * x, axis=(-2, -1)) / np.sum(area_weight, axis=(-2, -1))
+
+        if metric_name == "acc":
+            score = area_mean(fct * obs) / np.sqrt(area_mean(fct * fct) * area_mean(obs * obs))
+        else:
+            ens_size = fct.shape[1]
+            fct_mean = np.mean(fct, axis=1)
+            spread = area_mean(np.sum(np.square(fct - fct_mean[:, None]), axis=1) / (ens_size - 1))
+            if metric_name == "spread":
+                score = np.sqrt(spread)
+            else:
+                score = np.sqrt(spread / (area_mean(np.square(fct_mean - obs)) - spread / ens_size))
+
+    return np.nanmean(score, axis=0)
+
+
 @parameterized_class(("device",), _devices)
 class TestMetrics(unittest.TestCase):
     """
@@ -417,6 +443,57 @@ class TestMetrics(unittest.TestCase):
                     verbose=verbose,
                 )
             )
+
+    @parameterized.expand(["acc", "ssr", "spread"], skip_on_empty=True)
+    def test_masked_metrics(self, metric_name, verbose=False):
+        """
+        ACC, SSR and spread of masked data are those over the valid area, whatever the weights integrate to.
+
+        Missing target values, SST over land say, reach the metrics as zero weights. These metrics are normalized by
+        the weights of every sample already, so a sample has to count once when they are finalized. Counting it with
+        the area its weights integrate to, as for an area average, divides them by that area a second time.
+        """
+        batch_size, ensemble_size, num_channels, nlat, nlon = 4, 8, 3, 17, 32
+
+        metric_handle = {"acc": GeometricACC, "ssr": GeometricSSR, "spread": GeometricSpread}[metric_name]
+        metric_func = metric_handle(
+            "equiangular",
+            img_shape=(nlat, nlon),
+            crop_shape=(nlat, nlon),
+            crop_offset=(0, 0),
+            normalize=True,
+            channel_reduction="none",
+            batch_reduction="sum",
+        ).to(self.device)
+
+        # a static mask over about a third of the grid, plus a channel that is missing entirely in one sample, which
+        # has to stay out of the average
+        mask = torch.ones(batch_size, num_channels, nlat, nlon, device=self.device)
+        mask[..., : nlon // 3] = 0.0
+        mask[0, 1] = 0.0
+
+        truth = torch.randn(batch_size, num_channels, nlat, nlon, device=self.device)
+        obs = truth + torch.randn_like(truth)
+        if metric_name == "acc":
+            fct = truth + torch.randn_like(truth)
+        else:
+            fct = truth.unsqueeze(1) + torch.randn(
+                batch_size, ensemble_size, num_channels, nlat, nlon, device=self.device
+            )
+
+        area_weight = (metric_func.quadrature.quad_weight * mask).cpu().numpy()
+        reference = _valid_area_reference(metric_name, fct.cpu().numpy(), obs.cpu().numpy(), area_weight)
+
+        # the result must not depend on what the weights integrate to, the inferencer normalizes its masks for example
+        for scale in [1.0, 0.25]:
+            weight = scale * mask
+            result = metric_func(fct, obs, weight)
+            result = metric_func.finalize(result, metric_func.compute_counts(fct, weight))
+
+            with self.subTest(desc=f"weights scaled by {scale}"):
+                self.assertTrue(
+                    compare_arrays(metric_name, result.cpu().numpy(), reference, rtol=1e-5, atol=1e-6, verbose=verbose)
+                )
 
 
 @parameterized_class(("device",), _devices)
