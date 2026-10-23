@@ -207,6 +207,14 @@ def cleanup():
     """
     global _DM
     if _DM is not None:
+        # rank 0 hosts the TCPStore. Without a barrier it can tear down and exit while other ranks are still
+        # running, whose NCCL heartbeat monitors then lose the store and report it at shutdown
+        if dist.is_initialized():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            device_ids = [torch.cuda.current_device()] if dist.get_backend() == "nccl" else None
+            dist.barrier(device_ids=device_ids)
+
         for name in list(_DM.group_names):
             group = _DM.group(name)
             if group is not None:
