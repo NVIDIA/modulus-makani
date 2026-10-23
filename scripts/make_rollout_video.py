@@ -61,19 +61,21 @@ def _parse_utc(date_str):
     t = dt.datetime.fromisoformat(date_str)
     if t.tzinfo is None:
         t = t.replace(tzinfo=dt.timezone.utc)
-    return t
+    # the titles label times as UTC, so a time given in another zone is converted
+    return t.astimezone(dt.timezone.utc)
 
 
 def _decode(names):
     return [n.decode() if isinstance(n, bytes) else str(n) for n in names]
 
 
-def _channel_names(files, metadata_file):
-    """Channel names of the observation, from the dataset metadata or else from the first file."""
-    if metadata_file is not None:
-        with open(metadata_file) as f:
-            return json.load(f)["coords"]["channel"]
+def _metadata_channel_names(metadata_file):
+    with open(metadata_file) as f:
+        return json.load(f)["coords"]["channel"]
 
+
+def _file_channel_names(files):
+    """Channel names stored in the first observation file, if it is HDF5 and has them."""
     try:
         with h5.File(files[0], "r") as f:
             if "channel" in f:
@@ -86,7 +88,8 @@ def _channel_names(files, metadata_file):
 class ObservationIndex:
     """
     Observations by time. The dataset is discovered by the same backends the data loaders use, so the observations
-    can be a directory of per-year files, a single concatenated or virtual (.h5v) file, or a zarr store.
+    can be a directory of per-year files, a single concatenated or virtual (.h5v) file, or a zarr store. Channel
+    names come from --metadata_file, which a WeatherBench2 store requires, or else from the HDF5 files.
     """
 
     def __init__(self, path, dataset_key="fields", metadata_file=None, dhours=6):
@@ -94,10 +97,21 @@ class ObservationIndex:
         if not os.path.exists(path):
             raise FileNotFoundError(f"observation {path} does not exist")
 
+        # the backends search a directory for stores, so a single zarr store is found through its parent
+        location, file_pattern = path, "*"
+        if os.path.isdir(path) and path.rstrip("/").endswith(".zarr"):
+            location, store = os.path.split(path.rstrip("/"))
+            file_pattern = os.path.splitext(store)[0]
+
+        # the WeatherBench2 layout addresses variables by name, so the backend needs the names up front
+        channel_names = _metadata_channel_names(metadata_file) if metadata_file is not None else None
+
         # arbitrary file names, ordered by time, as for the inference datasets
-        self.backend = get_backend(path, dataset_name=dataset_key, file_pattern="*", dhours=dhours)
+        self.backend = get_backend(
+            location, dataset_name=dataset_key, file_pattern=file_pattern, dhours=dhours, channel_names=channel_names
+        )
         metadata = self.backend.discover()
-        self.channels = _channel_names(metadata.files, metadata_file)
+        self.channels = channel_names if channel_names is not None else _file_channel_names(metadata.files)
 
         self.lookup = {}
         sample = 0
@@ -262,7 +276,9 @@ def make_video(
         return np.nanmin(t), np.nanmax(t)
 
     if clim == "fixed":
-        fixed = limits(np.stack(observations))
+        # combine the limits of every frame rather than stacking the frames into another copy
+        frame_limits = np.array([limits(o) for o in observations])
+        fixed = (np.nanmin(frame_limits[:, 0]), np.nanmax(frame_limits[:, 1]))
 
     # one figure, prediction and observation side by side, updated per frame
     lon_plot = np.deg2rad(np.where(lon > 180.0, lon - 360.0, lon)) if projection else lon
