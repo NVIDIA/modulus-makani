@@ -23,14 +23,17 @@ online visualization (makani.utils.visualize.PLOT_OPS), and defaults to the 10m 
 Example:
 
     python scripts/make_rollout_video.py --prediction rollout.h5 --observation /out_of_sample \\
-        --timestamp 2020-06-01T00:00 --ensemble_member 0 --output wind10m.gif
+        --timestamp 2020-06-01T00:00 --ensemble_members 0 --output wind10m.gif
 
     python scripts/make_rollout_video.py --prediction rollout.h5 --observation /out_of_sample \\
         --timestamp 2020-06-01T00:00 --channels z500 --output z500.mp4
 
-With --data_output, the plotted fields are also written to an HDF5 file for numerical analysis: datasets prediction
-and observation of shape (lead_time, lat, lon), with lead time, valid time, latitude and longitude as dimension scales
-and what was plotted (channels, op, member, initial time, sources) as file attributes.
+Several members, or all of them with --ensemble_members all, are plotted one per row, each next to the observation.
+
+With --data_output, the plotted fields are also written to an HDF5 file for numerical analysis: a dataset prediction of
+shape (lead_time, ensemble_member, lat, lon) and a dataset observation of shape (lead_time, lat, lon), with lead time,
+valid time, ensemble member, latitude and longitude as dimension scales and what was plotted (channels, op, members,
+initial time, sources) as file attributes.
 """
 
 import argparse
@@ -144,8 +147,11 @@ def _to_frame(fig):
     return frame[:h, :w].copy()
 
 
-def write_plot_data(path, preds, observations, lead_times, valid_times, lat, lon, attrs):
-    """Write the plotted fields to HDF5, as datasets prediction and observation of shape (lead_time, lat, lon)."""
+def write_plot_data(path, preds, observations, lead_times, valid_times, members, lat, lon, attrs):
+    """
+    Write the plotted fields to HDF5, as datasets prediction of shape (lead_time, ensemble_member, lat, lon) and
+    observation of shape (lead_time, lat, lon).
+    """
     with h5.File(path, "w") as f:
         for key, value in attrs.items():
             f.attrs[key] = value
@@ -153,6 +159,7 @@ def write_plot_data(path, preds, observations, lead_times, valid_times, lat, lon
         scales = {
             "lead_time": (np.asarray(lead_times, dtype=np.float64), "Lead time in hours"),
             "timestamp": (np.array([t.timestamp() for t in valid_times]), "Valid time in seconds since 1970, UTC"),
+            "ensemble_member": (np.asarray(members, dtype=np.int64), "Ensemble member index in the rollout file"),
             "lat": (np.asarray(lat, dtype=np.float32), "Latitude in degrees"),
             "lon": (np.asarray(lon, dtype=np.float32), "Longitude in degrees"),
         }
@@ -161,16 +168,19 @@ def write_plot_data(path, preds, observations, lead_times, valid_times, lat, lon
             f[key].attrs["description"] = description
             f[key].make_scale(key)
 
-        for key, data in [("prediction", preds), ("observation", observations)]:
+        datasets = [
+            ("prediction", preds, ["lead_time", "ensemble_member", "lat", "lon"]),
+            ("observation", observations, ["lead_time", "lat", "lon"]),
+        ]
+        labels = dict(lead_time="Lead time", ensemble_member="Ensemble member", lat="Latitude", lon="Longitude")
+        for key, data, dims in datasets:
             dset = f.create_dataset(key, data=np.stack(data).astype(np.float32))
             dset.attrs["description"] = f"{attrs['name']} of the {key}"
+            for dim, scale in enumerate(dims):
+                dset.dims[dim].attach_scale(f[scale])
+                dset.dims[dim].label = labels[scale]
             # lead time and valid time both label the first dimension
-            dset.dims[0].attach_scale(f["lead_time"])
             dset.dims[0].attach_scale(f["timestamp"])
-            dset.dims[1].attach_scale(f["lat"])
-            dset.dims[2].attach_scale(f["lon"])
-            for dim, label in enumerate(["Lead time", "Latitude in degrees", "Longitude in degrees"]):
-                dset.dims[dim].label = label
 
 
 def make_video(
@@ -178,7 +188,7 @@ def make_video(
     observation,
     timestamp,
     output,
-    ensemble_member=0,
+    ensemble_members=(0,),
     channels=("u10m", "v10m"),
     op=None,
     name=None,
@@ -233,8 +243,16 @@ def make_video(
         ic = int(matches[0])
 
         num_members = pred_data.shape[2]
-        if not 0 <= ensemble_member < num_members:
-            raise IndexError(f"ensemble member {ensemble_member} out of range, the rollout has {num_members} members")
+        if isinstance(ensemble_members, str):
+            if ensemble_members != "all":
+                raise ValueError(f"ensemble members have to be indices or 'all', got {ensemble_members!r}")
+            ensemble_members = list(range(num_members))
+        ensemble_members = [int(m) for m in ensemble_members]
+        if not ensemble_members:
+            raise ValueError("no ensemble members selected")
+        bad = [m for m in ensemble_members if not 0 <= m < num_members]
+        if bad:
+            raise IndexError(f"ensemble members {bad} out of range, the rollout has {num_members} members")
 
         missing = [c for c in channels if c not in pred_channels or c not in obs_index.channels]
         if missing:
@@ -248,11 +266,14 @@ def make_video(
         # read everything first, the color limits of a fixed scale need all frames
         preds, observations = [], []
         for step, vtime in enumerate(valid_times):
-            pred = np.stack([pred_data[ic, step, ensemble_member, c] for c in pred_cidx], axis=0)
-            preds.append(func(pred, list(range(len(channels)))))
+            members = []
+            for m in ensemble_members:
+                pred = np.stack([pred_data[ic, step, m, c] for c in pred_cidx], axis=0)
+                members.append(func(pred, list(range(len(channels)))))
+            preds.append(np.stack(members, axis=0))
             observations.append(func(obs_index.read(vtime, obs_cidx), list(range(len(channels)))))
 
-    if (observations[0].shape != preds[0].shape) or (observations[0].shape != (len(lat), len(lon))):
+    if (observations[0].shape != preds[0].shape[1:]) or (observations[0].shape != (len(lat), len(lon))):
         raise ValueError(f"grid mismatch: prediction {preds[0].shape}, observation {observations[0].shape}")
 
     if data_output is not None:
@@ -260,13 +281,15 @@ def make_video(
             name=name,
             op=op,
             channels=channels,
-            ensemble_member=ensemble_member,
+            ensemble_members=ensemble_members,
             init_time=init_time.isoformat(),
             init_timestamp=init_time.timestamp(),
             prediction_file=os.path.abspath(prediction),
             observation_path=os.path.abspath(observation),
         )
-        write_plot_data(data_output, preds, observations, lead_times[:steps], valid_times, lat, lon, attrs)
+        write_plot_data(
+            data_output, preds, observations, lead_times[:steps], valid_times, ensemble_members, lat, lon, attrs
+        )
 
     def limits(t):
         # like the online visualization, the color scale follows the observation
@@ -280,33 +303,44 @@ def make_video(
         frame_limits = np.array([limits(o) for o in observations])
         fixed = (np.nanmin(frame_limits[:, 0]), np.nanmax(frame_limits[:, 1]))
 
-    # one figure, prediction and observation side by side, updated per frame
+    # one figure with a row per member, its prediction next to the observation, updated per frame
     lon_plot = np.deg2rad(np.where(lon > 180.0, lon - 360.0, lon)) if projection else lon
     lat_plot = np.deg2rad(lat) if projection else lat
     order = np.argsort(lon_plot)
     Lon, Lat = np.meshgrid(lon_plot[order], lat_plot)
 
-    fig = plt.figure(figsize=(13, 4.2), dpi=dpi)
+    titles = [title for m in ensemble_members for title in (f"Prediction, member {m}", "Observation")]
+    nrows = len(ensemble_members)
+
+    fig = plt.figure(figsize=(13, 3.2 * nrows + 1.0), dpi=dpi)
     axes, meshes = [], []
-    for i, title in enumerate(["Prediction", "Observation"]):
-        ax = fig.add_subplot(1, 2, i + 1, projection=projection)
+    for i, title in enumerate(titles):
+        ax = fig.add_subplot(nrows, 2, i + 1, projection=projection)
+        ax.set_title(title)
         mesh = ax.pcolormesh(Lon, Lat, np.zeros_like(Lon), cmap=cmap, shading="auto")
         ax.grid(grid)
         ax.set_xticklabels([])
         ax.set_yticklabels([])
         axes.append(ax)
         meshes.append(mesh)
-    fig.colorbar(meshes[1], ax=axes, orientation="horizontal", fraction=0.05, pad=0.04, label=name)
+    # the colorbar takes a fraction of the figure height, keep it the size of the single row layout
+    fig.colorbar(
+        meshes[-1],
+        ax=axes,
+        orientation="horizontal",
+        fraction=0.05 / nrows,
+        pad=0.04 / nrows,
+        aspect=20 * nrows,
+        label=name,
+    )
     suptitle = fig.suptitle("")
 
     frames = []
     for step, (pred, targ, vtime) in enumerate(zip(preds, observations, valid_times)):
         vmin, vmax = fixed if clim == "fixed" else limits(targ)
-        for mesh, field in zip(meshes, [pred, targ]):
+        for mesh, field in zip(meshes, [field for member in pred for field in (member, targ)]):
             mesh.set_array(np.ma.masked_invalid(field[:, order]).ravel())
             mesh.set_clim(vmin, vmax)
-        axes[0].set_title(f"Prediction, member {ensemble_member}")
-        axes[1].set_title("Observation")
         suptitle.set_text(
             f"{name}   init {init_time:%Y-%m-%d %H:%M} UTC   "
             f"+{lead_times[step]:.0f}h   valid {vtime:%Y-%m-%d %H:%M} UTC"
@@ -333,7 +367,12 @@ def main():
     )
     parser.add_argument("--timestamp", required=True, help="initial condition, ISO format, UTC if no zone is given")
     parser.add_argument("--output", required=True, help="output file, .gif or a video format such as .mp4")
-    parser.add_argument("--ensemble_member", type=int, default=0)
+    parser.add_argument(
+        "--ensemble_members",
+        nargs="+",
+        default=["0"],
+        help="indices of the members to plot, or all, default 0",
+    )
     parser.add_argument(
         "--channels",
         nargs="+",
@@ -375,7 +414,7 @@ def main():
     parser.add_argument(
         "--data_output",
         default=None,
-        help="optional HDF5 file for the plotted fields, as datasets prediction and observation",
+        help="optional HDF5 file for the plotted fields, as datasets prediction (per member) and observation",
     )
     args = parser.parse_args()
 
@@ -384,7 +423,7 @@ def main():
         observation=args.observation,
         timestamp=args.timestamp,
         output=args.output,
-        ensemble_member=args.ensemble_member,
+        ensemble_members="all" if args.ensemble_members == ["all"] else [int(m) for m in args.ensemble_members],
         channels=args.channels,
         op=args.op,
         name=args.name,
